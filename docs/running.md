@@ -162,6 +162,26 @@ What to look for in the report (`results/<scenario>.json`):
   hash-derived from the (src, dst) pair, so different pairs land on
   different spine subsets).
 
+Example filtered `results`:
+```bash
+jq '.flows[] | {flow: (.src_host + " -> " + .dst_host), per_ev_sent}' \
+   results/green-ev-spray.json
+```
+
+```bash
+jq '.flows[] | {
+  flow: (.src_host + " -> " + .dst_host),
+  spines_used: (.per_ev_sent | keys | map(split(":")[1]) | unique),
+  per_ev_sent
+}' results/green-ev-spray-n2.json
+```
+
+```bash
+jq -r '.flows[] as $f | $f.per_ev_sent | to_entries[] |
+       "\($f.src_host) -> \($f.dst_host)  \(.key)  \(.value)"' \
+   results/green-ev-spray-n2.json | column -t
+```
+
 What to look for on the wire (tcpdump on a leaf eth1..eth4):
 
 ```bash
