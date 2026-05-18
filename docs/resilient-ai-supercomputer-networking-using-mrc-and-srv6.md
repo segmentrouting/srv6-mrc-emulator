@@ -92,50 +92,32 @@ Knowing that we would deploy MRC allowed us to codesign the topology of training
 
 Consider a hypothetical cluster with 100,000 GPUs, each paired with an 800Gb/s NIC. We wish to achieve full bisection bandwidth to simplify workload placement. One option is a conventional three-tier Clos topology using today’s fastest Ethernet switches (Fig. 1a). Currently datacenter-class switches can achieve 51.2Tb/s giving 64 ports at 800Gb/s. Each Tier-0 (T0) switch connects down to 32 NICs and connects up to 32 Tier-1 (T1) switches, giving a pod size of 1024 NICs. Each T2 switch connects to 64 different pods giving a cluster size of 64K NICs. If we wish to connect 100K GPUs we either need to use four tiers of switches, oversubscribe the network, or build multiple independent rails. Alternatively, we can break out the 800Gb/s NIC by lane and use it as 8 x 100Gb/s ports (Fig. 1b). We build eight parallel 100Gb/s Clos planes using the same 51.2Tb/s switches, but now each switch has 512 ports. Each T0 switch connects down to 256 NIC ports and connects up to 256 T1 switches. Each T1 switch connects in turn down to 512 T0 switches, giving a network of 131,072 GPUs. In this arrangement we can easily accommodate our 100K GPUs usingonly two tiers of switches. Such a multi-plane network has many advantages:
 
-• Latency is lower because the longest path traverses only
+• Latency is lower because the longest path traverses only three switches rather than five or seven.
 
-three switches rather than five or seven.
+• Many more nodes are reachable in one hop (256 rather than 32), so it is easier to take advantage of locality in the job, reducing latency and reducing load on T0 uplinks.
 
-• Many more nodes are reachable in one hop (256 rather than
+• Cost and power consumption are reduced - for full bisection bandwidth we require 2/3 of the optics and 3/5 the number of switches compared to a 3-tier network.
 
-32), so it is easier to take advantage of locality in the job, reducing latency and reducing load on T0 uplinks.
+• The impact of an in-network failure is much less. For example, losing a T0-T1 link reduces capacity from a node by 3% in an 800Gb/s plane, vs 0.4% in a 100Gb/s plane.
 
-• Cost and power consumption are reduced - for full bisection
-
-bandwidth we require 2/3 of the optics and 3/5 the number of switches compared to a 3-tier network.
-
-• The impact of an in-network failure is much less. For example, losing a T0-T1 link reduces capacity from a node
-
-by 3% in an 800Gb/s plane, vs 0.4% in a 100Gb/s plane.
-
-• It is possible to lose a NIC-T0 link without bringing down
-
-the training job. We still lose 12% of the NIC bandwidth, but can easily ride out a link flap with the remaining capacity. It seems clear, therefore, that a multi-plane design has many advantages over a single-plane design, but there are some challenges too. First, the workload needs to be able to survive link and NIC port failures. Second, to fully use the network we need to be able to load all network planes equally and load balance across all the many paths within a plane without suffering a loss of performance due to flow collisions. This is hard to do with traditional single-path transport protocols [2] and is made harder by using lower speed network links which are easier to overload. This is where MRC comes in. 2
+• It is possible to lose a NIC-T0 link without bringing down the training job. We still lose 12% of the NIC bandwidth, but can easily ride out a link flap with the remaining capacity. It seems clear, therefore, that a multi-plane design has many advantages over a single-plane design, but there are some challenges too. First, the workload needs to be able to survive link and NIC port failures. Second, to fully use the network we need to be able to load all network planes equally and load balance across all the many paths within a plane without suffering a loss of performance due to flow collisions. This is hard to do with traditional single-path transport protocols [2] and is made harder by using lower speed network links which are easier to overload. This is where MRC comes in. 2
 
 
 ### 2.1 MRC Overview
 
 MRC extends the RoCEv2 Reliable Connection (RC) transport protocol to support multi-path operation borrowing several features of UET [10, 23]. It supports the normal RoCE verbs interface and Queue Pair (QP) abstraction, but only for write and write-with-immediate operations. At a protocol level, the main features MRC adds are the following:
 
-• Every data packet contains the RDMA virtual address and
+• Every data packet contains the RDMA virtual address and remote key so the receiving NIC can write each arriving packet to memory immediately, no matter the arrival order.
 
-remote key so the receiving NIC can write each arriving packet to memory immediately, no matter the arrival order.
+• Each packet contains an entropy value (EV) that dictates its path through the network. The 32-bit EV is striped across the UDP source port and IPv6 flow label in an MRC packet. In a conventional network, changing the EV causes switches to hash each packet to a different path from the ECMP set. At QP startup, the sender generates an EV set for that QP—typically 128 to 256 entries. The sender then rotates through this set, using a different EV for each packet, so that all packets of a QP are sprayed across many paths on all planes in a multi-plane network without the application needing to know. This serves to load balance the network.
 
-• Each packet contains an entropy value (EV) that dictates its
+• Spraying is hard to combine with the priority flow control (PFC) mechanism used in lossless Ethernet because a single flow reaches the last-hop switch over hundreds of paths. Further, PFC tends to create head-of-line blocking between different collectives, hurting tail latency. Thus MRC disables PFC and uses Ethernet in best-effort (lossy) mode.
 
-path through the network. The 32-bit EV is striped across the UDP source port and IPv6 flow label in an MRC packet. In a conventional network, changing the EV causes switches to hash each packet to a different path from the ECMP set. At QP startup, the sender generates an EV set for that QP—typically 128 to 256 entries. The sender then rotates through this set, using a different EV for each packet, so that all packets of a QP are sprayed across many paths on all planes in a multi-plane network without the application needing to know. This serves to load balance the network.
+• The combination of best-effort Ethernet and out-of-order delivery places a greater burden on recovering losses quickly. MRC implements fast selective retransmission, using Selective ACK (SACK) packets to indicate precisely which packets have arrived at the receiver.
 
-• Spraying is hard to combine with the priority flow control
+• To further increase retransmission speed, especially under incast, MRC can use packet trimming [10, 20]. With packet trimming, a packet that would have been dropped due to congestion has its payload trimmed off and is priority forwarded to the destination. The receiving NIC then generates a NACK to trigger fast retransmission. This also lets MRC distinguish congestion loss from other packet loss, which in AI clusters is mostly due to link flaps and failures. A protocol like MRC, designed around packet spraying, is a very good fit for a multi-plane network. Each EV corresponds to a specific path on a specific network plane. When MRC generates its EV set, it chooses an equal number of EVs per plane. This immediately equalizes the traffic between planes. For each EV , MRC keeps a few bits of state about path health. In each switch, we enable Explicit Congestion Notification (ECN) in the normal randomized manner, but disable ECN on the last hop to the receiver. 
 
-(PFC) mechanism used in lossless Ethernet because a single flow reaches the last-hop switch over hundreds of paths. Further, PFC tends to create head-of-line blocking between different collectives, hurting tail latency. Thus MRC disables PFC and uses Ethernet in best-effort (lossy) mode.
-
-• The combination of best-effort Ethernet and out-of-order delivery places a greater burden on recovering losses quickly.
-
-MRC implements fast selective retransmission, using Selective ACK (SACK) packets to indicate precisely which packets have arrived at the receiver.
-
-• To further increase retransmission speed, especially under incast, MRC can use packet trimming [10, 20]. With
-
-packet trimming, a packet that would have been dropped due to congestion has its payload trimmed off and is priorityforwarded to the destination. The receiving NIC then generates a NACK to trigger fast retransmission. This also lets MRC distinguish congestion loss from other packet loss, which in AI clusters is mostly due to link flaps and failures. A protocol like MRC, designed around packet spraying, is a very good fit for a multi-plane network. Each EV corresponds to a specific path on a specific network plane. When MRC generates its EV set, it chooses an equal number of EVs per plane. This immediately equalizes the traffic between planes. For each EV , MRC keeps a few bits of state about path health. In each switch, we enable Explicit Congestion Notification (ECN) in the normal randomized manner, but disable ECN on the last hop to the receiver. In a network with full bisection bandwidth, the traffic aggregate should not experience congestion, except from incast on the last hop, so ECN now acts as a load-balancing signal. The receiver echoes the ECN signal back to the sender, indicating that this specific path is more congested than others, and the sender temporarily avoids it. Different MRC senders do not coordinate when choosing their EV sets, so even though each sender load balances well, the aggregate may be slightly uneven. ECN-based load balancing smooths out this unevenness, keeping internal queues from growing enough to cause congestive loss. When a packet is not trimmed but actually lost, MRC assumes the path has failed and immediately stops using the corresponding EV . Of course, not all loss is due to failed paths - packets can suffer bit errors or other issues - so permanently retiring an EV after one lost packet may leave us short of working EVs. To avoid this, MRC sends background path probes to determine whether paths it assumed were bad are actually bad, and also detect if failed links have recovered. If enough probes succeed, the EV is resurrected. At this point we have a transport protocol that can detect path failures and bypass them in a few tens of microseconds.
+In a network with full bisection bandwidth, the traffic aggregate should not experience congestion, except from incast on the last hop, so ECN now acts as a load-balancing signal. The receiver echoes the ECN signal back to the sender, indicating that this specific path is more congested than others, and the sender temporarily avoids it. Different MRC senders do not coordinate when choosing their EV sets, so even though each sender load balances well, the aggregate may be slightly uneven. ECN-based load balancing smooths out this unevenness, keeping internal queues from growing enough to cause congestive loss. When a packet is not trimmed but actually lost, MRC assumes the path has failed and immediately stops using the corresponding EV . Of course, not all loss is due to failed paths - packets can suffer bit errors or other issues - so permanently retiring an EV after one lost packet may leave us short of working EVs. To avoid this, MRC sends background path probes to determine whether paths it assumed were bad are actually bad, and also detect if failed links have recovered. If enough probes succeed, the EV is resurrected. At this point we have a transport protocol that can detect path failures and bypass them in a few tens of microseconds.
 
 
 ### 2.2 Static Segment Routing
@@ -150,7 +132,8 @@ The approach we chose was to deploy IPv6 segment routing (SRv6) [15]. In the MRC
 
 ### 2.3 Mapping EVs to SRv6 Addresses
 
-MRC was designed to work with either hash-based ECMP forwarding or SRv6. The EV is embedded in each packet, striped across the UDP source port and the IPv6 flow label, both of which are hashed by switches performing ECMP forwarding. The EV is also echoed in SACK and NACK packets to indicate the congestion state on a path. When using SRv6, although the EV is not hashed by
+MRC was designed to work with either hash-based ECMP forwarding or SRv6. The EV is embedded in each packet, striped across the UDP source port and the IPv6 flow label, both of which are hashed by switches performing ECMP forwarding. The EV is also echoed in SACK and NACK packets to indicate the congestion state on a path. When using SRv6, although the EV is not hashed by switches, it still needs to be carried in data packets so the receiver can echo it. The SRv6 address itself cannot be echoed,
+as it is erased by the shifting process during forwarding.
 
 
 > **Figure 3: Creating the SRv6 address from an EV and template switches, it still needs to be carried in data packets so the receiver can echo it. The SRv6 address itself cannot be echoed, as it is erased by the shifting process during forwarding.**
