@@ -13,8 +13,8 @@ from srv6_fabric.mrc.scenario import (
     FaultSpec, FlowPair, FlowSpec, ReportSpec, Scenario,
 )
 from srv6_fabric.mrc.run import (
-    _recv_argv, _send_argv, expand_flows, faults_for_netem,
-    policy_to_cli, run_flows, FlowRun,
+    _ev_spray_n, _print_ev_preview, _recv_argv, _send_argv,
+    expand_flows, faults_for_netem, policy_to_cli, run_flows, FlowRun,
 )
 
 
@@ -262,6 +262,62 @@ class TestRunFlows(unittest.TestCase):
              mock.patch("srv6_fabric.mrc.run.docker_exec", return_value=send_res):
             run_flows(flows, settle_s=0, idle_timeout_s=1.0)
         self.assertEqual(recv_calls, ["green-host15"])
+
+
+class TestEvSprayPreview(unittest.TestCase):
+    """The --verbose preview is read-only and best-effort; we just
+    pin enough behaviour to catch regressions in the output shape
+    and the policy-string parser."""
+
+    def test_ev_spray_n_parses_explicit_form(self):
+        self.assertEqual(_ev_spray_n("ev_spray:3", None), 3)
+        # explicit N wins over scenario default
+        self.assertEqual(_ev_spray_n("ev_spray:3", 5), 3)
+
+    def test_ev_spray_n_bare_uses_scenario_default(self):
+        self.assertEqual(_ev_spray_n("ev_spray", 4), 4)
+
+    def test_ev_spray_n_bare_falls_back_to_num_spines(self):
+        # When scenario doesn't set paths_per_plane, bare ev_spray
+        # means "use all spines" — matches sender CLI precedence.
+        from srv6_fabric.topo import NUM_SPINES
+        self.assertEqual(_ev_spray_n("ev_spray", None), NUM_SPINES)
+
+    def test_ev_spray_n_returns_none_for_other_policies(self):
+        self.assertIsNone(_ev_spray_n("round_robin", 4))
+        self.assertIsNone(_ev_spray_n("health_aware_mrc", 4))
+
+    def test_preview_emits_yellow_2usid_outer(self):
+        # Yellow's outer DA carries an extra `e009` hextet vs. green;
+        # this is the whole point of the preview. Capture stdout and
+        # confirm both the spine-subset header and a yellow-shaped
+        # SID line appear.
+        import io, contextlib
+        flows = [FlowRun(
+            src_host="yellow-host00", dst_host="yellow-host15",
+            tenant="yellow", src_id=0, dst_id=15,
+            policy_cli="ev_spray", rate_pps=1000, duration_s=1.0,
+        )]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _print_ev_preview(flows, scenario_ppp=2)
+        out = buf.getvalue()
+        self.assertIn("ev preview (paths_per_plane=2)", out)
+        self.assertIn("yellow-host00 -> yellow-host15", out)
+        self.assertIn("ev_count=8", out)  # 4 planes * 2 spines
+        self.assertIn("e009:d001::", out)
+
+    def test_preview_silent_for_non_ev_spray(self):
+        import io, contextlib
+        flows = [FlowRun(
+            src_host="green-host00", dst_host="green-host15",
+            tenant="green", src_id=0, dst_id=15,
+            policy_cli="round_robin", rate_pps=1000, duration_s=1.0,
+        )]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _print_ev_preview(flows, scenario_ppp=None)
+        self.assertEqual(buf.getvalue(), "")
 
 
 if __name__ == "__main__":

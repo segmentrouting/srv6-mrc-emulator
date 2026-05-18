@@ -50,6 +50,8 @@ if __package__ in (None, ""):
 from srv6_fabric.netem import Fault, Netem
 from srv6_fabric.report import ScenarioReport
 from srv6_fabric.mrc.scenario import FlowSpec, MrcSpec, Scenario, from_yaml_file
+from srv6_fabric.topo import (NUM_PLANES, NUM_SPINES, inner_addr,
+                              select_spines_for_addrs, usid_outer_dst)
 
 
 # --- defaults ---------------------------------------------------------------
@@ -367,6 +369,63 @@ def faults_for_netem(scenario: Scenario) -> list[Fault]:
 
 # --- main pipeline ----------------------------------------------------------
 
+def _ev_spray_n(policy_cli: str,
+                scenario_ppp: int | None) -> int | None:
+    """Resolve the effective paths_per_plane for an EV-spray flow.
+
+    Returns None if the flow isn't EV-spray. Precedence matches the
+    sender CLI: `ev_spray:N` > scenario.paths_per_plane > NUM_SPINES.
+    """
+    s = policy_cli.strip()
+    if s.startswith("ev_spray:"):
+        try:
+            return int(s.split(":", 1)[1])
+        except ValueError:
+            return None
+    if s == "ev_spray":
+        return scenario_ppp if scenario_ppp is not None else NUM_SPINES
+    return None
+
+
+def _print_ev_preview(flows: list[FlowRun],
+                      scenario_ppp: int | None) -> None:
+    """Verbose-mode preview: for each EV-spray flow, print the spine
+    subset and the resolved outer-DA per (plane, spine).
+
+    Read-only: this just calls the same helpers the runner uses
+    inside the sender. Useful for verifying the per-packet wire form
+    BEFORE traffic flows, especially for yellow (where the 2-uSID
+    outer is easy to miscount visually) and for confirming the
+    hash-derived per-pair spine subset under paths_per_plane < N.
+
+    No output for non-EV-spray scenarios (round_robin etc.).
+    """
+    ev_flows = [(f, _ev_spray_n(f.policy_cli, scenario_ppp))
+                for f in flows]
+    ev_flows = [(f, n) for f, n in ev_flows if n is not None]
+    if not ev_flows:
+        return
+
+    print(f"  ev preview (paths_per_plane="
+          f"{scenario_ppp if scenario_ppp is not None else NUM_SPINES}):")
+    for flow, n in ev_flows:
+        src_addr = inner_addr(flow.tenant, flow.src_id)
+        dst_addr = inner_addr(flow.tenant, flow.dst_id)
+        spines = select_spines_for_addrs(src_addr, dst_addr, n)
+        ev_count = NUM_PLANES * len(spines)
+        print(f"    {flow.src_host} -> {flow.dst_host}  "
+              f"spines={list(spines)}  ev_count={ev_count}")
+        # Spine-major round-robin: plane = seq % NUM_PLANES;
+        # spine_idx = (seq // NUM_PLANES) % len(spines). Print one row
+        # per (plane, spine) — the full EV set this flow will rotate
+        # through, in transmit order so seq=k maps to the k-th row.
+        for spine in spines:
+            for plane in range(NUM_PLANES):
+                outer = usid_outer_dst(flow.tenant, plane, spine,
+                                       flow.dst_id)
+                print(f"      P{plane}:S{spine}  {outer}")
+
+
 def run_scenario(scenario: Scenario, *,
                  dry_run: bool = False,
                  verbose: bool = False) -> ScenarioReport:
@@ -385,6 +444,7 @@ def run_scenario(scenario: Scenario, *,
             print(f"    {fr.src_host} -> {fr.dst_host}  "
                   f"policy={fr.policy_cli}  rate={fr.rate_pps}pps  "
                   f"dur={fr.duration_s}s")
+        _print_ev_preview(flows, scenario.paths_per_plane)
         print(f"  faults:")
         if not scenario.faults:
             print("    (none)")
@@ -410,6 +470,7 @@ def run_scenario(scenario: Scenario, *,
         print(f"scenario: {scenario.name}")
         if scenario.mrc is not None:
             print(f"  mrc: enabled (env={scenario.mrc.to_env_json()})")
+        _print_ev_preview(flows, scenario.paths_per_plane)
         if scenario.faults:
             print(f"  applying {len(scenario.faults)} fault(s)...")
 
