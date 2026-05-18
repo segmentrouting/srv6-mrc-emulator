@@ -510,3 +510,40 @@ on to Phase 1b (module restructure). If any sub-step fails, share:
    was running against)
 4. For 4.2 / 4.3 specifically, the `ss -ulnp` and `tcpdump` snippets
    from the diagnostic blocks above
+
+### Yellow Tenant including verbose output
+
+Dry run
+```bash
+SRV6_TOPO=topologies/4p-8x16/topo.yaml \
+  python3 -m srv6_fabric.mrc.run \
+  topologies/4p-8x16/scenarios/yellow-ev-spray-n2.yaml --dry-run --verbose
+```
+
+2 spine fabric slice:
+```bash
+sudo make scenario SCEN=yellow-ev-spray-n2
+```
+
+Filtered:
+```bash
+jq '.flows[] | {flow: (.src_host + " -> " + .dst_host),
+               loss_pct: (((.sent - .received) / .sent * 100) | . * 100 | round / 100),
+               ev_keys: (.per_ev_sent | keys | sort)}' \
+   results/yellow-ev-spray-n2.json
+```
+
+Full 32 EV spray
+```bash
+sudo make scenario SCEN=yellow-ev-spray
+```
+
+Filtered
+```bash
+jq '.flows[] | {flow: (.src_host + " -> " + .dst_host),
+               loss_pct: (((.sent - .received) / .sent * 100) | . * 100 | round / 100),
+               ev_keys: (.per_ev_sent | keys | sort)}' \
+   results/yellow-ev-spray.json
+```
+
+
