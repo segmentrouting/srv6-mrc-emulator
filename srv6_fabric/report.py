@@ -58,6 +58,11 @@ class FlowRow:
     sent: int = 0
     elapsed_s: float = 0.0
     per_plane_sent: dict[int, int] = field(default_factory=dict)
+    # Populated only by EV-aware policies (e.g. ev_spray). Keys are
+    # "P<plane>:S<spine>" strings (the sender already serializes the
+    # tuple form for JSON-safety in SenderResult.to_dict). Empty for
+    # non-EV runs, where per_plane_sent alone tells the story.
+    per_ev_sent: dict[str, int] = field(default_factory=dict)
     send_errors: int = 0
 
     # Receiver-side (None means no matching receiver record found).
@@ -153,6 +158,7 @@ class ScenarioReport:
                 elapsed_s=s["elapsed_s"],
                 per_plane_sent={int(k): v
                                 for k, v in s["per_plane_sent"].items()},
+                per_ev_sent=dict(s.get("per_ev_sent", {})),
                 send_errors=s.get("errors", 0),
                 mrc=s.get("mrc"),
             )

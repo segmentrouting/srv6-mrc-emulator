@@ -206,6 +206,29 @@ class TestSerialization(unittest.TestCase):
         rep = ScenarioReport.from_records("x", [_sender()], [])
         self.assertIn("no receiver record", rep.render_ascii())
 
+    def test_per_ev_sent_is_forwarded_into_flow_row(self):
+        # EV-aware senders (e.g. ev_spray) emit a per_ev_sent map keyed
+        # by "P<p>:S<s>" strings. The report layer must preserve those
+        # keys verbatim in the merged JSON so consumers can plot EV-
+        # level balance.
+        s = _sender(policy="ev_spray",
+                    per_ev_sent={"P0:S3": 25, "P1:S3": 25,
+                                 "P2:S3": 25, "P3:S3": 25,
+                                 "P0:S7": 25, "P1:S7": 25,
+                                 "P2:S7": 25, "P3:S7": 25})
+        rep = ScenarioReport.from_records("ev", [s], [])
+        row = rep.flows[0]
+        self.assertEqual(row.per_ev_sent["P0:S3"], 25)
+        self.assertEqual(sum(row.per_ev_sent.values()), 200)
+        # And it serializes back out.
+        self.assertEqual(row.to_dict()["per_ev_sent"]["P0:S3"], 25)
+
+    def test_per_ev_sent_absent_for_non_ev_policies(self):
+        # Non-EV senders (round_robin, hash5tuple, …) don't emit the
+        # field; report must default to an empty dict, never raise.
+        rep = ScenarioReport.from_records("x", [_sender()], [])
+        self.assertEqual(rep.flows[0].per_ev_sent, {})
+
 
 if __name__ == "__main__":
     unittest.main()
