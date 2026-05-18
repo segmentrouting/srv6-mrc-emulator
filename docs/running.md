@@ -125,6 +125,8 @@ Under `topologies/4p-8x16/scenarios/`:
 | `plane-blackhole.yaml` | 100% drop on one plane | loss% ≈ 25%, target plane shows rx=0, reord ↓ |
 | `green-ev-spray.yaml` | EV-spray full fan-out (4 planes * 8 spines) | balanced across all 32 EVs in `per_ev_sent` |
 | `green-ev-spray-n2.yaml` | EV-spray narrow (4 planes * 2 spines) | per-pair tcpdump alternates between 2 spine hextets |
+| `yellow-ev-spray.yaml` | Yellow EV-spray, full fan-out | balanced 32 EVs; validates yellow's 2-uSID outer survives per-packet spine rotation |
+| `yellow-ev-spray-n2.yaml` | Yellow EV-spray, narrow (4 planes * 2 spines) | per-pair host-side decap stays clean across both spine choices |
 
 See each `.yaml` for the exact flow list, rates, and netem specs.
 
