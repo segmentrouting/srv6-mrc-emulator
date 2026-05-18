@@ -314,7 +314,7 @@ class SenderMrcAgent:
         self.stats = LossFusionStats()
         self.probe_clock = ProbeClock(
             num_planes=NUM_PLANES,
-            num_spines=NUM_SPINES,
+            num_paths=NUM_SPINES,
             probe_timeout_ns=config.probe_timeout_ms * 1_000_000,
         )
         self.sent_ring = SentWindowRing(num_planes=NUM_PLANES)
@@ -420,14 +420,14 @@ class SenderMrcAgent:
             now_ns = self.clock_ns()
             for plane in range(NUM_PLANES):
                 req_id, tx_ns = self.probe_clock.emit(
-                    plane, spine=0, now_ns=now_ns,
+                    plane, path=0, now_ns=now_ns,
                 )
                 try:
                     payload = encode_probe(
                         req_id=req_id,
                         plane_id=plane,
                         tx_ns=tx_ns,
-                        spine_id=0,  # TODO(phase1b/step2): per-EV probes
+                        path_id=0,  # TODO(phase1b/step2): per-EV probes
                         tenant_id=self.tenant_id,
                         src_id=self.src_id,
                         reply_port=self._peer.report_port,
@@ -462,7 +462,7 @@ class SenderMrcAgent:
         interval_s = self.cfg.probe_interval_ms / 1000.0
         while not self._stop.is_set():
             timeouts = self.probe_clock.sweep_timeouts(self.clock_ns())
-            for plane, _spine, _req_id in timeouts:
+            for plane, _path, _req_id in timeouts:
                 self.table.record_probe_result(
                     self.tenant, plane, success=False,
                 )
@@ -491,7 +491,7 @@ class SenderMrcAgent:
             rtt_ns = self.probe_clock.match_reply(
                 req_id=reply.req_id,
                 plane=reply.plane_id,
-                spine=reply.spine_id,
+                path=reply.path_id,
                 reply_tx_ns=reply.tx_ns,
                 now_ns=now_ns,
             )
@@ -837,7 +837,7 @@ class ReceiverMrcAgent:
                     plane_id=probe.plane_id,
                     tx_ns=probe.tx_ns,
                     svc_time_ns=0,  # we don't measure service time today
-                    spine_id=probe.spine_id,  # echo per-EV identity back
+                    path_id=probe.path_id,  # echo per-EV identity back
                     tenant_id=probe.tenant_id,
                     src_id=probe.src_id,
                     reply_port=probe.reply_port,

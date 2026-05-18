@@ -1,42 +1,42 @@
 """Per-EV outstanding-probe tracking + timeout sweep (sender side).
 
-The sender's probe loop emits one PROBE per EV (each (plane, spine)
+The sender's probe loop emits one PROBE per EV (each (plane, path)
 pair) every probe_interval_ms and wants to know which EVs' probes
 never came back. This module holds the bookkeeping for that question,
 separated from the I/O so the state-machine logic is unit-testable
 without sockets.
 
 Phase 1b step 2 commit 2/5: pre-Phase-1b this was per-plane only.
-spine_id is now a required dimension on emit / match_reply / the
-timeout sweep result. Internal storage is keyed (plane, spine);
-public methods take both. The agent currently passes spine=0 while
+path_id is now a required dimension on emit / match_reply / the
+timeout sweep result. Internal storage is keyed (plane, path);
+public methods take both. The agent currently passes path=0 while
 the rest of the per-EV stack lands — wire format and storage are
-ready, the actual fan-out per spine moves in commit 5.
+ready, the actual fan-out per path moves in commit 5.
 
 Lifecycle from the caller's view:
 
-    clock = ProbeClock(num_planes=4, num_spines=8,
+    clock = ProbeClock(num_planes=4, num_paths=8,
                       probe_timeout_ns=50_000_000)
 
     # Each emit:
-    req_id, tx_ns = clock.emit(plane=2, spine=3,
+    req_id, tx_ns = clock.emit(plane=2, path=3,
                                now_ns=time.monotonic_ns())
     # ... encode + sendto
 
     # Each reply received:
     matched = clock.match_reply(
-        req_id=req_id, plane=2, spine=3,
+        req_id=req_id, plane=2, path=3,
         reply_tx_ns=reply.tx_ns, now_ns=time.monotonic_ns(),
     )
     # matched is None (unknown / late / wrong-EV) or an RTT in ns.
 
     # Periodic timeout sweep (e.g. every probe_interval_ms):
     timeouts = clock.sweep_timeouts(now_ns=time.monotonic_ns())
-    for plane, spine, _req_id in timeouts:
-        ev_table.record_probe_result(tenant, plane, spine, success=False)
+    for plane, path, _req_id in timeouts:
+        ev_table.record_probe_result(tenant, plane, path, success=False)
 
 `req_id` is a u16 that wraps, allocated PER EV. Different EVs have
-independent number spaces; the (plane, spine, req_id) triple is the
+independent number spaces; the (plane, path, req_id) triple is the
 match key. The tracker keeps at most `max_outstanding_per_ev`
 entries per EV (default 256, fits in u16 wrap window for typical
 cadences). Older outstanding entries are silently evicted — at the
@@ -63,13 +63,13 @@ from typing import Dict, List, Optional, Tuple
 class _OutstandingProbe:
     """Bookkeeping for one in-flight probe.
 
-    `req_id` is also the dict key in `_outstanding[plane][spine]`; we
+    `req_id` is also the dict key in `_outstanding[plane][path]`; we
     keep it in the value too so the sweep can build clean
-    (plane, spine, req_id) tuples without re-iterating dict items.
+    (plane, path, req_id) tuples without re-iterating dict items.
     """
     req_id: int
     plane: int
-    spine: int
+    path: int
     tx_ns: int
 
 
@@ -80,14 +80,14 @@ class ProbeClock:
         self,
         *,
         num_planes: int,
-        num_spines: int,
+        num_paths: int,
         probe_timeout_ns: int,
         max_outstanding_per_ev: int = 256,
     ) -> None:
         if num_planes <= 0:
             raise ValueError(f"num_planes must be positive, got {num_planes}")
-        if num_spines <= 0:
-            raise ValueError(f"num_spines must be positive, got {num_spines}")
+        if num_paths <= 0:
+            raise ValueError(f"num_paths must be positive, got {num_paths}")
         if probe_timeout_ns <= 0:
             raise ValueError(
                 f"probe_timeout_ns must be positive, got {probe_timeout_ns}"
@@ -99,27 +99,27 @@ class ProbeClock:
             )
 
         self._num_planes = num_planes
-        self._num_spines = num_spines
+        self._num_paths = num_paths
         self._probe_timeout_ns = probe_timeout_ns
         self._max_outstanding = max_outstanding_per_ev
 
-        # Per-EV next req_id (u16, wraps). 2-D: [plane][spine]. Per-EV
+        # Per-EV next req_id (u16, wraps). 2-D: [plane][path]. Per-EV
         # keeps the number-space dense and lets us reason about wrap
         # independently per EV; req_ids ARE NOT globally unique across
         # EVs.
         self._next_req_id: List[List[int]] = [
-            [0] * num_spines for _ in range(num_planes)
+            [0] * num_paths for _ in range(num_planes)
         ]
 
-        # Per-EV outstanding probes: [plane][spine] -> {req_id -> entry}.
+        # Per-EV outstanding probes: [plane][path] -> {req_id -> entry}.
         self._outstanding: List[List[Dict[int, _OutstandingProbe]]] = [
-            [{} for _ in range(num_spines)] for _ in range(num_planes)
+            [{} for _ in range(num_paths)] for _ in range(num_planes)
         ]
 
         # Counters: how many probes have we ever emitted vs replied to
         # vs timed out per EV. Diagnostic only; useful for tests
         # asserting the I/O layer is calling us correctly. Stored as
-        # flat dicts keyed by (plane, spine) so callers iterating over
+        # flat dicts keyed by (plane, path) so callers iterating over
         # stats don't pay for a 4×N dense list when most EVs are quiet.
         self._emit_count: Dict[Tuple[int, int], int] = {}
         self._reply_count: Dict[Tuple[int, int], int] = {}
@@ -135,11 +135,11 @@ class ProbeClock:
         return self._num_planes
 
     @property
-    def num_spines(self) -> int:
-        return self._num_spines
+    def num_paths(self) -> int:
+        return self._num_paths
 
-    def emit(self, plane: int, spine: int, now_ns: int) -> Tuple[int, int]:
-        """Allocate a fresh req_id for the (plane, spine) EV.
+    def emit(self, plane: int, path: int, now_ns: int) -> Tuple[int, int]:
+        """Allocate a fresh req_id for the (plane, path) EV.
 
         Returns (req_id, tx_ns) — caller passes both to encode_probe.
         tx_ns is just `now_ns` echoed back (we accept the clock as a
@@ -150,18 +150,18 @@ class ProbeClock:
         shouldn't happen at sane cadences and is treated as a silent
         timeout — the evicted entry won't appear in any sweep.
         """
-        self._check_ev(plane, spine)
-        key = (plane, spine)
+        self._check_ev(plane, path)
+        key = (plane, path)
         with self._lock:
-            req_id = self._next_req_id[plane][spine]
-            self._next_req_id[plane][spine] = (req_id + 1) & 0xFFFF
-            outstanding = self._outstanding[plane][spine]
+            req_id = self._next_req_id[plane][path]
+            self._next_req_id[plane][path] = (req_id + 1) & 0xFFFF
+            outstanding = self._outstanding[plane][path]
             if len(outstanding) >= self._max_outstanding:
                 # Drop oldest. dicts preserve insertion order.
                 oldest_key = next(iter(outstanding))
                 del outstanding[oldest_key]
             outstanding[req_id] = _OutstandingProbe(
-                req_id=req_id, plane=plane, spine=spine, tx_ns=now_ns,
+                req_id=req_id, plane=plane, path=path, tx_ns=now_ns,
             )
             self._emit_count[key] = self._emit_count.get(key, 0) + 1
             return req_id, now_ns
@@ -171,7 +171,7 @@ class ProbeClock:
         *,
         req_id: int,
         plane: int,
-        spine: int,
+        path: int,
         reply_tx_ns: int,
         now_ns: int,
     ) -> Optional[int]:
@@ -180,22 +180,22 @@ class ProbeClock:
         Returns the RTT in ns if matched (and removes the entry), or
         None if no match (stale / duplicate / wrong EV).
 
-        We require the (plane, spine, req_id) triple to match — a
+        We require the (plane, path, req_id) triple to match — a
         reply that arrives attributing itself to a different EV than
         the probe was sent on is treated as stale. This catches the
         rare case where a reply traverses an unexpected EV due to a
         misconfigured route or a buggy receiver echoing the wrong
-        spine_id, which would otherwise silently be counted against
+        path_id, which would otherwise silently be counted against
         the wrong EV.
 
         We also cross-check `reply_tx_ns` against the recorded tx_ns:
         if they don't match exactly the reply is also stale (a
         different probe with the same req_id, e.g. after wrap).
         """
-        self._check_ev(plane, spine)
-        key = (plane, spine)
+        self._check_ev(plane, path)
+        key = (plane, path)
         with self._lock:
-            outstanding = self._outstanding[plane][spine]
+            outstanding = self._outstanding[plane][path]
             entry = outstanding.get(req_id)
             if entry is None or entry.tx_ns != reply_tx_ns:
                 self._stale_replies += 1
@@ -210,7 +210,7 @@ class ProbeClock:
     def sweep_timeouts(self, now_ns: int) -> List[Tuple[int, int, int]]:
         """Remove + return any outstanding probes older than the timeout.
 
-        Returns a list of (plane, spine, req_id) for each timed-out
+        Returns a list of (plane, path, req_id) for each timed-out
         probe. Caller is responsible for translating each into a
         EVStateTable.record_probe_result(success=False) call (which we
         don't do directly to avoid coupling this module to the table).
@@ -219,16 +219,16 @@ class ProbeClock:
         timed_out: List[Tuple[int, int, int]] = []
         with self._lock:
             for plane in range(self._num_planes):
-                for spine in range(self._num_spines):
-                    outstanding = self._outstanding[plane][spine]
+                for path in range(self._num_paths):
+                    outstanding = self._outstanding[plane][path]
                     # Iterate over a copy of items because we mutate
                     # the dict. At sane cadences this is small (a
                     # handful of entries per EV).
                     for req_id, entry in list(outstanding.items()):
                         if entry.tx_ns <= deadline_ns:
                             del outstanding[req_id]
-                            timed_out.append((plane, spine, req_id))
-                            key = (plane, spine)
+                            timed_out.append((plane, path, req_id))
+                            key = (plane, path)
                             self._timeout_count[key] = (
                                 self._timeout_count.get(key, 0) + 1
                             )
@@ -237,7 +237,7 @@ class ProbeClock:
     def stats(self) -> dict:
         """Snapshot of per-EV counters for tests / diagnostics.
 
-        Counters are keyed by (plane, spine) tuple. EVs that have
+        Counters are keyed by (plane, path) tuple. EVs that have
         never had any activity are absent from the dicts (callers
         should treat missing keys as zero).
         """
@@ -250,27 +250,27 @@ class ProbeClock:
                 "outstanding": {
                     (p, s): len(self._outstanding[p][s])
                     for p in range(self._num_planes)
-                    for s in range(self._num_spines)
+                    for s in range(self._num_paths)
                     if self._outstanding[p][s]
                 },
             }
 
-    def outstanding(self, plane: int, spine: int) -> int:
-        """Number of probes currently in-flight on the (plane, spine) EV."""
-        self._check_ev(plane, spine)
+    def outstanding(self, plane: int, path: int) -> int:
+        """Number of probes currently in-flight on the (plane, path) EV."""
+        self._check_ev(plane, path)
         with self._lock:
-            return len(self._outstanding[plane][spine])
+            return len(self._outstanding[plane][path])
 
     # --- internal -----------------------------------------------------
 
-    def _check_ev(self, plane: int, spine: int) -> None:
+    def _check_ev(self, plane: int, path: int) -> None:
         if not 0 <= plane < self._num_planes:
             raise ValueError(
                 f"plane {plane} out of range [0, {self._num_planes})"
             )
-        if not 0 <= spine < self._num_spines:
+        if not 0 <= path < self._num_paths:
             raise ValueError(
-                f"spine {spine} out of range [0, {self._num_spines})"
+                f"path {path} out of range [0, {self._num_paths})"
             )
 
 

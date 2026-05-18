@@ -17,7 +17,7 @@ Wire format (all big-endian / network byte order):
       version     u8   = 3
       req_id      u16
       plane_id    u8
-      spine_id    u8        (NEW in v3 — was _reserved in v2)
+      path_id    u8        (NEW in v3 — was _reserved in v2)
       tx_ns       u64       (sender's monotonic_ns at TX time, echoed in reply)
       svc_time_ns u64       (PROBE: 0; PROBE_REPLY: responder service time)
       tenant_id   u16       (sender's tenant per topo.TENANT_ID; 0 = unknown)
@@ -32,7 +32,7 @@ Wire format (all big-endian / network byte order):
       _reserved   u16  = 0
       then num_records × per-EV records:
           plane_id    u8
-          spine_id    u8        (NEW in v2 — was _reserved in v1)
+          path_id    u8        (NEW in v2 — was _reserved in v1)
           _reserved   u16 = 0
           seen        u32
           expected    u32
@@ -43,12 +43,12 @@ also sees spray data (in the unlikely event of port collision) can
 demux defensively. Version byte is reserved for future protocol bumps.
 
 PROBE v3 vs v2: v3 reuses the v2 `_reserved` byte after plane_id to
-carry spine_id, giving per-EV (plane, spine) attribution without
+carry path_id, giving per-EV (plane, path) attribution without
 growing the on-wire size (still 28 B). v2 is rejected by the decoder;
 this is a lab tool with no in-flight upgrades, lockstep is free.
 
 LOSS_REPORT v2 vs v1: same change — `_reserved` byte after plane_id is
-now spine_id. Record stays 16 B. v1 rejected.
+now path_id. Record stays 16 B. v1 rejected.
 
 If we later bump beyond v3 / v2, decoders SHOULD accept previous
 versions for one release cycle.
@@ -76,7 +76,7 @@ _MAGIC_LOSS_REPORT = 0xA7
 
 
 # struct format strings (network byte order)
-# PROBE / PROBE_REPLY v3: magic, version, req_id, plane_id, spine_id,
+# PROBE / PROBE_REPLY v3: magic, version, req_id, plane_id, path_id,
 # tx_ns, svc_time_ns, tenant_id, src_id, reply_port
 _PROBE_FMT = "!BBHBBQQHHH"
 _PROBE_SIZE = struct.calcsize(_PROBE_FMT)   # 28 bytes
@@ -84,7 +84,7 @@ _PROBE_SIZE = struct.calcsize(_PROBE_FMT)   # 28 bytes
 # LOSS_REPORT header: magic, version, window_id, num_records, _rsv
 _LOSS_HDR_FMT = "!BBHHH"
 _LOSS_HDR_SIZE = struct.calcsize(_LOSS_HDR_FMT)  # 8 bytes
-# per-EV record (v2): plane_id, spine_id, _rsv16, seen, expected, max_gap
+# per-EV record (v2): plane_id, path_id, _rsv16, seen, expected, max_gap
 _LOSS_REC_FMT = "!BBHIII"
 _LOSS_REC_SIZE = struct.calcsize(_LOSS_REC_FMT)  # 16 bytes
 
@@ -102,7 +102,7 @@ class Probe:
     """A decoded PROBE packet."""
     req_id: int
     plane_id: int
-    spine_id: int
+    path_id: int
     tx_ns: int
     tenant_id: int
     src_id: int
@@ -111,7 +111,7 @@ class Probe:
     def __post_init__(self) -> None:
         _check_u16(self.req_id, "req_id")
         _check_u8(self.plane_id, "plane_id")
-        _check_u8(self.spine_id, "spine_id")
+        _check_u8(self.path_id, "path_id")
         _check_u64(self.tx_ns, "tx_ns")
         _check_u16(self.tenant_id, "tenant_id")
         _check_u16(self.src_id, "src_id")
@@ -131,13 +131,13 @@ class ProbeReply:
     binding multiple sockets across tenants can demux replies without
     consulting the original probe.
 
-    `spine_id` is echoed so the sender can attribute the reply to the
-    same (plane, spine) EV it sent on — without it, RTT/loss could only
+    `path_id` is echoed so the sender can attribute the reply to the
+    same (plane, path) EV it sent on — without it, RTT/loss could only
     be charged back to the plane.
     """
     req_id: int
     plane_id: int
-    spine_id: int
+    path_id: int
     tx_ns: int
     svc_time_ns: int
     tenant_id: int
@@ -147,7 +147,7 @@ class ProbeReply:
     def __post_init__(self) -> None:
         _check_u16(self.req_id, "req_id")
         _check_u8(self.plane_id, "plane_id")
-        _check_u8(self.spine_id, "spine_id")
+        _check_u8(self.path_id, "path_id")
         _check_u64(self.tx_ns, "tx_ns")
         _check_u64(self.svc_time_ns, "svc_time_ns")
         _check_u16(self.tenant_id, "tenant_id")
@@ -160,19 +160,19 @@ class PlaneLossRecord:
     """One per-EV entry inside a LOSS_REPORT.
 
     Named PlaneLossRecord for back-compat; v2 widens the key from plane
-    to (plane, spine). A v1 record had spine_id implicitly zero; this
+    to (plane, path). A v1 record had path_id implicitly zero; this
     type now carries it explicitly. Consumers that only care about the
-    plane axis can still aggregate by `plane_id` and ignore `spine_id`.
+    plane axis can still aggregate by `plane_id` and ignore `path_id`.
     """
     plane_id: int
-    spine_id: int
+    path_id: int
     seen: int
     expected: int
     max_gap: int
 
     def __post_init__(self) -> None:
         _check_u8(self.plane_id, "plane_id")
-        _check_u8(self.spine_id, "spine_id")
+        _check_u8(self.path_id, "path_id")
         _check_u32(self.seen, "seen")
         _check_u32(self.expected, "expected")
         _check_u32(self.max_gap, "max_gap")
@@ -183,7 +183,7 @@ class LossReport:
     """A decoded LOSS_REPORT packet.
 
     `planes` (historical name; really "EV records") is in wire order;
-    receivers should treat duplicate (plane_id, spine_id) entries as
+    receivers should treat duplicate (plane_id, path_id) entries as
     latest-wins (we don't enforce uniqueness on decode).
     """
     window_id: int
@@ -199,7 +199,7 @@ class LossReport:
 
 def encode_probe(
     req_id: int, plane_id: int, tx_ns: int,
-    *, spine_id: int, tenant_id: int, src_id: int, reply_port: int,
+    *, path_id: int, tenant_id: int, src_id: int, reply_port: int,
 ) -> bytes:
     """Build the UDP-payload bytes for a PROBE packet.
 
@@ -207,9 +207,9 @@ def encode_probe(
     receiver echoes it verbatim in the matching PROBE_REPLY; the sender
     subtracts it from a later clock read to get RTT.
 
-    `spine_id` identifies the per-plane EV the sender chose for this
+    `path_id` identifies the per-plane EV the sender chose for this
     probe; the receiver echoes it in the reply so the sender can
-    attribute RTT / loss back to the specific (plane, spine) pair.
+    attribute RTT / loss back to the specific (plane, path) pair.
 
     `tenant_id` / `src_id` / `reply_port` identify the sender so the
     receiver can attribute received probes and route LOSS_REPORTs back
@@ -217,7 +217,7 @@ def encode_probe(
     """
     _check_u16(req_id, "req_id")
     _check_u8(plane_id, "plane_id")
-    _check_u8(spine_id, "spine_id")
+    _check_u8(path_id, "path_id")
     _check_u64(tx_ns, "tx_ns")
     _check_u16(tenant_id, "tenant_id")
     _check_u16(src_id, "src_id")
@@ -225,7 +225,7 @@ def encode_probe(
     return struct.pack(
         _PROBE_FMT,
         _MAGIC_PROBE, PROBE_VERSION,
-        req_id, plane_id, spine_id,
+        req_id, plane_id, path_id,
         tx_ns, 0,
         tenant_id, src_id, reply_port,
     )
@@ -233,7 +233,7 @@ def encode_probe(
 
 def encode_probe_reply(
     req_id: int, plane_id: int, tx_ns: int, svc_time_ns: int,
-    *, spine_id: int, tenant_id: int, src_id: int, reply_port: int,
+    *, path_id: int, tenant_id: int, src_id: int, reply_port: int,
 ) -> bytes:
     """Build the UDP-payload bytes for a PROBE_REPLY packet.
 
@@ -241,7 +241,7 @@ def encode_probe_reply(
     pair them up; `svc_time_ns` is the responder's measured
     "request-arrival → reply-emit" duration (may be 0 if not measured).
 
-    `spine_id` MUST be echoed from the PROBE so the sender can attribute
+    `path_id` MUST be echoed from the PROBE so the sender can attribute
     the reply to the right EV.
 
     `tenant_id` / `src_id` / `reply_port` are echoed verbatim from the
@@ -249,7 +249,7 @@ def encode_probe_reply(
     """
     _check_u16(req_id, "req_id")
     _check_u8(plane_id, "plane_id")
-    _check_u8(spine_id, "spine_id")
+    _check_u8(path_id, "path_id")
     _check_u64(tx_ns, "tx_ns")
     _check_u64(svc_time_ns, "svc_time_ns")
     _check_u16(tenant_id, "tenant_id")
@@ -258,7 +258,7 @@ def encode_probe_reply(
     return struct.pack(
         _PROBE_FMT,
         _MAGIC_PROBE_REPLY, PROBE_VERSION,
-        req_id, plane_id, spine_id,
+        req_id, plane_id, path_id,
         tx_ns, svc_time_ns,
         tenant_id, src_id, reply_port,
     )
@@ -290,7 +290,7 @@ def encode_loss_report(
             )
         out += struct.pack(
             _LOSS_REC_FMT,
-            rec.plane_id, rec.spine_id, 0,
+            rec.plane_id, rec.path_id, 0,
             rec.seen, rec.expected, rec.max_gap,
         )
     return bytes(out)
@@ -302,20 +302,20 @@ def decode_probe(payload: bytes) -> Probe:
     fields = _decode_probe_packet(payload, expect_magic=_MAGIC_PROBE)
     # PROBE carries svc_time_ns == 0 by protocol; we don't enforce it
     # because a misbehaving sender shouldn't crash the receiver. Drop it.
-    (req_id, plane_id, spine_id, tx_ns, _svc,
+    (req_id, plane_id, path_id, tx_ns, _svc,
      tenant_id, src_id, reply_port) = fields
     return Probe(
-        req_id=req_id, plane_id=plane_id, spine_id=spine_id, tx_ns=tx_ns,
+        req_id=req_id, plane_id=plane_id, path_id=path_id, tx_ns=tx_ns,
         tenant_id=tenant_id, src_id=src_id, reply_port=reply_port,
     )
 
 
 def decode_probe_reply(payload: bytes) -> ProbeReply:
     fields = _decode_probe_packet(payload, expect_magic=_MAGIC_PROBE_REPLY)
-    (req_id, plane_id, spine_id, tx_ns, svc_time_ns,
+    (req_id, plane_id, path_id, tx_ns, svc_time_ns,
      tenant_id, src_id, reply_port) = fields
     return ProbeReply(
-        req_id=req_id, plane_id=plane_id, spine_id=spine_id,
+        req_id=req_id, plane_id=plane_id, path_id=path_id,
         tx_ns=tx_ns, svc_time_ns=svc_time_ns,
         tenant_id=tenant_id, src_id=src_id, reply_port=reply_port,
     )
@@ -347,11 +347,11 @@ def decode_loss_report(payload: bytes) -> LossReport:
     planes: list[PlaneLossRecord] = []
     off = _LOSS_HDR_SIZE
     for _ in range(num_records):
-        plane_id, spine_id, _r16, seen, expected, max_gap = struct.unpack(
+        plane_id, path_id, _r16, seen, expected, max_gap = struct.unpack(
             _LOSS_REC_FMT, payload[off:off + _LOSS_REC_SIZE],
         )
         planes.append(PlaneLossRecord(
-            plane_id=plane_id, spine_id=spine_id,
+            plane_id=plane_id, path_id=path_id,
             seen=seen, expected=expected, max_gap=max_gap,
         ))
         off += _LOSS_REC_SIZE
@@ -363,7 +363,7 @@ def _decode_probe_packet(
 ) -> tuple[int, int, int, int, int, int, int, int]:
     """Shared decode for PROBE and PROBE_REPLY.
 
-    Returns (req_id, plane_id, spine_id, tx_ns, svc_time_ns, tenant_id,
+    Returns (req_id, plane_id, path_id, tx_ns, svc_time_ns, tenant_id,
     src_id, reply_port). Caller turns the tuple into the appropriate
     dataclass; we keep this as a tuple so PROBE doesn't pay for
     ProbeReply's extra field validation in the (very common)
@@ -373,7 +373,7 @@ def _decode_probe_packet(
         raise ProbeDecodeError(
             f"probe payload too short: {len(payload)} < {_PROBE_SIZE}"
         )
-    (magic, version, req_id, plane_id, spine_id,
+    (magic, version, req_id, plane_id, path_id,
      tx_ns, svc_time_ns,
      tenant_id, src_id, reply_port) = struct.unpack(
          _PROBE_FMT, payload[:_PROBE_SIZE],
@@ -386,7 +386,7 @@ def _decode_probe_packet(
         raise ProbeDecodeError(
             f"unsupported probe protocol version {version}"
         )
-    return (req_id, plane_id, spine_id, tx_ns, svc_time_ns,
+    return (req_id, plane_id, path_id, tx_ns, svc_time_ns,
             tenant_id, src_id, reply_port)
 
 

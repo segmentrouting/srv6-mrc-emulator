@@ -197,7 +197,7 @@ class LossWindowTable:
                 max_gap_capped = min(counters.max_gap, 0xFFFFFFFF)
                 records.append(PlaneLossRecord(
                     plane_id=plane,
-                    spine_id=0,  # TODO(phase1b/step2): per-EV counters
+                    path_id=0,  # TODO(phase1b/step2): per-EV counters
                     seen=seen_capped,
                     expected=expected_local,
                     max_gap=max_gap_capped,

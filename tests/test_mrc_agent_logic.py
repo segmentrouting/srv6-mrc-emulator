@@ -33,9 +33,9 @@ from srv6_fabric.mrc.probe_clock import ProbeClock
 
 class TestProbeClockEmit(unittest.TestCase):
     def test_emit_returns_monotonic_req_ids_per_ev(self):
-        c = ProbeClock(num_planes=4, num_spines=8,
+        c = ProbeClock(num_planes=4, num_paths=8,
                        probe_timeout_ns=50_000_000)
-        # Per-EV req_id spaces are independent — each (plane, spine)
+        # Per-EV req_id spaces are independent — each (plane, path)
         # starts at 0.
         ids_p0_s0 = [c.emit(0, 0, now_ns=t)[0] for t in range(0, 5)]
         ids_p1_s0 = [c.emit(1, 0, now_ns=t)[0] for t in range(0, 5)]
@@ -45,7 +45,7 @@ class TestProbeClockEmit(unittest.TestCase):
         self.assertEqual(ids_p0_s3, [0, 1, 2, 3, 4])
 
     def test_emit_records_outstanding(self):
-        c = ProbeClock(num_planes=2, num_spines=4, probe_timeout_ns=1_000)
+        c = ProbeClock(num_planes=2, num_paths=4, probe_timeout_ns=1_000)
         c.emit(0, 0, now_ns=10)
         c.emit(0, 0, now_ns=20)
         c.emit(0, 1, now_ns=30)
@@ -59,7 +59,7 @@ class TestProbeClockEmit(unittest.TestCase):
         # Exhaust the u16 space on one EV; next id should wrap to 0,
         # then 1 after emitting again.
         c = ProbeClock(
-            num_planes=1, num_spines=1, probe_timeout_ns=1,
+            num_planes=1, num_paths=1, probe_timeout_ns=1,
             max_outstanding_per_ev=1,  # force LRU so we don't OOM
         )
         for t in range(0x10001):
@@ -70,11 +70,11 @@ class TestProbeClockEmit(unittest.TestCase):
 
 class TestProbeClockMatchReply(unittest.TestCase):
     def test_match_returns_rtt(self):
-        c = ProbeClock(num_planes=2, num_spines=2,
+        c = ProbeClock(num_planes=2, num_paths=2,
                        probe_timeout_ns=1_000_000_000)
         req_id, tx_ns = c.emit(0, 1, now_ns=1_000)
         rtt = c.match_reply(
-            req_id=req_id, plane=0, spine=1,
+            req_id=req_id, plane=0, path=1,
             reply_tx_ns=tx_ns, now_ns=1_500,
         )
         self.assertEqual(rtt, 500)
@@ -82,22 +82,22 @@ class TestProbeClockMatchReply(unittest.TestCase):
         self.assertEqual(c.outstanding(0, 1), 0)
 
     def test_unknown_req_id_is_stale(self):
-        c = ProbeClock(num_planes=1, num_spines=1,
+        c = ProbeClock(num_planes=1, num_paths=1,
                        probe_timeout_ns=1_000_000)
-        rtt = c.match_reply(req_id=42, plane=0, spine=0,
+        rtt = c.match_reply(req_id=42, plane=0, path=0,
                             reply_tx_ns=0, now_ns=100)
         self.assertIsNone(rtt)
         self.assertEqual(c.stats()["stale_replies"], 1)
 
     def test_wrong_ev_is_stale(self):
-        # Probe emitted on (plane=0, spine=0); reply claims (plane=0,
-        # spine=1). The req_id space is per-EV, so spine=1 has no such
+        # Probe emitted on (plane=0, path=0); reply claims (plane=0,
+        # path=1). The req_id space is per-EV, so path=1 has no such
         # entry and the reply is stale; the original entry survives.
-        c = ProbeClock(num_planes=1, num_spines=2,
+        c = ProbeClock(num_planes=1, num_paths=2,
                        probe_timeout_ns=1_000_000)
         req_id, tx_ns = c.emit(0, 0, now_ns=10)
         rtt = c.match_reply(
-            req_id=req_id, plane=0, spine=1,
+            req_id=req_id, plane=0, path=1,
             reply_tx_ns=tx_ns, now_ns=20,
         )
         self.assertIsNone(rtt)
@@ -105,12 +105,12 @@ class TestProbeClockMatchReply(unittest.TestCase):
         self.assertEqual(c.stats()["stale_replies"], 1)
 
     def test_wrong_plane_is_stale(self):
-        # Same idea, but mismatching on plane instead of spine.
-        c = ProbeClock(num_planes=2, num_spines=2,
+        # Same idea, but mismatching on plane instead of path.
+        c = ProbeClock(num_planes=2, num_paths=2,
                        probe_timeout_ns=1_000_000)
         req_id, tx_ns = c.emit(0, 0, now_ns=10)
         rtt = c.match_reply(
-            req_id=req_id, plane=1, spine=0,
+            req_id=req_id, plane=1, path=0,
             reply_tx_ns=tx_ns, now_ns=20,
         )
         self.assertIsNone(rtt)
@@ -119,11 +119,11 @@ class TestProbeClockMatchReply(unittest.TestCase):
     def test_mismatched_tx_ns_is_stale(self):
         # Reply with same req_id but different tx_ns indicates a
         # post-wrap collision (different probe, same id). Reject.
-        c = ProbeClock(num_planes=1, num_spines=1,
+        c = ProbeClock(num_planes=1, num_paths=1,
                        probe_timeout_ns=1_000_000)
         req_id, tx_ns = c.emit(0, 0, now_ns=100)
         rtt = c.match_reply(
-            req_id=req_id, plane=0, spine=0,
+            req_id=req_id, plane=0, path=0,
             reply_tx_ns=tx_ns + 1, now_ns=200,
         )
         self.assertIsNone(rtt)
@@ -133,7 +133,7 @@ class TestProbeClockMatchReply(unittest.TestCase):
 
 class TestProbeClockSweepTimeouts(unittest.TestCase):
     def test_sweep_returns_old_outstanding(self):
-        c = ProbeClock(num_planes=2, num_spines=2, probe_timeout_ns=100)
+        c = ProbeClock(num_planes=2, num_paths=2, probe_timeout_ns=100)
         c.emit(0, 0, now_ns=0)
         c.emit(0, 1, now_ns=50)
         c.emit(1, 0, now_ns=200)
@@ -148,7 +148,7 @@ class TestProbeClockSweepTimeouts(unittest.TestCase):
         self.assertEqual(c.outstanding(1, 0), 1)
 
     def test_sweep_idempotent(self):
-        c = ProbeClock(num_planes=1, num_spines=1, probe_timeout_ns=10)
+        c = ProbeClock(num_planes=1, num_paths=1, probe_timeout_ns=10)
         c.emit(0, 0, now_ns=0)
         first = c.sweep_timeouts(now_ns=100)
         second = c.sweep_timeouts(now_ns=200)
@@ -156,7 +156,7 @@ class TestProbeClockSweepTimeouts(unittest.TestCase):
         self.assertEqual(second, [])
 
     def test_timeout_count_tracks_sweep_per_ev(self):
-        c = ProbeClock(num_planes=2, num_spines=2, probe_timeout_ns=10)
+        c = ProbeClock(num_planes=2, num_paths=2, probe_timeout_ns=10)
         c.emit(0, 1, now_ns=0)
         c.emit(0, 1, now_ns=5)
         c.emit(1, 0, now_ns=2)
@@ -169,7 +169,7 @@ class TestProbeClockEvictsAtCap(unittest.TestCase):
     def test_evict_oldest_at_capacity(self):
         # Cap of 2 means the third emit pushes out the first.
         c = ProbeClock(
-            num_planes=1, num_spines=1, probe_timeout_ns=1_000_000_000,
+            num_planes=1, num_paths=1, probe_timeout_ns=1_000_000_000,
             max_outstanding_per_ev=2,
         )
         id0, _ = c.emit(0, 0, now_ns=10)
@@ -177,21 +177,21 @@ class TestProbeClockEvictsAtCap(unittest.TestCase):
         id2, _ = c.emit(0, 0, now_ns=30)
         # id0 was evicted; matching it should be stale.
         self.assertIsNone(c.match_reply(
-            req_id=id0, plane=0, spine=0, reply_tx_ns=10, now_ns=40,
+            req_id=id0, plane=0, path=0, reply_tx_ns=10, now_ns=40,
         ))
         # id1 and id2 still match.
         self.assertEqual(c.match_reply(
-            req_id=id1, plane=0, spine=0, reply_tx_ns=20, now_ns=40,
+            req_id=id1, plane=0, path=0, reply_tx_ns=20, now_ns=40,
         ), 20)
         self.assertEqual(c.match_reply(
-            req_id=id2, plane=0, spine=0, reply_tx_ns=30, now_ns=40,
+            req_id=id2, plane=0, path=0, reply_tx_ns=30, now_ns=40,
         ), 10)
 
     def test_eviction_is_per_ev(self):
         # Cap is per-EV: filling (0,0) to capacity does not evict
         # (0,1)'s outstanding entries.
         c = ProbeClock(
-            num_planes=1, num_spines=2, probe_timeout_ns=1_000_000_000,
+            num_planes=1, num_paths=2, probe_timeout_ns=1_000_000_000,
             max_outstanding_per_ev=1,
         )
         s1_id, _ = c.emit(0, 1, now_ns=10)
@@ -199,7 +199,7 @@ class TestProbeClockEvictsAtCap(unittest.TestCase):
         c.emit(0, 0, now_ns=30)  # evicts the now=20 entry on (0,0)
         # (0,1) is undisturbed.
         rtt = c.match_reply(
-            req_id=s1_id, plane=0, spine=1, reply_tx_ns=10, now_ns=40,
+            req_id=s1_id, plane=0, path=1, reply_tx_ns=10, now_ns=40,
         )
         self.assertEqual(rtt, 30)
 
@@ -207,28 +207,28 @@ class TestProbeClockEvictsAtCap(unittest.TestCase):
 class TestProbeClockValidation(unittest.TestCase):
     def test_construct_validates(self):
         with self.assertRaises(ValueError):
-            ProbeClock(num_planes=0, num_spines=1, probe_timeout_ns=1)
+            ProbeClock(num_planes=0, num_paths=1, probe_timeout_ns=1)
         with self.assertRaises(ValueError):
-            ProbeClock(num_planes=1, num_spines=0, probe_timeout_ns=1)
+            ProbeClock(num_planes=1, num_paths=0, probe_timeout_ns=1)
         with self.assertRaises(ValueError):
-            ProbeClock(num_planes=1, num_spines=1, probe_timeout_ns=0)
+            ProbeClock(num_planes=1, num_paths=1, probe_timeout_ns=0)
         with self.assertRaises(ValueError):
-            ProbeClock(num_planes=1, num_spines=1, probe_timeout_ns=1,
+            ProbeClock(num_planes=1, num_paths=1, probe_timeout_ns=1,
                        max_outstanding_per_ev=0)
 
     def test_emit_rejects_bad_plane(self):
-        c = ProbeClock(num_planes=4, num_spines=2, probe_timeout_ns=10)
+        c = ProbeClock(num_planes=4, num_paths=2, probe_timeout_ns=10)
         with self.assertRaises(ValueError):
-            c.emit(plane=4, spine=0, now_ns=0)
+            c.emit(plane=4, path=0, now_ns=0)
         with self.assertRaises(ValueError):
-            c.emit(plane=-1, spine=0, now_ns=0)
+            c.emit(plane=-1, path=0, now_ns=0)
 
-    def test_emit_rejects_bad_spine(self):
-        c = ProbeClock(num_planes=4, num_spines=2, probe_timeout_ns=10)
+    def test_emit_rejects_bad_path(self):
+        c = ProbeClock(num_planes=4, num_paths=2, probe_timeout_ns=10)
         with self.assertRaises(ValueError):
-            c.emit(plane=0, spine=2, now_ns=0)
+            c.emit(plane=0, path=2, now_ns=0)
         with self.assertRaises(ValueError):
-            c.emit(plane=0, spine=-1, now_ns=0)
+            c.emit(plane=0, path=-1, now_ns=0)
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +440,7 @@ class TestApplyLossReport(unittest.TestCase):
             sent=(100, 100, 100, 100),
         ))
         report = LossReport(window_id=0, planes=(
-            PlaneLossRecord(plane_id=0, spine_id=0, seen=50, expected=80, max_gap=2),
+            PlaneLossRecord(plane_id=0, path_id=0, seen=50, expected=80, max_gap=2),
         ))
         stats = LossFusionStats()
         apply_loss_report(
@@ -464,7 +464,7 @@ class TestApplyLossReport(unittest.TestCase):
             sent=(100, 100, 100, 100),
         ))
         bad_report = LossReport(window_id=0, planes=(
-            PlaneLossRecord(plane_id=0, spine_id=0, seen=50, expected=80, max_gap=2),
+            PlaneLossRecord(plane_id=0, path_id=0, seen=50, expected=80, max_gap=2),
         ))
         # Two consecutive bad reports for plane 0.
         apply_loss_report(
@@ -484,7 +484,7 @@ class TestApplyLossReport(unittest.TestCase):
         t = self._table(loss_threshold=0.05, loss_demote_consecutive=2)
         ring = SentWindowRing(num_planes=self.NUM_PLANES)
         report = LossReport(window_id=0, planes=(
-            PlaneLossRecord(plane_id=1, spine_id=0, seen=50, expected=80, max_gap=2),
+            PlaneLossRecord(plane_id=1, path_id=0, seen=50, expected=80, max_gap=2),
         ))
         stats = LossFusionStats()
         apply_loss_report(
@@ -502,7 +502,7 @@ class TestApplyLossReport(unittest.TestCase):
         t = self._table()
         ring = SentWindowRing(num_planes=self.NUM_PLANES)
         report = LossReport(window_id=0, planes=(
-            PlaneLossRecord(plane_id=0, spine_id=0, seen=0, expected=0, max_gap=0),
+            PlaneLossRecord(plane_id=0, path_id=0, seen=0, expected=0, max_gap=0),
         ))
         stats = LossFusionStats()
         apply_loss_report(
