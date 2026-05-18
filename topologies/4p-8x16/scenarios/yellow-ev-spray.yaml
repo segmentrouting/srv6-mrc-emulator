@@ -1,0 +1,38 @@
+# yellow-ev-spray.yaml — yellow tenant EV-spray, full fan-out.
+#
+# Yellow analogue of green-ev-spray.yaml. Same per-packet outer-DA
+# rotation across 4 planes * 8 spines = 32 EVs, but on the yellow
+# tenant — which means each packet's outer SID list has TWO uSIDs
+# (leaf-up `f<S>` + leaf→host `e009`) instead of green's one. This
+# scenario doubles as a regression check that the per-packet spine
+# rotation in the runner correctly rebuilds the SECOND uSID position
+# from `usid_outer_dst("yellow", ...)` on every packet, not just the
+# first.
+#
+# What to look for:
+#   - per_plane_sent:  balanced (round-robin still rotates planes
+#                      fastest).
+#   - per_ev_sent:     balanced across all 32 (plane, spine) keys.
+#   - On the wire:     outer DA's `f<S>` hextet rotates packet-by-
+#                      packet, `e009` host-hop stays constant.
+#
+# Run:
+#   sudo make scenario SCEN=yellow-ev-spray
+name: yellow-ev-spray
+description: |
+  Yellow tenant EV-spray over 8 spines * 4 planes (32 EVs per pair).
+  Validates that yellow's extra leaf->host hop (`e009`) survives
+  per-packet outer-SID rotation. Companion to green-ev-spray.yaml.
+
+paths_per_plane: 8
+
+flows:
+  - pairs: yellow-pairs-8
+    policy: ev_spray
+    rate: 1000pps
+    duration: 5s
+
+faults: []
+
+report:
+  out: results/yellow-ev-spray.json
