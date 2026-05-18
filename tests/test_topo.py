@@ -317,6 +317,112 @@ class TestSelectSpines(unittest.TestCase):
         b = topo.select_spines(4, 11, 3)
         self.assertEqual(a, b)
 
+    def test_reaches_non_consecutive_subsets(self):
+        # An earlier implementation returned `n` consecutive spines
+        # mod NUM_SPINES (e.g. only {0,1}, {1,2}, …) starving the
+        # other C(NUM_SPINES,n) - NUM_SPINES subsets. The Fisher-Yates
+        # rewrite must reach disjoint pairs too. We sweep many synthetic
+        # (src, dst) values and confirm we see at least one
+        # non-consecutive (gap > 1) subset.
+        seen_non_consecutive = False
+        for src in range(0, 100):
+            sub = topo.select_spines(src, src + 1000, 2)
+            a, b = sorted(sub)
+            if b - a > 1 and not (a == 0 and b == topo.NUM_SPINES - 1):
+                seen_non_consecutive = True
+                break
+        self.assertTrue(
+            seen_non_consecutive,
+            "select_spines never produced a non-consecutive subset over "
+            "100 synthetic pairs — distribution is still rotation-only"
+        )
+
+    def test_distribution_is_balanced_for_n2(self):
+        # Sanity check the spine distribution is roughly uniform. Over
+        # 1000 distinct pairs at n=2 (so 2000 picks total), each spine
+        # should see ~250 picks (12.5%). Allow generous tolerance —
+        # we only catch catastrophic biases (entire spine starved, or
+        # one spine taking 2x its share). Real-world this matters
+        # because production scenarios run with 8..16 pairs and any
+        # large per-spine bias means dark fabric.
+        from collections import Counter
+        totals = Counter()
+        for i in range(1000):
+            for spine in topo.select_spines(i, i + 10000, 2):
+                totals[spine] += 1
+        # Every spine seen at least once.
+        for s in range(topo.NUM_SPINES):
+            self.assertGreater(
+                totals[s], 0,
+                f"spine {s} got zero picks over 1000 pairs — distribution "
+                f"is severely biased"
+            )
+        # No spine takes more than 2x its share. Ideal share = 2000 / 8
+        # = 250; cap at 500.
+        ideal = 2 * 1000 // topo.NUM_SPINES
+        for s in range(topo.NUM_SPINES):
+            self.assertLess(
+                totals[s], 2 * ideal,
+                f"spine {s} got {totals[s]} picks (>2x ideal {ideal}) — "
+                f"distribution is biased"
+            )
+
+
+class TestSelectSpinesForAddrs(unittest.TestCase):
+    """Address-seeded variant used by EvSpray (FlowKey carries addrs,
+    not host ids)."""
+
+    def test_deterministic_per_address_pair(self):
+        a = topo.select_spines_for_addrs("fc00::1", "fc00::ff", 3)
+        b = topo.select_spines_for_addrs("fc00::1", "fc00::ff", 3)
+        self.assertEqual(a, b)
+
+    def test_symmetric_in_pair(self):
+        forward = topo.select_spines_for_addrs("fc00::1", "fc00::ff", 4)
+        reverse = topo.select_spines_for_addrs("fc00::ff", "fc00::1", 4)
+        self.assertEqual(forward, reverse)
+
+    def test_rejects_out_of_range_n(self):
+        with self.assertRaises(ValueError):
+            topo.select_spines_for_addrs("fc00::1", "fc00::ff", 0)
+        with self.assertRaises(ValueError):
+            topo.select_spines_for_addrs(
+                "fc00::1", "fc00::ff", topo.NUM_SPINES + 1
+            )
+
+    def test_process_stable_no_hash_seed_dependency(self):
+        # Regression: an earlier EvSpray implementation derived the
+        # subset from Python's hash() of the address strings, which is
+        # salted by PYTHONHASHSEED and produced different subsets in
+        # different sender processes. select_spines_for_addrs must NOT
+        # depend on hash(): the FNV mixer should give a value derived
+        # purely from the address byte string.
+        import subprocess, sys, json
+        # Compute locally.
+        local = topo.select_spines_for_addrs(
+            "2001:db8:bbbb::2", "2001:db8:bbbb:f::2", 4
+        )
+        # Compute in a subprocess with a different PYTHONHASHSEED.
+        out = subprocess.check_output([
+            sys.executable, "-c",
+            "from srv6_fabric.topo import select_spines_for_addrs; "
+            "import json; "
+            "print(json.dumps(list(select_spines_for_addrs("
+            "'2001:db8:bbbb::2','2001:db8:bbbb:f::2',4))))"
+        ], env={"PYTHONHASHSEED": "12345"})
+        sub = tuple(json.loads(out))
+        self.assertEqual(local, sub,
+                         "select_spines_for_addrs varies with "
+                         "PYTHONHASHSEED — must not depend on hash()")
+
+    def test_returns_exactly_n_distinct(self):
+        for n in range(1, topo.NUM_SPINES + 1):
+            sub = topo.select_spines_for_addrs("a", "z", n)
+            self.assertEqual(len(sub), n)
+            self.assertEqual(len(set(sub)), n)
+            for s in sub:
+                self.assertIn(s, range(topo.NUM_SPINES))
+
 
 if __name__ == "__main__":
     unittest.main()

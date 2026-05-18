@@ -23,7 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, TYPE_CHECKING
 
-from .topo import NUM_PLANES, NUM_SPINES, FlowKey, select_spines
+from .topo import (NUM_PLANES, NUM_SPINES, FlowKey, select_spines,
+                   select_spines_for_addrs)
 
 if TYPE_CHECKING:
     # Imported lazily inside HealthAwareMrc to avoid a circular import
@@ -95,21 +96,23 @@ class EvSpray:
             )
 
     def _spines_for_flow(self, flow: FlowKey) -> tuple[int, ...]:
-        """Per-flow spine subset, cached. Symmetric in flow direction."""
+        """Per-flow spine subset, cached. Symmetric in flow direction.
+
+        Seeded from the canonical (lo, hi) of the inner IPv6 addresses,
+        NOT from Python's `hash()`. `hash(str)` is salted by
+        PYTHONHASHSEED and varies across processes, so an earlier
+        implementation gave 8 senders 8 different spine subsets for the
+        "same" pair, and the lossy `% 1024` collapse on top of that
+        starved certain spines fabric-wide. select_spines_for_addrs
+        feeds the canonicalized address string straight into FNV-1a,
+        which is process-stable and full-entropy.
+        """
         cached = self._spine_subsets.get(flow)
         if cached is not None:
             return cached
-        # FlowKey carries IPv6 strings, not host ids. Use the flow hash
-        # as a stand-in for (src_id, dst_id) since select_spines only
-        # needs a stable pair fingerprint. We canonicalize on addresses
-        # so both directions of the same pair get the same subset.
-        lo, hi = sorted((flow.src_addr, flow.dst_addr))
-        # Derive synthetic numeric ids from the address strings for
-        # select_spines (which expects ints). Hash to small ints so
-        # select_spines's FNV-1a step gets fresh entropy.
-        a = (hash(lo) & 0xFFFFFFFF) % 1024
-        b = (hash(hi) & 0xFFFFFFFF) % 1024
-        subset = select_spines(a, b, self.paths_per_plane)
+        subset = select_spines_for_addrs(
+            flow.src_addr, flow.dst_addr, self.paths_per_plane,
+        )
         self._spine_subsets[flow] = subset
         return subset
 
