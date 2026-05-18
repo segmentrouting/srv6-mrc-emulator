@@ -61,13 +61,16 @@ class SentWindow:
     """One closed emit-window snapshot from the sender's perspective.
 
     `start_ns` and `end_ns` are wall-clock bounds (inclusive start,
-    exclusive end). `sent` is per-plane packet count. `window_id` is
-    optional bookkeeping for tests / diagnostics; the receiver's
-    window_id is independent, so we don't try to match them by id.
+    exclusive end). `sent` is a 2-D per-EV packet count indexed as
+    `sent[plane][path]` — the receiver's LossReport carries per-EV
+    `(plane_id, path_id, seen)` records and pairs against this same
+    granularity. `window_id` is optional bookkeeping for tests /
+    diagnostics; the receiver's window_id is independent, so we don't
+    try to match them by id.
     """
     start_ns: int
     end_ns: int
-    sent: Tuple[int, ...]
+    sent: Tuple[Tuple[int, ...], ...]
     window_id: int = 0
 
     def midpoint_ns(self) -> int:
@@ -77,12 +80,17 @@ class SentWindow:
 class SentWindowRing:
     """Bounded ring of recent emit-window snapshots for window pairing."""
 
-    def __init__(self, *, num_planes: int, capacity: int = 16) -> None:
+    def __init__(
+        self, *, num_planes: int, num_paths: int, capacity: int = 16,
+    ) -> None:
         if num_planes <= 0:
             raise ValueError(f"num_planes must be positive, got {num_planes}")
+        if num_paths <= 0:
+            raise ValueError(f"num_paths must be positive, got {num_paths}")
         if capacity <= 0:
             raise ValueError(f"capacity must be positive, got {capacity}")
         self._num_planes = num_planes
+        self._num_paths = num_paths
         self._ring: Deque[SentWindow] = deque(maxlen=capacity)
         self._lock = threading.Lock()
 
@@ -92,6 +100,12 @@ class SentWindowRing:
                 f"window.sent length {len(window.sent)} != "
                 f"num_planes {self._num_planes}"
             )
+        for plane_row in window.sent:
+            if len(plane_row) != self._num_paths:
+                raise ValueError(
+                    f"window.sent row length {len(plane_row)} != "
+                    f"num_paths {self._num_paths}"
+                )
         with self._lock:
             self._ring.append(window)
 
@@ -194,10 +208,16 @@ def apply_loss_report(
         denominator = 0
         used_sender_counter = False
         if paired is not None:
-            sender_sent = paired.sent[rec.plane_id]
-            if sender_sent > 0:
-                denominator = sender_sent
-                used_sender_counter = True
+            # Per-EV sender count: rows are planes, columns are paths.
+            # Defensive bounds-check in case a malformed/forward-compat
+            # report carries an out-of-range (plane, path).
+            if 0 <= rec.plane_id < len(paired.sent):
+                row = paired.sent[rec.plane_id]
+                if 0 <= rec.path_id < len(row):
+                    sender_sent = row[rec.path_id]
+                    if sender_sent > 0:
+                        denominator = sender_sent
+                        used_sender_counter = True
 
         if denominator == 0:
             denominator = rec.expected

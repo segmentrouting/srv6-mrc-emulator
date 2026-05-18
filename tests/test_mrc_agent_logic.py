@@ -239,58 +239,84 @@ class TestLossWindow(unittest.TestCase):
     def _flow(self):
         return ("green", 0, 15)
 
+    def _table(self, num_planes=4, num_paths=1):
+        return LossWindowTable(num_planes=num_planes, num_paths=num_paths)
+
     def test_empty_snapshot_is_empty(self):
-        t = LossWindowTable(num_planes=4)
+        t = self._table()
         rep = t.snapshot_and_reset(self._flow())
         self.assertEqual(rep.window_id, 0)
         self.assertEqual(rep.planes, ())
 
-    def test_single_plane_records(self):
-        t = LossWindowTable(num_planes=4)
+    def test_single_ev_records(self):
+        t = self._table()
         flow = self._flow()
         for seq in range(10):
-            t.record(flow, plane=2, seq=seq)
+            t.record(flow, plane=2, path=0, seq=seq)
         rep = t.snapshot_and_reset(flow)
         self.assertEqual(rep.window_id, 0)
         self.assertEqual(len(rep.planes), 1)
         rec = rep.planes[0]
         self.assertEqual(rec.plane_id, 2)
+        self.assertEqual(rec.path_id, 0)
         self.assertEqual(rec.seen, 10)
         self.assertEqual(rec.expected, 10)  # min=0, max=9 -> 10
         self.assertEqual(rec.max_gap, 1)
 
     def test_multi_plane_records(self):
-        t = LossWindowTable(num_planes=4)
+        t = self._table()
         flow = self._flow()
-        # Round-robin across planes 0..3.
+        # Round-robin across planes 0..3 (single path each).
         for seq in range(20):
-            t.record(flow, plane=seq % 4, seq=seq)
+            t.record(flow, plane=seq % 4, path=0, seq=seq)
         rep = t.snapshot_and_reset(flow)
         self.assertEqual(len(rep.planes), 4)
         # Each plane sees 5 packets, with seqs 0,4,8,12,16 (etc.).
         for rec in rep.planes:
+            self.assertEqual(rec.path_id, 0)
             self.assertEqual(rec.seen, 5)
             # min..max span = 16, so expected = 17.
             self.assertEqual(rec.expected, 17)
             # Gaps between consecutive seqs on the same plane are all 4.
             self.assertEqual(rec.max_gap, 4)
 
-    def test_window_id_increments(self):
-        t = LossWindowTable(num_planes=2)
+    def test_multi_path_records(self):
+        # Different paths on the same plane should produce separate
+        # PlaneLossRecord entries.
+        t = self._table(num_planes=2, num_paths=4)
         flow = self._flow()
-        t.record(flow, plane=0, seq=0)
+        # Spread 16 packets across (plane=1, path=0..3); every path
+        # gets 4 packets, seqs striped by path.
+        for seq in range(16):
+            t.record(flow, plane=1, path=seq % 4, seq=seq)
+        rep = t.snapshot_and_reset(flow)
+        self.assertEqual(len(rep.planes), 4)
+        # Records emitted in (plane, path) order; all on plane 1, paths
+        # 0..3 in order.
+        for path_id, rec in enumerate(rep.planes):
+            self.assertEqual(rec.plane_id, 1)
+            self.assertEqual(rec.path_id, path_id)
+            self.assertEqual(rec.seen, 4)
+            # min..max span: e.g. path=0 sees seqs 0,4,8,12 -> 13.
+            self.assertEqual(rec.expected, 13)
+            self.assertEqual(rec.max_gap, 4)
+
+    def test_window_id_increments(self):
+        t = self._table(num_planes=2)
+        flow = self._flow()
+        t.record(flow, plane=0, path=0, seq=0)
         self.assertEqual(t.snapshot_and_reset(flow).window_id, 0)
         # Even with no traffic, the window_id increments.
         self.assertEqual(t.snapshot_and_reset(flow).window_id, 1)
         self.assertEqual(t.snapshot_and_reset(flow).window_id, 2)
 
     def test_reset_zeros_counters(self):
-        t = LossWindowTable(num_planes=2)
+        t = self._table(num_planes=2)
         flow = self._flow()
-        t.record(flow, plane=0, seq=5)
+        t.record(flow, plane=0, path=0, seq=5)
         t.snapshot_and_reset(flow)
         # After reset, a fresh single record produces seen=1, gap=0.
-        t.record(flow, plane=0, seq=100)
+        t.record(flow, plane=0, path=0, seq=100)
         rep = t.snapshot_and_reset(flow)
         self.assertEqual(rep.planes[0].seen, 1)
         self.assertEqual(rep.planes[0].max_gap, 0)
@@ -298,37 +324,41 @@ class TestLossWindow(unittest.TestCase):
         self.assertEqual(rep.planes[0].expected, 1)
 
     def test_max_gap_tracks_largest_jump(self):
-        t = LossWindowTable(num_planes=1)
+        t = self._table(num_planes=1)
         flow = self._flow()
         for seq in [10, 11, 12, 50, 51]:
-            t.record(flow, plane=0, seq=seq)
+            t.record(flow, plane=0, path=0, seq=seq)
         rep = t.snapshot_and_reset(flow)
         # Largest forward jump is 50 - 12 = 38.
         self.assertEqual(rep.planes[0].max_gap, 38)
 
     def test_known_flows_listed(self):
-        t = LossWindowTable(num_planes=2)
-        t.record(("a", 0, 1), plane=0, seq=0)
-        t.record(("b", 0, 2), plane=1, seq=0)
+        t = self._table(num_planes=2)
+        t.record(("a", 0, 1), plane=0, path=0, seq=0)
+        t.record(("b", 0, 2), plane=1, path=0, seq=0)
         flows = t.known_flows()
         self.assertEqual(set(flows), {("a", 0, 1), ("b", 0, 2)})
 
     def test_forget_drops_flow(self):
-        t = LossWindowTable(num_planes=2)
-        t.record(("a", 0, 1), plane=0, seq=0)
+        t = self._table(num_planes=2)
+        t.record(("a", 0, 1), plane=0, path=0, seq=0)
         t.forget(("a", 0, 1))
         self.assertEqual(t.known_flows(), ())
         # Forgetting an unknown flow is a no-op.
         t.forget(("nonexistent",))
 
     def test_validation(self):
-        t = LossWindowTable(num_planes=4)
+        t = self._table(num_planes=4, num_paths=2)
         with self.assertRaises(ValueError):
-            t.record(self._flow(), plane=4, seq=0)
+            t.record(self._flow(), plane=4, path=0, seq=0)
         with self.assertRaises(ValueError):
-            t.record(self._flow(), plane=0, seq=-1)
+            t.record(self._flow(), plane=0, path=2, seq=0)
         with self.assertRaises(ValueError):
-            LossWindowTable(num_planes=0)
+            t.record(self._flow(), plane=0, path=0, seq=-1)
+        with self.assertRaises(ValueError):
+            LossWindowTable(num_planes=0, num_paths=1)
+        with self.assertRaises(ValueError):
+            LossWindowTable(num_planes=4, num_paths=0)
 
 
 # ---------------------------------------------------------------------------
@@ -366,15 +396,16 @@ class TestComputeLossRatio(unittest.TestCase):
 
 class TestSentWindowRing(unittest.TestCase):
     def test_push_validates_plane_count(self):
-        ring = SentWindowRing(num_planes=4)
+        ring = SentWindowRing(num_planes=4, num_paths=1)
         with self.assertRaises(ValueError):
-            ring.push(SentWindow(start_ns=0, end_ns=100, sent=(1, 2, 3)))
+            ring.push(SentWindow(start_ns=0, end_ns=100,
+                                 sent=((1,), (2,), (3,))))
 
     def test_capacity_drops_oldest(self):
-        ring = SentWindowRing(num_planes=2, capacity=2)
-        ring.push(SentWindow(start_ns=0, end_ns=100, sent=(10, 10)))
-        ring.push(SentWindow(start_ns=100, end_ns=200, sent=(20, 20)))
-        ring.push(SentWindow(start_ns=200, end_ns=300, sent=(30, 30)))
+        ring = SentWindowRing(num_planes=2, num_paths=1, capacity=2)
+        ring.push(SentWindow(start_ns=0, end_ns=100, sent=((10,), (10,))))
+        ring.push(SentWindow(start_ns=100, end_ns=200, sent=((20,), (20,))))
+        ring.push(SentWindow(start_ns=200, end_ns=300, sent=((30,), (30,))))
         # Only the last two remain.
         self.assertEqual(len(ring), 2)
         # Looking near t=50 (the dropped window's mid) finds the
@@ -383,18 +414,18 @@ class TestSentWindowRing(unittest.TestCase):
         self.assertEqual(found.start_ns, 100)
 
     def test_find_closest_within_skew(self):
-        ring = SentWindowRing(num_planes=1, capacity=4)
-        ring.push(SentWindow(start_ns=0, end_ns=100, sent=(10,)))
-        ring.push(SentWindow(start_ns=200, end_ns=300, sent=(20,)))
-        ring.push(SentWindow(start_ns=400, end_ns=500, sent=(30,)))
+        ring = SentWindowRing(num_planes=1, num_paths=1, capacity=4)
+        ring.push(SentWindow(start_ns=0, end_ns=100, sent=((10,),)))
+        ring.push(SentWindow(start_ns=200, end_ns=300, sent=((20,),)))
+        ring.push(SentWindow(start_ns=400, end_ns=500, sent=((30,),)))
         # Closest to 250 is window [200,300] mid=250.
         w = ring.find_closest(target_ns=250, max_skew_ns=1)
         self.assertIsNotNone(w)
         self.assertEqual(w.start_ns, 200)
 
     def test_find_closest_returns_none_when_outside_skew(self):
-        ring = SentWindowRing(num_planes=1, capacity=2)
-        ring.push(SentWindow(start_ns=0, end_ns=100, sent=(10,)))
+        ring = SentWindowRing(num_planes=1, num_paths=1, capacity=2)
+        ring.push(SentWindow(start_ns=0, end_ns=100, sent=((10,),)))
         # Mid is 50; target 1_000_000 is far. Skew threshold tight.
         w = ring.find_closest(target_ns=1_000_000, max_skew_ns=10)
         self.assertIsNone(w)
@@ -414,9 +445,26 @@ class TestApplyLossReport(unittest.TestCase):
             num_paths=self.NUM_PLANES, cfg=c,
         )
 
+    def _ring(self):
+        # Tests use num_paths == NUM_PLANES so a single index can stand
+        # in as both plane and path when convenient.
+        return SentWindowRing(
+            num_planes=self.NUM_PLANES, num_paths=self.NUM_PLANES,
+        )
+
+    @staticmethod
+    def _per_ev_sent(per_plane: tuple, num_paths: int) -> tuple:
+        """Helper: build a per-EV `sent` grid that attributes the whole
+        per-plane count to (plane, path=0). Lets these tests target a
+        single EV cell while still exercising the 2-D loss-pairing path.
+        """
+        return tuple(
+            (n,) + (0,) * (num_paths - 1) for n in per_plane
+        )
+
     def test_empty_report_noop(self):
         t = self._table()
-        ring = SentWindowRing(num_planes=self.NUM_PLANES)
+        ring = self._ring()
         stats = LossFusionStats()
         apply_loss_report(
             table=t, tenant="green",
@@ -430,15 +478,15 @@ class TestApplyLossReport(unittest.TestCase):
         self.assertEqual(t.state("green", 0, 0), EVState.UNKNOWN)
 
     def test_uses_sender_counter_when_available(self):
-        # Sender sent 100 on plane 0; receiver saw 50 -> 50% loss.
-        # With loss_threshold=0.05 and loss_demote_consecutive=2 we
-        # should see one bad-window counter increment but no demote
+        # Sender sent 100 on (plane=0, path=0); receiver saw 50 -> 50%
+        # loss. With loss_threshold=0.05 and loss_demote_consecutive=2
+        # we should see one bad-window counter increment but no demote
         # (yet).
         t = self._table(loss_threshold=0.05, loss_demote_consecutive=2)
-        ring = SentWindowRing(num_planes=self.NUM_PLANES)
+        ring = self._ring()
         ring.push(SentWindow(
             start_ns=0, end_ns=100_000_000,
-            sent=(100, 100, 100, 100),
+            sent=self._per_ev_sent((100, 100, 100, 100), self.NUM_PLANES),
         ))
         report = LossReport(window_id=0, planes=(
             PlaneLossRecord(plane_id=0, path_id=0, seen=50, expected=80, max_gap=2),
@@ -459,10 +507,10 @@ class TestApplyLossReport(unittest.TestCase):
     def test_consecutive_bad_windows_demote(self):
         t = self._table(loss_threshold=0.05, loss_demote_consecutive=2,
                         min_active_evs=1)
-        ring = SentWindowRing(num_planes=self.NUM_PLANES)
+        ring = self._ring()
         ring.push(SentWindow(
             start_ns=0, end_ns=100_000_000,
-            sent=(100, 100, 100, 100),
+            sent=self._per_ev_sent((100, 100, 100, 100), self.NUM_PLANES),
         ))
         bad_report = LossReport(window_id=0, planes=(
             PlaneLossRecord(plane_id=0, path_id=0, seen=50, expected=80, max_gap=2),
@@ -483,7 +531,7 @@ class TestApplyLossReport(unittest.TestCase):
     def test_falls_back_to_receiver_expected(self):
         # No SentWindow in ring. Use receiver's expected_local field.
         t = self._table(loss_threshold=0.05, loss_demote_consecutive=2)
-        ring = SentWindowRing(num_planes=self.NUM_PLANES)
+        ring = self._ring()
         report = LossReport(window_id=0, planes=(
             PlaneLossRecord(plane_id=1, path_id=0, seen=50, expected=80, max_gap=2),
         ))
@@ -501,7 +549,7 @@ class TestApplyLossReport(unittest.TestCase):
     def test_skips_plane_with_no_signal(self):
         # seen=0 AND expected=0 -> no info.
         t = self._table()
-        ring = SentWindowRing(num_planes=self.NUM_PLANES)
+        ring = self._ring()
         report = LossReport(window_id=0, planes=(
             PlaneLossRecord(plane_id=0, path_id=0, seen=0, expected=0, max_gap=0),
         ))

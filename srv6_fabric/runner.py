@@ -20,7 +20,7 @@ Public API:
   - run_sender(flow, policy, rate_pps, duration_s) -> SenderResult
   - run_receiver(self_host, self_id, tenant, idle_timeout_s,
                  stop_event=None) -> dict  (multi-flow report)
-  - parse_payload(raw_bytes) -> (seq, plane) | None
+  - parse_payload(raw_bytes) -> (seq, plane, path) | None
 """
 
 from __future__ import annotations
@@ -44,9 +44,12 @@ from .topo import (
     FlowKey, host_underlay_addr, inner_addr, spine_for, usid_outer_dst,
 )
 
-# 8 bytes seq + 1 byte plane = 9 bytes header in the UDP payload.
-_PAYLOAD_HDR = "!QB"
-_PAYLOAD_HDR_LEN = struct.calcsize(_PAYLOAD_HDR)   # 9
+# 8 bytes seq + 1 byte plane + 1 byte path = 10 bytes header in the UDP
+# payload. path is the spine_id (==MRC path_id) the sender chose for
+# this packet's plane; non-EV-aware senders write path=0. Receivers
+# feed (plane, path) into MRC's per-EV loss accountant.
+_PAYLOAD_HDR = "!QBB"
+_PAYLOAD_HDR_LEN = struct.calcsize(_PAYLOAD_HDR)   # 10
 _PAD = b"X" * 32                                    # frame >= 64 bytes
 
 
@@ -127,17 +130,22 @@ def host_for(tenant: str, host_id: int) -> str:
 
 # --- payload encode/decode (no scapy required) ------------------------------
 
-def encode_payload(seq: int, plane: int) -> bytes:
-    """Build the UDP payload (9-byte header + 32-byte pad). Stable wire fmt."""
-    return struct.pack(_PAYLOAD_HDR, seq, plane) + _PAD
+def encode_payload(seq: int, plane: int, path: int = 0) -> bytes:
+    """Build the UDP payload (10-byte header + 32-byte pad). Stable wire fmt.
+
+    `path` is the spine_id chosen for this packet (== MRC path_id).
+    Non-EV-aware senders should leave it at 0; receivers attribute
+    per-EV loss using (plane, path).
+    """
+    return struct.pack(_PAYLOAD_HDR, seq, plane, path) + _PAD
 
 
-def parse_payload(raw: bytes) -> Optional[tuple[int, int]]:
-    """Inverse of encode_payload. Returns (seq, plane) or None for too-short."""
+def parse_payload(raw: bytes) -> Optional[tuple[int, int, int]]:
+    """Inverse of encode_payload. Returns (seq, plane, path) or None."""
     if len(raw) < _PAYLOAD_HDR_LEN:
         return None
-    seq, plane = struct.unpack(_PAYLOAD_HDR, raw[:_PAYLOAD_HDR_LEN])
-    return seq, plane
+    seq, plane, path = struct.unpack(_PAYLOAD_HDR, raw[:_PAYLOAD_HDR_LEN])
+    return seq, plane, path
 
 
 # --- send -------------------------------------------------------------------
@@ -162,7 +170,7 @@ def _open_send_socket(iface: str) -> socket.socket:
 
 def _build_packet_bytes(src_underlay: str, dst_outer: str,
                         src_inner: str, dst_inner: str,
-                        seq: int, plane: int) -> bytes:
+                        seq: int, plane: int, path: int) -> bytes:
     """Build full outer/inner/UDP bytes. Lazy-imports scapy."""
     # Local import keeps the orchestrator side (no scapy) able to import this
     # module without an error. AGENTS.md notes scapy noise on import.
@@ -170,7 +178,7 @@ def _build_packet_bytes(src_underlay: str, dst_outer: str,
     _logging.getLogger("scapy.runtime").setLevel(_logging.ERROR)
     from scapy.all import IPv6, UDP  # type: ignore
 
-    payload = encode_payload(seq, plane)
+    payload = encode_payload(seq, plane, path)
     inner = (IPv6(src=src_inner, dst=dst_inner)
              / UDP(sport=SPRAY_PORT, dport=SPRAY_PORT)
              / payload)
@@ -193,7 +201,8 @@ def run_sender(flow: FlowEndpoint,
         rate_pps: positive int, packets/sec
         duration_s: 0 = run until stop_event/SIGINT
         stop_event: optional Event for external cancellation
-        progress_cb: optional fn(seq, plane) called per packet (debug)
+        progress_cb: optional fn(seq, plane, path) called per packet
+            (debug / sender-side MRC bookkeeping)
 
     Returns: SenderResult
     """
@@ -264,7 +273,8 @@ def run_sender(flow: FlowEndpoint,
                     ev_spine = spine
                     src_u, outer_d, sa = plane_meta[plane]
                 pkt = _build_packet_bytes(
-                    src_u, outer_d, src_inner, dst_inner, seq, plane,
+                    src_u, outer_d, src_inner, dst_inner,
+                    seq, plane, ev_spine,
                 )
                 try:
                     sockets[plane].sendto(pkt, sa)
@@ -276,7 +286,7 @@ def run_sender(flow: FlowEndpoint,
                             result.per_ev_sent.get(ev_key, 0) + 1
                     result.sent += 1
                     if progress_cb is not None:
-                        progress_cb(seq, plane)
+                        progress_cb(seq, plane, ev_spine)
                 except OSError:
                     result.errors += 1
                 seq += 1
@@ -333,9 +343,9 @@ def run_receiver(self_host: str,
 
     `on_packet` (optional): callable invoked once per successfully decoded
     data packet, with signature `on_packet(flow_key: FlowKey, plane: int,
-    seq: int)`. Used by the MRC receiver agent to feed its loss-window
-    accountant. Callback exceptions are caught + logged but never crash
-    the sniffer (the receiver's job is to keep counting).
+    path: int, seq: int)`. Used by the MRC receiver agent to feed its
+    per-EV loss-window accountant. Callback exceptions are caught + logged
+    but never crash the sniffer (the receiver's job is to keep counting).
     """
     # Lazy scapy import — keeps orchestrator (no scapy) able to import this.
     logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
@@ -373,7 +383,7 @@ def run_receiver(self_host: str,
         parsed = parse_payload(bytes(udp.payload))
         if parsed is None:
             return
-        seq, plane = parsed
+        seq, plane, path = parsed
 
         flow = FlowKey(
             src_addr=inner_src,
@@ -387,7 +397,7 @@ def run_receiver(self_host: str,
         last_rx[0] = time.monotonic()
         if on_packet is not None:
             try:
-                on_packet(flow, plane, seq)
+                on_packet(flow, plane, path, seq)
             except Exception as e:  # noqa: BLE001 — sniffer must keep counting
                 logging.getLogger(__name__).debug(
                     "run_receiver on_packet hook raised %s; ignoring", e,

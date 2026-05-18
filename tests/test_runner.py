@@ -18,30 +18,44 @@ class TestPayloadCodec(unittest.TestCase):
     def test_roundtrip_basic(self):
         for seq in (0, 1, 42, 2**63 - 1):
             for plane in range(4):
-                buf = encode_payload(seq, plane)
-                self.assertEqual(parse_payload(buf), (seq, plane))
+                for path in (0, 1, 7, 255):
+                    buf = encode_payload(seq, plane, path)
+                    self.assertEqual(
+                        parse_payload(buf), (seq, plane, path),
+                    )
 
-    def test_payload_length_is_41(self):
-        # 8 (seq) + 1 (plane) + 32 (pad) = 41. Total frame >= 64B when
-        # wrapped in IPv6+IPv6+UDP, satisfying min ethernet.
-        self.assertEqual(len(encode_payload(0, 0)), 41)
+    def test_default_path_is_zero(self):
+        # encode_payload(seq, plane) without an explicit path defaults
+        # to 0; lets non-EV-aware callers keep their two-arg form.
+        buf = encode_payload(5, 2)
+        self.assertEqual(parse_payload(buf), (5, 2, 0))
+
+    def test_payload_length_is_42(self):
+        # 8 (seq) + 1 (plane) + 1 (path) + 32 (pad) = 42. Total frame
+        # stays >= 64B when wrapped in IPv6+IPv6+UDP, satisfying min
+        # ethernet.
+        self.assertEqual(len(encode_payload(0, 0, 0)), 42)
 
     def test_parse_short_returns_none(self):
         self.assertIsNone(parse_payload(b""))
-        self.assertIsNone(parse_payload(b"\x00" * 8))   # one byte short
+        self.assertIsNone(parse_payload(b"\x00" * 9))   # one byte short
 
     def test_parse_ignores_trailing_bytes(self):
-        # Receiver should accept any pad length >= 0 after the 9B header.
-        buf = encode_payload(99, 2) + b"extra junk"
-        self.assertEqual(parse_payload(buf), (99, 2))
+        # Receiver should accept any pad length >= 0 after the 10B header.
+        buf = encode_payload(99, 2, 3) + b"extra junk"
+        self.assertEqual(parse_payload(buf), (99, 2, 3))
 
     def test_wire_format_stability(self):
         # Lock byte-for-byte format so we don't accidentally break
         # interop with the existing tools/spray.py senders/receivers.
-        # !QB encodes seq=1 as 8 big-endian bytes then plane=3 as 1 byte.
-        buf = encode_payload(1, 3)
-        self.assertEqual(buf[:9], b"\x00\x00\x00\x00\x00\x00\x00\x01\x03")
-        self.assertEqual(buf[9:], b"X" * 32)
+        # !QBB encodes seq=1 as 8 big-endian bytes, plane=3 as 1 byte,
+        # path=5 as 1 byte.
+        buf = encode_payload(1, 3, 5)
+        self.assertEqual(
+            buf[:10],
+            b"\x00\x00\x00\x00\x00\x00\x00\x01\x03\x05",
+        )
+        self.assertEqual(buf[10:], b"X" * 32)
 
 
 class TestFlowEndpoint(unittest.TestCase):

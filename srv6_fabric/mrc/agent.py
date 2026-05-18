@@ -44,7 +44,7 @@ ReceiverMrcAgent runs THREE daemon threads per agent:
   - loss-emit thread: every loss_window_ms, snapshot each known flow
     in LossWindowTable, encode LOSS_REPORT, sendto cached reply_addr
 
-Plus: `agent.record_data(flow_key, plane, seq)` hooked into the
+Plus: `agent.record_data(flow_key, plane, path, seq)` hooked into the
 existing data-receive path so the LossWindowTable sees data packets.
 
 All threads are daemons; they exit when the main thread does. Each
@@ -317,7 +317,9 @@ class SenderMrcAgent:
             num_paths=NUM_SPINES,
             probe_timeout_ns=config.probe_timeout_ms * 1_000_000,
         )
-        self.sent_ring = SentWindowRing(num_planes=NUM_PLANES)
+        self.sent_ring = SentWindowRing(
+            num_planes=NUM_PLANES, num_paths=NUM_SPINES,
+        )
 
         # Per-plane peer addresses for probes. For both tenants we use
         # the inner (plane-independent) host address; plane selection is
@@ -355,10 +357,17 @@ class SenderMrcAgent:
         }
         self._report_socket: socket.socket = report_socket_factory()
 
-        # Sender-side per-plane TX counter for the current emit-window.
-        # Updated by record_sent() on the hot path; snapshotted by the
-        # window-rotate thread.
-        self._current_window_sent: List[int] = [0] * NUM_PLANES
+        # Sender-side per-EV TX counter for the current emit-window,
+        # indexed `[plane][path]`. Updated by record_sent() on the hot
+        # path; snapshotted (and reset) by the window-rotate thread.
+        # Per-EV (rather than per-plane) granularity is required so the
+        # apply_loss_report fusion can pair its denominator against the
+        # receiver's per-EV `seen` counter — a per-plane denominator
+        # over-counts by the spray-fanout factor and would force every
+        # EV's loss ratio toward 1.0 even when the EV is healthy.
+        self._current_window_sent: List[List[int]] = [
+            [0] * NUM_SPINES for _ in range(NUM_PLANES)
+        ]
         self._current_window_start_ns: int = self.clock_ns()
         self._current_window_id: int = 0
 
@@ -394,21 +403,27 @@ class SenderMrcAgent:
             if remaining > 0:
                 t.join(timeout=remaining)
 
-    def record_sent(self, plane: int) -> None:
+    def record_sent(self, plane: int, path: int = 0) -> None:
         """Hook for the runner's progress_cb. O(1), lock-free per call;
         the window-rotate thread snapshots the counters under the lock.
 
-        Out-of-range planes are silently dropped — defensive: a policy
-        returning garbage shouldn't crash the agent.
+        `path` is the EV index inside the plane (0..NUM_SPINES-1). The
+        default of 0 lets older non-EV-aware callers keep working — they
+        attribute all packets to path 0, which is still correct for
+        the per-plane roll-up but degrades per-EV loss attribution.
+        EV-aware spray paths (cli/spray.py) pass the real spine id.
+
+        Out-of-range (plane, path) are silently dropped — defensive: a
+        policy returning garbage shouldn't crash the agent.
         """
-        if 0 <= plane < NUM_PLANES:
+        if 0 <= plane < NUM_PLANES and 0 <= path < NUM_SPINES:
             # We trade strict atomicity for speed here: Python's list
             # element += is not atomic, but a single thread (the spray
             # hot loop) calls record_sent, and the window-rotate thread
             # takes the lock when snapshotting. Worst case is one
             # off-by-one in a snapshot taken concurrently with an
             # increment, which is negligible for loss math.
-            self._current_window_sent[plane] += 1
+            self._current_window_sent[plane][path] += 1
 
     # --- thread bodies -------------------------------------------------
 
@@ -539,18 +554,22 @@ class SenderMrcAgent:
     def _rotate_window(self) -> None:
         """Snapshot the current sent counters into a closed SentWindow.
 
-        Resets per-plane counters under the lock so concurrent
-        record_sent calls don't lose increments straddling the rotate.
+        Resets per-EV counters under the lock so concurrent record_sent
+        calls don't lose increments straddling the rotate. The snapshot
+        is stored as a tuple-of-tuples so SentWindow remains hashable /
+        immutable.
         """
         now_ns = self.clock_ns()
         with self._lock:
-            sent = tuple(self._current_window_sent)
+            sent = tuple(tuple(row) for row in self._current_window_sent)
             start = self._current_window_start_ns
             wid = self._current_window_id
-            self._current_window_sent = [0] * NUM_PLANES
+            self._current_window_sent = [
+                [0] * NUM_SPINES for _ in range(NUM_PLANES)
+            ]
             self._current_window_start_ns = now_ns
             self._current_window_id = (wid + 1) & 0xFFFF
-        if any(s > 0 for s in sent):
+        if any(any(row) for row in sent):
             self.sent_ring.push(SentWindow(
                 start_ns=start, end_ns=now_ns,
                 sent=sent, window_id=wid,
@@ -623,7 +642,7 @@ class ReceiverMrcAgent:
         LOSS_REPORTs back to the cached sender addresses
 
     The data RX path stays in spray.py / runner.py; this agent exposes
-    `record_data(flow_key, plane, seq)` for that path to call.
+    `record_data(flow_key, plane, path, seq)` for that path to call.
     """
 
     def __init__(
@@ -645,7 +664,9 @@ class ReceiverMrcAgent:
         # same socket object for every plane arg (Phase 1a step 3).
         self._default_rx_socket: Optional[socket.socket] = None
 
-        self.loss_table = LossWindowTable(num_planes=NUM_PLANES)
+        self.loss_table = LossWindowTable(
+            num_planes=NUM_PLANES, num_paths=NUM_SPINES,
+        )
 
         # Cache of (tenant_id, src_id) -> sender reply info, learned
         # from received PROBEs. Keyed by tenant_id + src_id (not the
@@ -758,9 +779,9 @@ class ReceiverMrcAgent:
             if remaining > 0:
                 t.join(timeout=remaining)
 
-    def record_data(self, flow_key, plane: int, seq: int) -> None:
+    def record_data(self, flow_key, plane: int, path: int, seq: int) -> None:
         """Hook for the data-RX path."""
-        self.loss_table.record(flow_key, plane=plane, seq=seq)
+        self.loss_table.record(flow_key, plane=plane, path=path, seq=seq)
 
     def known_senders(self) -> Tuple[Tuple[int, int], ...]:
         """Test/diagnostic accessor for the sender cache."""

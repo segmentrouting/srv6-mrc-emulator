@@ -210,7 +210,7 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
             table=policy.table,
             config=agent_cfg,
         )
-        progress_cb = lambda _seq, plane: mrc_agent.record_sent(plane)
+        progress_cb = lambda _seq, plane, path: mrc_agent.record_sent(plane, path)
 
     if not args.json:
         spine = spine_for(my_id, args.dst_id)
@@ -304,7 +304,7 @@ def cmd_recv(args, tenant: str, my_id: int) -> int:
             config=agent_cfg,
         )
 
-        def _on_packet(flow_key, plane: int, seq: int) -> None:
+        def _on_packet(flow_key, plane: int, path: int, seq: int) -> None:
             # FlowKey.src_addr is the sender's inner address. Translate
             # to (tenant_id, src_id) so the receiver can route loss
             # reports back via its sender cache. Packets from senders
@@ -320,7 +320,9 @@ def cmd_recv(args, tenant: str, my_id: int) -> int:
                 return
             tid = topo_tenant_id(sender_tenant)
             agent_flow_key = (tid, src_id, my_id)
-            mrc_agent.record_data(agent_flow_key, plane=plane, seq=seq)
+            mrc_agent.record_data(
+                agent_flow_key, plane=plane, path=path, seq=seq,
+            )
 
         on_packet = _on_packet
 

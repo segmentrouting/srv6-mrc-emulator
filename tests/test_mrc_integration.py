@@ -11,10 +11,10 @@ distribution as expected.
 The data plane is fully simulated — we do not run the spray runner here.
 A simulated "send" is just:
 
-    plane = policy.pick(seq, flow_key)
-    sender.record_sent(plane)            # feeds SentWindowRing
-    if plane != bad_plane:
-        receiver.record_data(flow_key, plane, seq)  # feeds LossWindowTable
+    plane, path = policy.pick_ev(seq, flow_key)
+    sender.record_sent(plane, path)       # feeds SentWindowRing[plane][path]
+    if (plane, path) != bad_ev:
+        receiver.record_data(flow_key, plane=plane, path=path, seq=seq)
 
 So the receiver "sees" 100% of plane-0 traffic, 0% of bad_plane traffic
 (the rest somewhere in between for the asymmetric variant). The
@@ -95,45 +95,57 @@ def _build_pair(table: EVStateTable):
 
 def _drive_spray(policy: HealthAwareMrc, sender: SenderMrcAgent,
                  receiver: ReceiverMrcAgent, flow_key,
-                 *, n: int, bad_plane=None, bad_loss: float = 1.0,
-                 per_plane_seq=None,
+                 *, n: int, bad_ev=None, bad_loss: float = 1.0,
+                 per_ev_seq=None,
                  ) -> collections.Counter:
-    """Simulate `n` data packets through `policy.pick`.
+    """Simulate `n` data packets through `policy.pick_ev`.
 
-    Each plane is given its own monotonic seq stream (in `per_plane_seq`,
-    a mutable list of length NUM_PLANES the caller threads across
-    invocations) so the receiver's max_seq − min_seq + 1 estimate of
-    "expected" is accurate; mixing one global seq across planes would
-    let normal plane-skipping look like loss in the receiver's per-plane
-    window.
+    Each EV (plane, path) is given its own monotonic seq stream (in
+    `per_ev_seq`, a mutable dict the caller threads across invocations)
+    so the receiver's per-EV max_seq − min_seq + 1 estimate of
+    "expected" matches actual sent packets — using a per-plane stream
+    would let normal EV-skipping look like loss in the receiver's
+    per-EV loss window.
 
-    `bad_plane` simulates partial-or-total loss on a single plane:
-    fraction `bad_loss` of packets picked for `bad_plane` are dropped
-    (not handed to receiver.record_data). bad_loss=1.0 means 100% loss
-    but then the receiver sees zero arrivals on bad_plane and its loss
-    window has nothing to estimate from — use 0.5 if you actually want
-    the receiver to flag the plane.
+    `bad_ev` is a `(plane, path)` tuple or callable `(plane, path) ->
+    bool` that decides whether the EV is "broken". `bad_loss` is the
+    drop probability for matching EVs (0..1). With `bad_loss < 1.0`
+    we still need *some* arrivals on the broken EV so the receiver's
+    loss window has min/max to estimate expected from; use 0.5 for
+    real partial-loss scenarios.
+
+    Returns a Counter keyed by `(plane, path)` recording how many
+    packets the policy picked for each EV.
     """
-    if per_plane_seq is None:
-        per_plane_seq = [0] * NUM_PLANES
+    if per_ev_seq is None:
+        per_ev_seq = {}
     pol_flow = FlowKey(src_addr="fc00::1", dst_addr="fc00::15",
                        src_port=10000, dst_port=20000)
+    if callable(bad_ev):
+        is_bad = bad_ev
+    elif bad_ev is None:
+        is_bad = lambda _p, _q: False  # noqa: E731
+    else:
+        bp, bq = bad_ev
+        is_bad = lambda p, q: p == bp and q == bq  # noqa: E731
     picks: collections.Counter = collections.Counter()
     for i in range(n):
-        plane = policy.pick(i, pol_flow)
-        picks[plane] += 1
-        sender.record_sent(plane)
-        seq = per_plane_seq[plane]
-        per_plane_seq[plane] += 1
+        plane, path = policy.pick_ev(i, pol_flow)
+        picks[(plane, path)] += 1
+        sender.record_sent(plane, path)
+        seq = per_ev_seq.get((plane, path), 0)
+        per_ev_seq[(plane, path)] = seq + 1
         drop = False
-        if plane == bad_plane and bad_loss > 0:
+        if is_bad(plane, path) and bad_loss > 0:
             if bad_loss >= 1.0:
                 drop = True
             else:
                 step = max(1, int(round(1.0 / bad_loss)))
                 drop = (seq % step) == 0
         if not drop:
-            receiver.record_data(flow_key, plane=plane, seq=seq)
+            receiver.record_data(
+                flow_key, plane=plane, path=path, seq=seq,
+            )
     return picks
 
 
@@ -159,28 +171,30 @@ class HealthyFabricTests(unittest.TestCase):
                 timeout_s=1.0,
             ), "receiver never learned sender")
 
-            # Drive 200 picks across ~4 loss windows. With no plane
+            # Drive 200 picks across ~4 loss windows. With no EV
             # dropped, every packet reaches the receiver.
-            seqs = [0] * NUM_PLANES
+            seqs = {}
             picks = _drive_spray(policy, sender, receiver, flow_key,
-                                 n=200, bad_plane=None,
-                                 per_plane_seq=seqs)
+                                 n=200, bad_ev=None,
+                                 per_ev_seq=seqs)
             time.sleep(FAST_CONFIG.loss_window_ms * 3.0 / 1000.0)
 
-            # No plane should be ASSUMED_BAD. We pull the per-plane
-            # state from the EVStateTable directly.
+            # No EV should be ASSUMED_BAD. Check every (plane, path)
+            # cell in the EVStateTable.
             for plane in range(NUM_PLANES):
-                st = table.state("green", plane, 0)
-                self.assertNotEqual(
-                    st.name, "ASSUMED_BAD",
-                    f"plane {plane} unexpectedly demoted; state={st}",
-                )
+                for path in range(NUM_SPINES):
+                    st = table.state("green", plane, path)
+                    self.assertNotEqual(
+                        st.name, "ASSUMED_BAD",
+                        f"EV ({plane},{path}) unexpectedly demoted; "
+                        f"state={st}",
+                    )
 
-            # Distribution sanity: uniform-ish weights mean no plane
-            # should have gotten zero picks across 200 draws. (The
-            # golden-ratio picker is deterministic but does spread across
-            # all bins when weights are equal.)
-            self.assertEqual(set(picks), set(range(NUM_PLANES)),
+            # Distribution sanity: uniform weights mean every plane
+            # should have gotten picks across 200 draws. (We aggregate
+            # ev_picks to plane buckets for the legacy check.)
+            planes_seen = {plane for (plane, _path) in picks}
+            self.assertEqual(planes_seen, set(range(NUM_PLANES)),
                              f"clean fabric left a plane unused: {picks}")
         finally:
             sender.stop(timeout_s=0.5)
@@ -201,13 +215,14 @@ class PlaneLossShiftsDistributionTests(unittest.TestCase):
 
         # EV-centric expectation: with NUM_PLANES planes and NUM_SPINES
         # paths/plane there are NUM_PLANES * NUM_SPINES EVs; a single
-        # failure drops *one EV* (here (BAD_PLANE, 0), since loss_window
-        # still emits path_id=0 pending commit 4/5 of the per-EV
-        # rewrite). We verify that EV's share collapses to ~0 and its
-        # siblings on the same plane absorb the slack — *not* that the
-        # whole plane drops out.
+        # failure drops *one EV*. We pick (BAD_PLANE, BAD_PATH) and
+        # drop only packets the policy steers there. The receiver's
+        # per-EV loss window attributes the drops to that EV's record,
+        # the EVStateTable demotes it, and pick_ev never visits it
+        # again. Sibling EVs (same plane, different path) stay healthy
+        # and absorb the slack.
         BAD_PLANE = 2
-        BAD_PATH = 0
+        BAD_PATH = 1
 
         try:
             receiver.start()
@@ -218,16 +233,17 @@ class PlaneLossShiftsDistributionTests(unittest.TestCase):
                 timeout_s=1.0,
             ), "receiver never learned sender")
 
-            # Phase 1: drive picks while dropping ~50% of plane-BAD
-            # packets. We need enough arrivals on BAD that the receiver
+            # Phase 1: drive picks while dropping ~50% of the bad EV's
+            # packets. We need enough arrivals on it that the receiver
             # gets a non-degenerate (max_seq − min_seq + 1) estimate of
-            # "expected" for that plane — pure 100% loss would leave BAD
-            # with zero arrivals and the LossWindow would report 0/0.
-            seqs = [0] * NUM_PLANES
+            # "expected" for that EV — pure 100% loss would leave the
+            # EV with zero arrivals and the LossWindow would emit no
+            # record for it at all.
+            seqs = {}
             for _round_ix in range(4):
                 _drive_spray(policy, sender, receiver, flow_key,
-                             n=200, bad_plane=BAD_PLANE, bad_loss=0.5,
-                             per_plane_seq=seqs)
+                             n=200, bad_ev=(BAD_PLANE, BAD_PATH),
+                             bad_loss=0.5, per_ev_seq=seqs)
                 time.sleep(FAST_CONFIG.loss_window_ms / 1000.0)
 
             # Wait for the demote to propagate to the specific EV that
@@ -240,6 +256,21 @@ class PlaneLossShiftsDistributionTests(unittest.TestCase):
             self.assertTrue(_wait_for(bad_ev_demoted, timeout_s=2.0),
                             f"EV ({BAD_PLANE},{BAD_PATH}) never demoted; "
                             f"snapshot={table.snapshot()}")
+
+            # Sanity: targeted EV should be demoted but the loss-feedback
+            # plumbing should not collateral-damage healthy siblings.
+            # A regression where SentWindow.sent is rolled up per-plane
+            # (instead of per-EV) would over-count denominators by the
+            # spray-fanout factor and force every EV in the affected
+            # plane toward ASSUMED_BAD; if we ever lose that property
+            # this assert will catch it.
+            snap = table.snapshot()["tenants"]["green"]
+            bad_count = sum(1 for e in snap if e["state"] == "assumed_bad")
+            self.assertEqual(
+                bad_count, 1,
+                f"expected exactly one demoted EV; got {bad_count}: "
+                f"{[ (e['plane'], e['path'], e['state']) for e in snap ]}",
+            )
 
             # Phase 2: post-demote distribution. Use pick_ev so we can
             # observe per-EV behavior. The demoted EV should attract

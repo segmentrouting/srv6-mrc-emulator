@@ -329,9 +329,9 @@ class LossReportEndToEndTests(unittest.TestCase):
             # Inject some data packets on plane 0 and 2 so the receiver
             # has loss-window content to report.
             for seq in range(0, 50, 2):  # 25 packets on plane 0
-                receiver.record_data(flow_key, plane=0, seq=seq)
+                receiver.record_data(flow_key, plane=0, path=0, seq=seq)
             for seq in range(1, 50, 2):  # 25 packets on plane 2
-                receiver.record_data(flow_key, plane=2, seq=seq)
+                receiver.record_data(flow_key, plane=2, path=0, seq=seq)
 
             # Wait for at least one report round to be processed by the
             # sender's fusion path. Either a "ratio_applied" or a
@@ -365,7 +365,7 @@ class ReceiverNoSenderKnownTests(unittest.TestCase):
             # Record packets for a never-seen sender.
             flow_key = (topo_tenant_id("green"), 99, 15)
             for seq in range(20):
-                receiver.record_data(flow_key, plane=1, seq=seq)
+                receiver.record_data(flow_key, plane=1, path=0, seq=seq)
             # Let two loss-emit rounds elapse; nothing should explode.
             time.sleep(FAST_CONFIG.loss_window_ms * 2.5 / 1000.0)
             self.assertEqual(receiver.known_senders(), ())
