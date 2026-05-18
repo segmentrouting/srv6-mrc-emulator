@@ -146,26 +146,55 @@ the `srv6_fabric.topo` ↔ `spray` reference-pairs map in sync.
 
 ## Phase status (where the codebase is right now)
 
-- **Phase 1a (plane-aware MRC):** done, validated in lab. Plane-level
-  loss detection via receiver MRC agent; sender demotes lossy planes
-  in `health_aware_mrc` policy.
-- **Phase 1b step 1 (EV-spray data-path):** done. `EvSpray` policy
-  varies BOTH plane and spine per packet via per-packet outer-DA
-  rotation. Reports include `per_ev_sent` keyed `"P<p>:S<s>"`. No
-  health awareness — every EV is always active. Scenarios:
-  `green-ev-spray.yaml` (full fan-out) and `green-ev-spray-n2.yaml`
-  (narrow, easier to eyeball on tcpdump).
+- **Phase 1a (plane-aware MRC):** done, validated in lab for BOTH
+  tenants (green + yellow). Plane-level loss detection via receiver
+  MRC agent; sender demotes lossy planes in `health_aware_mrc`
+  policy.
+- **Phase 1b step 1 (EV-spray data-path):** done for green; yellow
+  TODO. `EvSpray` policy varies BOTH plane and spine per packet via
+  per-packet outer-DA rotation. Reports include `per_ev_sent` keyed
+  `"P<p>:S<s>"`. No health awareness — every EV is always active.
+  Scenarios shipped: `green-ev-spray.yaml` (full fan-out) and
+  `green-ev-spray-n2.yaml` (narrow). **Yellow parity outstanding:**
+  add `yellow-ev-spray.yaml` and `yellow-ev-spray-n2.yaml` (pure
+  YAML; runner/policy are tenant-agnostic), then lab-validate that
+  yellow's extra `e009` leaf→host hop survives per-packet spine
+  rotation. Invariant 7 means yellow uses a 2-uSID list per packet
+  while green uses 1 — the spine hextet position is the same, but
+  the underlying SID list length isn't.
 - **Phase 1b step 2 (probes on scapy raw-socket):** not started.
   Today's MRC probes use a UDP socket + per-plane `encap.red` route,
   which only has plane granularity (4 routes), not EV granularity
   (4 * NUM_SPINES routes). Step 2 moves the probe TX path to scapy
   raw-socket using the same `usid_outer_dst()` helper as the data
-  path. Prerequisite for step 3.
+  path. Must work for both tenants from the start. Prerequisite for
+  step 3.
 - **Phase 1b step 3 (per-EV health):** not started. New policy that
   extends `EvSpray` with an "active EV mask" read from a per-EV
   health table (analogous to `EVStateTable` for planes). On loss
   detection at an EV granularity, the sender skips that EV on its
-  round-robin turn.
+  round-robin turn. Tenant-agnostic from day one — when this lands,
+  ship both `green-mrc-ev-spray-*` and `yellow-mrc-ev-spray-*`
+  scenario sets together; don't repeat the step-1 yellow-lag pattern.
+
+## Yellow parity — do not forget
+
+Every spray feature added for green needs a yellow counterpart in
+the same commit (or the immediate follow-up). Past pattern: green
+gets a feature, yellow lags by N commits, and the demo story
+becomes "green works, yellow is broken in interesting ways."
+Concretely:
+
+- New policy → exercise it in both `green-…yaml` and `yellow-…yaml`
+  scenarios before declaring the feature done.
+- New probe / health code path → test with both tenants in the
+  lab; yellow's host-side decap (invariant 7) is the failure mode
+  green never exposes.
+- Phase 1b step 1's yellow-ev-spray YAMLs are the immediate
+  outstanding piece. Pick those up at the same time as step 2's
+  scapy probes — they're cheap (~20 lines of YAML each) and rerun
+  the same `green-ev-spray-n2` validation against yellow as a
+  yellow-decap regression check.
 
 ## Naming conventions
 
