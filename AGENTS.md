@@ -316,7 +316,7 @@ Detection signals fused into `EVStateTable`:
    compares against its own per-plane sent windows. Demotes after
    `loss_demote_consecutive` windows over `loss_threshold`.
 
-Demotions are subject to an `min_active_planes` floor (OCP's
+Demotions are subject to an `min_active_evs` floor (OCP's
 `ev_min_active`). Recovery is asymmetric: demote fast, recover slow
 (`probe_recover_threshold` defaults to 5).
 

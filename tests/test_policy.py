@@ -2,7 +2,7 @@ import unittest
 from collections import Counter
 
 from srv6_fabric import policy
-from srv6_fabric.topo import FlowKey, NUM_PLANES
+from srv6_fabric.topo import FlowKey, NUM_PLANES, NUM_SPINES
 
 
 F = FlowKey("2001:db8:bbbb:00::2", "2001:db8:bbbb:0f::2", 9999, 9999)
@@ -176,7 +176,8 @@ class TestHealthAwareMrc(unittest.TestCase):
         from srv6_fabric.mrc.ev_state import EVStateTable, EVStateConfig
         cfg = EVStateConfig(**cfg_overrides) if cfg_overrides else None
         return EVStateTable(
-            tenants=("green",), num_planes=NUM_PLANES, cfg=cfg,
+            tenants=("green",), num_planes=NUM_PLANES,
+            num_paths=NUM_SPINES, cfg=cfg,
         )
 
     def test_uniform_when_all_unknown(self):
@@ -189,38 +190,43 @@ class TestHealthAwareMrc(unittest.TestCase):
             self.assertGreater(counts[plane], 0)
 
     def test_demoted_plane_gets_zero_picks(self):
-        # Drive plane 1 to ASSUMED_BAD via probe timeouts; verify the
-        # policy never picks it. (We don't compare against another
-        # `Weighted` here because the floor logic can keep a "bad" plane
-        # nonzero if too many are bad; only one demote keeps us above
-        # the floor.)
+        # Drive every EV on plane 1 to ASSUMED_BAD via probe timeouts;
+        # verify the policy never picks plane 1. (We don't compare
+        # against another `Weighted` here because the floor logic can
+        # keep a "bad" plane nonzero if too many are bad; only one
+        # plane's worth of demotes keeps us above the floor.)
         table = self._table(
             probe_fail_threshold=3,
-            min_active_planes=1,
+            min_active_evs=1,
         )
-        for _ in range(3):
-            table.record_probe_result("green", 1, success=False)
+        for path in range(NUM_SPINES):
+            for _ in range(3):
+                table.record_probe_result("green", 1, path, success=False)
         from srv6_fabric.mrc.ev_state import EVState
-        self.assertEqual(table.state("green", 1), EVState.ASSUMED_BAD)
+        for path in range(NUM_SPINES):
+            self.assertEqual(
+                table.state("green", 1, path), EVState.ASSUMED_BAD
+            )
         p = policy.HealthAwareMrc(table=table, tenant="green")
         seen = {p.pick(i, F) for i in range(4096)}
         self.assertNotIn(1, seen)
 
     def test_live_state_change_takes_effect_next_pick(self):
         # No caching of weights inside the policy: a demote between two
-        # picks should reshape the distribution. Sample 1k picks before
-        # and after; plane 0's share must drop materially.
+        # picks should reshape the distribution. Sample 2k picks before
+        # and after; plane 0's share must drop to zero.
         table = self._table(
             probe_fail_threshold=3,
-            min_active_planes=1,
+            min_active_evs=1,
         )
         p = policy.HealthAwareMrc(table=table, tenant="green")
         before = Counter(p.pick(i, F) for i in range(2048))
-        for _ in range(3):
-            table.record_probe_result("green", 0, success=False)
+        for path in range(NUM_SPINES):
+            for _ in range(3):
+                table.record_probe_result("green", 0, path, success=False)
         after = Counter(p.pick(i, F) for i in range(2048, 4096))
-        # Plane 0 was uniform-share (~25%) before; after demote it
-        # should be zero given the min-active-planes floor of 1.
+        # Plane 0 was uniform-share (~25%) before; after fully demoting
+        # all its EVs it should be zero given the min-active-evs floor.
         self.assertGreater(before[0], 100)
         self.assertEqual(after[0], 0)
 
@@ -243,7 +249,10 @@ class TestHealthAwareMrc(unittest.TestCase):
         # the table. A mismatch is a configuration bug, not a runtime
         # one; fail at construction.
         from srv6_fabric.mrc.ev_state import EVStateTable
-        bad = EVStateTable(tenants=("green",), num_planes=NUM_PLANES + 1)
+        bad = EVStateTable(
+            tenants=("green",), num_planes=NUM_PLANES + 1,
+            num_paths=NUM_SPINES,
+        )
         with self.assertRaises(ValueError):
             policy.HealthAwareMrc(table=bad, tenant="green")
 

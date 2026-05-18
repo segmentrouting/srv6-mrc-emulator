@@ -39,7 +39,7 @@ from srv6_fabric.mrc.agent import (
 )
 from srv6_fabric.mrc.ev_state import EVStateConfig, EVStateTable
 from srv6_fabric.policy import HealthAwareMrc
-from srv6_fabric.topo import FlowKey, NUM_PLANES, tenant_id as topo_tenant_id
+from srv6_fabric.topo import FlowKey, NUM_PLANES, NUM_SPINES, tenant_id as topo_tenant_id
 
 # Reuse the loopback plumbing the I/O tests already built. Importing
 # from a sibling test module is unusual; the alternative is duplicating
@@ -57,7 +57,7 @@ from tests.test_mrc_agent_io import (  # noqa: E402
 FAST_EV = EVStateConfig(
     loss_threshold=0.05,
     loss_demote_consecutive=1,   # one bad window is enough
-    min_active_planes=1,         # let us demote up to 3 of 4
+    min_active_evs=1,         # let us demote up to 3 of 4
 )
 
 
@@ -143,7 +143,7 @@ class HealthyFabricTests(unittest.TestCase):
 
     def test_clean_fabric_keeps_planes_healthy(self) -> None:
         table = EVStateTable(
-            tenants=("green",), num_planes=NUM_PLANES, cfg=FAST_EV,
+            tenants=("green",), num_planes=NUM_PLANES, num_paths=NUM_SPINES, cfg=FAST_EV,
         )
         policy = HealthAwareMrc(table=table, tenant="green")
         sender, receiver, flow_key = _build_pair(table)
@@ -170,7 +170,7 @@ class HealthyFabricTests(unittest.TestCase):
             # No plane should be ASSUMED_BAD. We pull the per-plane
             # state from the EVStateTable directly.
             for plane in range(NUM_PLANES):
-                st = table.state("green", plane)
+                st = table.state("green", plane, 0)
                 self.assertNotEqual(
                     st.name, "ASSUMED_BAD",
                     f"plane {plane} unexpectedly demoted; state={st}",
@@ -188,18 +188,26 @@ class HealthyFabricTests(unittest.TestCase):
 
 
 class PlaneLossShiftsDistributionTests(unittest.TestCase):
-    """Inject 100% loss on plane 2: the receiver reports it, the EV
-    table demotes it, and subsequent picks shift to the remaining
-    planes."""
+    """Inject loss on a single EV: the receiver reports it, the EV
+    table demotes that EV (not the whole plane), and subsequent picks
+    redistribute to the remaining 31 EVs."""
 
     def test_plane_loss_demotes_and_picks_shift(self) -> None:
         table = EVStateTable(
-            tenants=("green",), num_planes=NUM_PLANES, cfg=FAST_EV,
+            tenants=("green",), num_planes=NUM_PLANES, num_paths=NUM_SPINES, cfg=FAST_EV,
         )
         policy = HealthAwareMrc(table=table, tenant="green")
         sender, receiver, flow_key = _build_pair(table)
 
-        BAD = 2
+        # EV-centric expectation: with NUM_PLANES planes and NUM_SPINES
+        # paths/plane there are NUM_PLANES * NUM_SPINES EVs; a single
+        # failure drops *one EV* (here (BAD_PLANE, 0), since loss_window
+        # still emits path_id=0 pending commit 4/5 of the per-EV
+        # rewrite). We verify that EV's share collapses to ~0 and its
+        # siblings on the same plane absorb the slack — *not* that the
+        # whole plane drops out.
+        BAD_PLANE = 2
+        BAD_PATH = 0
 
         try:
             receiver.start()
@@ -216,40 +224,55 @@ class PlaneLossShiftsDistributionTests(unittest.TestCase):
             # "expected" for that plane — pure 100% loss would leave BAD
             # with zero arrivals and the LossWindow would report 0/0.
             seqs = [0] * NUM_PLANES
-            for round_ix in range(4):
+            for _round_ix in range(4):
                 _drive_spray(policy, sender, receiver, flow_key,
-                             n=200, bad_plane=BAD, bad_loss=0.5,
+                             n=200, bad_plane=BAD_PLANE, bad_loss=0.5,
                              per_plane_seq=seqs)
                 time.sleep(FAST_CONFIG.loss_window_ms / 1000.0)
 
-            # Wait for the demote to propagate.
-            def bad_demoted() -> bool:
-                return table.state("green", BAD).name == "ASSUMED_BAD"
-            self.assertTrue(_wait_for(bad_demoted, timeout_s=2.0),
-                            f"plane {BAD} never demoted; "
+            # Wait for the demote to propagate to the specific EV that
+            # carried the loss feedback.
+            def bad_ev_demoted() -> bool:
+                return (
+                    table.state("green", BAD_PLANE, BAD_PATH).name
+                    == "ASSUMED_BAD"
+                )
+            self.assertTrue(_wait_for(bad_ev_demoted, timeout_s=2.0),
+                            f"EV ({BAD_PLANE},{BAD_PATH}) never demoted; "
                             f"snapshot={table.snapshot()}")
 
-            # Phase 2: post-demote distribution. Weights for BAD should
-            # be zero, so 500 fresh picks should land essentially zero
-            # on BAD. We allow up to 5% slop for any in-flight state.
-            picks = _drive_spray(policy, sender, receiver, flow_key,
-                                 n=500, bad_plane=None,
-                                 per_plane_seq=seqs)
-            bad_share = picks[BAD] / 500
-            self.assertLess(
-                bad_share, 0.05,
-                f"plane {BAD} still receiving {bad_share:.1%} of picks "
-                f"after demote; picks={picks}",
+            # Phase 2: post-demote distribution. Use pick_ev so we can
+            # observe per-EV behavior. The demoted EV should attract
+            # essentially zero picks; the remaining (NUM_SPINES − 1) EVs
+            # on plane BAD share its load with their plane peers.
+            pol_flow = FlowKey(
+                src_addr="fc00::1", dst_addr="fc00::15",
+                src_port=10000, dst_port=20000,
             )
-            # And the surviving planes should each carry roughly a third.
-            for plane in range(NUM_PLANES):
-                if plane == BAD:
+            n_picks = 4096
+            ev_picks: collections.Counter = collections.Counter()
+            for i in range(n_picks):
+                ev_picks[policy.pick_ev(i, pol_flow)] += 1
+
+            bad_ev_share = ev_picks[(BAD_PLANE, BAD_PATH)] / n_picks
+            self.assertLess(
+                bad_ev_share, 0.01,
+                f"demoted EV ({BAD_PLANE},{BAD_PATH}) still receiving "
+                f"{bad_ev_share:.2%} of picks; ev_picks={ev_picks}",
+            )
+
+            # The surviving EVs on plane BAD should still absorb traffic
+            # (and slightly more than 1/(num_evs) each, since the
+            # demoted EV's share got redistributed).
+            uniform = 1.0 / (NUM_PLANES * NUM_SPINES)
+            for path in range(NUM_SPINES):
+                if path == BAD_PATH:
                     continue
-                share = picks[plane] / 500
+                share = ev_picks[(BAD_PLANE, path)] / n_picks
                 self.assertGreater(
-                    share, 0.15,
-                    f"plane {plane} under-utilised post-demote: "
-                    f"{share:.1%}; picks={picks}",
+                    share, uniform * 0.5,
+                    f"surviving EV ({BAD_PLANE},{path}) under-utilised "
+                    f"post-demote: {share:.2%}; ev_picks={ev_picks}",
                 )
         finally:
             sender.stop(timeout_s=0.5)

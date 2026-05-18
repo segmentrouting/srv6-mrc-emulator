@@ -18,7 +18,7 @@ Validates the full scenario shape laid out in mrc/README.md:
       probe_recover_threshold: <int>
       loss_threshold: <float 0..1>
       loss_demote_consecutive: <int>
-      min_active_planes: <int>
+      min_active_evs: <int>
       rtt_ring_size: <int>
     faults:                          # optional
       - kind: netem
@@ -118,7 +118,7 @@ class MrcSpec:
     probe_recover_threshold: int | None = None
     loss_threshold: float | None = None
     loss_demote_consecutive: int | None = None
-    min_active_planes: int | None = None
+    min_active_evs: int | None = None
     rtt_ring_size: int | None = None
 
     def to_env_json(self) -> str:
@@ -132,7 +132,7 @@ class MrcSpec:
             "probe_interval_ms", "probe_timeout_ms", "loss_window_ms",
             "max_window_skew_ms", "probe_fail_threshold",
             "probe_recover_threshold", "loss_threshold",
-            "loss_demote_consecutive", "min_active_planes",
+            "loss_demote_consecutive", "min_active_evs",
             "rtt_ring_size",
         ):
             v = getattr(self, fname)
@@ -391,7 +391,7 @@ _MRC_POSITIVE_INT_FIELDS = (
     "probe_interval_ms", "probe_timeout_ms", "loss_window_ms",
     "max_window_skew_ms", "probe_fail_threshold",
     "probe_recover_threshold", "loss_demote_consecutive",
-    "min_active_planes", "rtt_ring_size",
+    "min_active_evs", "rtt_ring_size",
 )
 _MRC_RATIO_FIELDS = ("loss_threshold",)
 _MRC_OPTIONAL = set(_MRC_POSITIVE_INT_FIELDS) | set(_MRC_RATIO_FIELDS)

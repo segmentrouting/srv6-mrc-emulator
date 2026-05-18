@@ -52,7 +52,7 @@ from srv6_fabric.policy import (
     policy_from_spec, HealthAwareMrc, HealthAwareMrcFactory,
 )
 from srv6_fabric.topo import (
-    NUM_PLANES, PLANE_NICS, SPRAY_PORT,
+    NUM_PLANES, NUM_SPINES, PLANE_NICS, SPRAY_PORT,
     host_underlay_addr, inner_addr, usid_outer_dst, spine_for,
 )
 
@@ -123,7 +123,8 @@ def parse_policy(s: str, *, tenant: str, ev_config=None,
         # One tenant per sender process today. If we ever multiplex
         # tenants in a single sender, this becomes a per-host singleton.
         table = EVStateTable(
-            tenants=(tenant,), num_planes=NUM_PLANES, cfg=ev_config,
+            tenants=(tenant,), num_planes=NUM_PLANES,
+            num_paths=NUM_SPINES, cfg=ev_config,
         )
         return policy.bind(table=table, tenant=tenant)
     return policy

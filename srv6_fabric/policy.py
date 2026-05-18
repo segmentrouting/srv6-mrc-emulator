@@ -10,12 +10,16 @@ flavors:
     walk forward to the next healthy plane.
 
   - `HealthAwareMrc`: an MRC-aware policy that reads per-pick from an
-    EVStateTable's normalized weight tuple. Demoted planes (state
-    ASSUMED_BAD) get weight 0; degraded/unknown planes (state UNKNOWN)
-    get reduced weight. The weighted CDF is recomputed each pick so
-    updates from probe/loss-report threads take effect immediately,
-    without coordination with the sender hot loop. Deterministic per
-    (seq, flow) given a fixed weights snapshot.
+    EVStateTable's per-EV (plane, path) weight grid. Demoted EVs
+    (state ASSUMED_BAD) get weight 0; degraded/unknown EVs (state
+    UNKNOWN) get reduced weight. The weighted CDF is rebuilt each
+    pick from the live atomic snapshot of the table, so updates from
+    probe/loss-report threads take effect immediately, without
+    coordination with the sender hot loop. Like `EvSpray`, it
+    respects a per-flow spine subset so different flows visit
+    different fabric slices; unlike `EvSpray` the within-flow
+    distribution is health-weighted instead of round-robin.
+    Deterministic per (seq, flow) given a fixed weights snapshot.
 """
 
 from __future__ import annotations
@@ -252,30 +256,38 @@ class HealthAware:
 
 @dataclass
 class HealthAwareMrc:
-    """MRC-aware weighted spray driven by an EVStateTable.
+    """MRC-aware weighted per-EV spray driven by an EVStateTable.
 
-    Reads `table.weights(tenant)` per pick and draws a plane from the
-    resulting distribution using the same deterministic golden-ratio
-    scheme as `Weighted`. Because `weights()` reflects the live state
-    machine (probes + loss reports), demotions and recoveries take
-    effect on the next packet, no extra synchronisation needed: weight
-    tuples are replaced atomically by EVStateTable on every state
-    transition.
+    Reads `table.weights_ev(tenant)` per pick and draws a (plane, path)
+    pair from the resulting 2-D distribution using the same
+    deterministic golden-ratio scheme as `Weighted`. Because
+    `weights_ev()` reflects the live state machine (probes + loss
+    reports), demotions and recoveries take effect on the next packet —
+    weight tables are replaced atomically by EVStateTable on every state
+    transition, so we never hold the table's lock here.
+
+    Like `EvSpray`, the policy respects a per-flow spine subset
+    (`paths_per_plane`, default = `NUM_SPINES` = all paths). The
+    subset is hash-derived from the flow's address pair so different
+    flows visit different subsets of the fabric, and within each flow
+    the policy spreads across `NUM_PLANES * paths_per_plane` EVs
+    weighted by the table's per-EV health.
 
     Compared to `HealthAware(inner=...)`:
       - HealthAware is binary (down or up) and walks forward to find the
-        next up plane on a "down hit".
+        next up plane on a "down hit"; it operates per plane.
       - HealthAwareMrc is graded (GOOD/UNKNOWN/ASSUMED_BAD map to
-        configurable weights) and draws from a normalized CDF every
-        pick, so the distribution smoothly follows EV state changes.
+        configurable weights) and operates per EV, so a partial-path
+        failure on one plane doesn't kill the plane.
 
-    Cold-start: when no probes have replied yet, every plane is UNKNOWN
-    and `weights()` returns a uniform distribution (per EVStateConfig
-    defaults). Pick distributes ~uniformly across all planes — fine for
-    a clean fabric and indistinguishable from round_robin in expectation.
+    Cold-start: when no probes have replied yet, every EV is UNKNOWN
+    and `weights_ev()` returns a uniform distribution. Pick distributes
+    ~uniformly across all EVs in the flow's subset — fine for a clean
+    fabric and indistinguishable from `EvSpray` round-robin in
+    expectation.
 
-    All-bad pathological case: prevented by the `ev_min_active` floor
-    in EVStateTable. If somehow reached, `weights()` falls back to
+    All-bad pathological case: prevented by the `min_active_evs` floor
+    in EVStateTable. If somehow reached, `weights_ev()` falls back to
     uniform; pick still works.
 
     Construction is typically via `parse_policy(..., tenant=..., table=...)`
@@ -286,7 +298,11 @@ class HealthAwareMrc:
     """
     table: "EVStateTable"
     tenant: str
+    paths_per_plane: int = NUM_SPINES
     name: str = field(init=False)
+
+    # Per-flow spine subset cache (mirrors EvSpray._spine_subsets).
+    _spine_subsets: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         if self.tenant not in self.table.tenants:
@@ -299,21 +315,73 @@ class HealthAwareMrc:
                 f"EVStateTable.num_planes={self.table.num_planes} but "
                 f"topo NUM_PLANES={NUM_PLANES}; tables must match topology"
             )
+        if self.table.num_paths != NUM_SPINES:
+            raise ValueError(
+                f"EVStateTable.num_paths={self.table.num_paths} but "
+                f"topo NUM_SPINES={NUM_SPINES}; tables must match topology"
+            )
+        if not (1 <= self.paths_per_plane <= NUM_SPINES):
+            raise ValueError(
+                f"paths_per_plane must be 1..{NUM_SPINES}, "
+                f"got {self.paths_per_plane}"
+            )
         object.__setattr__(self, "name", f"health_aware_mrc({self.tenant})")
 
+    def _spines_for_flow(self, flow: FlowKey) -> tuple[int, ...]:
+        """Per-flow spine subset, cached (same scheme as EvSpray)."""
+        cached = self._spine_subsets.get(flow)
+        if cached is not None:
+            return cached
+        subset = select_spines_for_addrs(
+            flow.src_addr, flow.dst_addr, self.paths_per_plane,
+        )
+        self._spine_subsets[flow] = subset
+        return subset
+
+    def pick_ev(self, seq: int, flow: FlowKey) -> tuple[int, int]:
+        """Return (plane, spine) for this packet.
+
+        The second element is a physical spine ID (the value the runner
+        feeds to `usid_outer_dst(spine=...)`), not a 0..paths_per_plane
+        index. This matches `EvSpray.pick_ev`'s contract so the runner
+        consumes them identically.
+        """
+        spines = self._spines_for_flow(flow)
+        # 2-D table read; atomic tuple swap on transitions.
+        wgrid = self.table.weights_ev(self.tenant)
+        # Slice rows by all planes, columns by the flow's spine subset.
+        # Build a flat weight vector over (plane, subset_idx) pairs.
+        flat: list[float] = []
+        for plane in range(NUM_PLANES):
+            row = wgrid[plane]
+            for sp in spines:
+                flat.append(row[sp])
+        total = sum(flat)
+        if total <= 0:
+            # Safety net: defensively spread uniformly across the
+            # flow's EV set when the slice is all-zero (which shouldn't
+            # happen under normal floor behaviour but might under e.g.
+            # an exotic test setup that demotes a whole spine subset).
+            n = NUM_PLANES * len(spines)
+            ev_idx = seq % n
+        else:
+            cdf = _build_cdf(tuple(flat))
+            ev_idx = _weighted_pick(seq, flow, cdf)
+        # Decode flat index back to (plane, subset_idx).
+        plane = ev_idx // len(spines)
+        spine = spines[ev_idx % len(spines)]
+        return plane, spine
+
     def pick(self, seq: int, flow: FlowKey) -> int:
-        # Single tuple read; EVStateTable rebuilds + atomically replaces
-        # this tuple on every state transition, so we get a coherent
-        # snapshot without holding the table's lock.
-        weights = self.table.weights(self.tenant)
-        # Safety net: EVStateTable guarantees a positive-sum weight tuple
-        # under normal operation, but defensively guard against an
-        # all-zero tuple (e.g. if a future change to the floor logic
-        # regresses) by falling back to uniform.
-        if sum(weights) <= 0:
-            return seq % NUM_PLANES
-        cdf = _build_cdf(weights)
-        return _weighted_pick(seq, flow, cdf)
+        """Backward-compat shim returning just the plane.
+
+        Provided so non-EV-aware call sites (e.g. tests that only care
+        about the plane axis) keep working. EV-aware runners use
+        `pick_ev()` directly.
+        """
+        plane, _ = self.pick_ev(seq, flow)
+        return plane
+
 
 
 # --- construction from scenario YAML ---------------------------------------
@@ -333,11 +401,20 @@ class HealthAwareMrcFactory:
     policy_from_spec) lets the scenario validator and dry-runs accept
     `health_aware_mrc` even without a live EV table, so we can validate
     YAML shapes early.
+
+    `paths_per_plane` is carried so the YAML form
+    `{health_aware_mrc: <int>}` can configure the per-flow spine subset
+    size in the same way as `{ev_spray: <int>}`. Default = NUM_SPINES
+    (full fan-out).
     """
+    paths_per_plane: int = NUM_SPINES
     name: str = "health_aware_mrc"
 
     def bind(self, table: "EVStateTable", tenant: str) -> HealthAwareMrc:
-        return HealthAwareMrc(table=table, tenant=tenant)
+        return HealthAwareMrc(
+            table=table, tenant=tenant,
+            paths_per_plane=self.paths_per_plane,
+        )
 
     # Make the factory acceptable wherever a SprayPolicy is expected for
     # diagnostic plumbing (printing the policy name in dry-run output).
@@ -355,8 +432,11 @@ def policy_from_spec(spec) -> SprayPolicy:
     Accepted forms:
       "round_robin"
       "hash5tuple"
+      "ev_spray"                               (full fan-out)
       "health_aware_mrc"                       (returns a factory; see below)
       {"weighted": [0.4, 0.3, 0.2, 0.1]}
+      {"ev_spray": <int>}                      (paths_per_plane)
+      {"health_aware_mrc": <int>}              (paths_per_plane on factory)
       {"health_aware": "round_robin"}
       {"health_aware": {"weighted": [...]}}
 
@@ -384,6 +464,8 @@ def policy_from_spec(spec) -> SprayPolicy:
             return Weighted(weights=tuple(float(x) for x in value))
         if kind == "ev_spray":
             return EvSpray(paths_per_plane=int(value))
+        if kind == "health_aware_mrc":
+            return HealthAwareMrcFactory(paths_per_plane=int(value))
         if kind == "health_aware":
             return HealthAware(inner=policy_from_spec(value))
         raise ValueError(f"unknown policy kind: {kind!r}")

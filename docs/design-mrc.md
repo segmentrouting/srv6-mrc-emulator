@@ -114,7 +114,7 @@ distribution for quick eyeballing.
 | `round_robin` | `plane = seq % 4` | Current `spray.py` behavior; trivially balanced; ignores plane health. |
 | `hash5tuple` | `plane = hash(src, dst, sport, dport, proto) % 4` | Per-flow plane affinity; mimics ECMP. Single flow → single plane unless tuple varies. |
 | `weighted` | Plane probabilities from scenario YAML | E.g. `[0.4, 0.3, 0.2, 0.1]`; used to model TE / congestion bias. |
-| `health_aware_mrc` | Weighted RR with plane weights derived from EV state (`GOOD=1.0`, `UNKNOWN=0.5`, `ASSUMED_BAD=0.0`), subject to `min_active_planes` floor | Reads from `mrc/ev_state.py` `EVStateTable`, which is fed by EV Probes and receiver loss-feedback. See *Detection & re-spray* below. |
+| `health_aware_mrc` | Weighted RR with plane weights derived from EV state (`GOOD=1.0`, `UNKNOWN=0.5`, `ASSUMED_BAD=0.0`), subject to `min_active_evs` floor | Reads from `mrc/ev_state.py` `EVStateTable`, which is fed by EV Probes and receiver loss-feedback. See *Detection & re-spray* below. |
 
 Policies share a tiny interface in `policy.py`:
 
@@ -183,7 +183,7 @@ is a NIC-side libibverbs-style API. Its core abstractions:
 | **EV Probe** (`MRC_CTL_EP_OP_EV_PROBE`) | NIC sends a small out-of-band probe along an explicit EV; responder echoes; NIC measures RTT or times out. | Implemented faithfully in `mrc/probe.py` — see *Probe wire format* below. |
 | **TRIM NACK** (`MRC_DEVICE_CAP_TRIM_NACK`) | Fabric trims a congestion-dropped packet to its header; responder NIC generates a NACK to the requester. | **Not modeled.** docker-sonic-vs does not support packet trimming. We substitute receiver-side loss-feedback (below), which is a coarser but trim-free analogue. |
 | **NSCC CC** (`uet-1.0-nscc`) | NIC-resident congestion control consuming per-EV RTT and queueing delay; produces per-EV rate adjustments and `ASSUMED_BAD` demotions. | Deferred. The current `EVStateTable` does on/off demotion only; per-EV rate control is a future extension (see roadmap). |
-| **`ev_min_active`** | Minimum number of EVs that must remain `GOOD`; firmware refuses to demote past this floor. | Honored: when fewer than `mrc_min_active_planes` are `GOOD`, the state machine logs a warning and lets the otherwise-doomed plane stay nominally up. Spray continues to spread across whatever is left rather than collapsing onto one plane. |
+| **`ev_min_active`** | Minimum number of EVs that must remain `GOOD`; firmware refuses to demote past this floor. | Honored: when fewer than `mrc_min_active_evs` are `GOOD`, the state machine logs a warning and lets the otherwise-doomed plane stay nominally up. Spray continues to spread across whatever is left rather than collapsing onto one plane. |
 
 What this simulator does **not** attempt to be: a wire-faithful
 reimplementation of the OCP RDMA transport. We share the control-plane
@@ -251,7 +251,7 @@ telemetry) with out-of-band (EV Probe) signals.
 
    UNKNOWN is the initial state until the first probe round completes.
    ev_min_active floor: if demoting would push GOOD count below
-   mrc_min_active_planes, transition is suppressed and a warning is
+   mrc_min_active_evs, transition is suppressed and a warning is
    logged in the per-flow report.
 ```
 
@@ -307,7 +307,7 @@ mrc:
   probe_recover_threshold: 5    # consecutive probe successes → recover
   loss_threshold:        0.05   # per-window loss ratio that flags a plane (float in [0,1])
   loss_demote_consecutive: 2    # consecutive windows over threshold → demote
-  min_active_planes:       2    # floor matching OCP's ev_min_active (default = max(1, num_planes//2))
+  min_active_evs:       2    # floor matching OCP's ev_min_active (default = max(1, num_planes//2))
   rtt_ring_size:         128    # per-plane RTT-sample ring length
 ```
 
@@ -321,7 +321,7 @@ mrc:
 | `probe_recover_threshold` | `5` | Consecutive successes before recovery (asymmetric: demote fast, recover slow). |
 | `loss_threshold` | `0.05` | 5% per-plane loss in a window flags it. |
 | `loss_demote_consecutive` | `2` | Two flagged windows back-to-back → demote. |
-| `min_active_planes` | `max(1, num_planes // 2)` | Floor matching OCP's `ev_min_active`. On 4 planes this is 2. |
+| `min_active_evs` | `max(1, num_planes // 2)` | Floor matching OCP's `ev_min_active`. On 4 planes this is 2. |
 | `rtt_ring_size` | `128` | RTT samples retained per plane for diagnostics (no policy effect today). |
 
 Validation lives in `srv6_fabric/mrc/scenario.py` (`_validate_mrc`):

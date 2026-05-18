@@ -41,6 +41,7 @@ from srv6_fabric.mrc.agent import (
 from srv6_fabric.mrc.ev_state import EVStateTable
 from srv6_fabric.topo import (
     NUM_PLANES,
+    NUM_SPINES,
     SPRAY_PROBE_PORT,
     SPRAY_REPORT_PORT,
     tenant_id as topo_tenant_id,
@@ -182,7 +183,7 @@ class ProbeRoundTripTests(unittest.TestCase):
         sender_report_port = PORTS.take(1)
         recv_probe_base = PORTS.take(NUM_PLANES)
 
-        self.table = EVStateTable(tenants=("green",), num_planes=NUM_PLANES)
+        self.table = EVStateTable(tenants=("green",), num_planes=NUM_PLANES, num_paths=NUM_SPINES)
         s_probe_factory, s_report_factory = _build_sender_factory(
             sender_probe_base, sender_report_port,
         )
@@ -218,8 +219,9 @@ class ProbeRoundTripTests(unittest.TestCase):
 
         def saw_a_reply() -> bool:
             for plane in range(NUM_PLANES):
-                if self.table.rtt_p50_ns("green", plane) is not None:
-                    return True
+                for path in range(NUM_SPINES):
+                    if self.table.rtt_p50_ns("green", plane, path) is not None:
+                        return True
             return False
 
         self.assertTrue(_wait_for(saw_a_reply, timeout_s=1.0),
@@ -246,7 +248,7 @@ class ProbeTimeoutTests(unittest.TestCase):
         sender_report_port = PORTS.take(1)
         recv_probe_base = PORTS.take(NUM_PLANES)  # nothing bound here
 
-        table = EVStateTable(tenants=("green",), num_planes=NUM_PLANES)
+        table = EVStateTable(tenants=("green",), num_planes=NUM_PLANES, num_paths=NUM_SPINES)
         s_probe_factory, s_report_factory = _build_sender_factory(
             sender_probe_base, sender_report_port,
         )
@@ -285,7 +287,7 @@ class LossReportEndToEndTests(unittest.TestCase):
         sender_report_port = PORTS.take(1)
         recv_probe_base = PORTS.take(NUM_PLANES)
 
-        table = EVStateTable(tenants=("green",), num_planes=NUM_PLANES)
+        table = EVStateTable(tenants=("green",), num_planes=NUM_PLANES, num_paths=NUM_SPINES)
         s_probe_factory, s_report_factory = _build_sender_factory(
             sender_probe_base, sender_report_port,
         )

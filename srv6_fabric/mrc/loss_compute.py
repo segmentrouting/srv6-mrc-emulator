@@ -225,8 +225,13 @@ def apply_loss_report(
 
         # EVStateTable.record_loss_window takes (seen, expected) and
         # does the ratio internally; we keep compute_loss_ratio public
-        # so callers / tests can convert without re-deriving.
-        table.record_loss_window(tenant, rec.plane_id, rec.seen, denominator)
+        # so callers / tests can convert without re-deriving. The EV is
+        # identified by (plane, path); the loss record carries both
+        # since PROBE/LOSS_REPORT v2 wire formats added the path
+        # dimension.
+        table.record_loss_window(
+            tenant, rec.plane_id, rec.path_id, rec.seen, denominator,
+        )
         stats.planes_updated += 1
         if used_sender_counter:
             stats.paired_with_sent_window += 1

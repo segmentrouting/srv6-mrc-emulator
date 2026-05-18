@@ -289,7 +289,7 @@ class TestMrc(unittest.TestCase):
             "probe_recover_threshold": 4,
             "loss_threshold": 0.02,
             "loss_demote_consecutive": 3,
-            "min_active_planes": 1,
+            "min_active_evs": 1,
             "rtt_ring_size": 64,
         }}
         s = scenario.validate(doc)

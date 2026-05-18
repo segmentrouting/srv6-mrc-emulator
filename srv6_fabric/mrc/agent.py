@@ -148,7 +148,7 @@ _AGENT_CONFIG_FIELDS = frozenset({
 _EV_STATE_CONFIG_FIELDS = frozenset({
     "probe_fail_threshold", "probe_recover_threshold",
     "loss_threshold", "loss_demote_consecutive",
-    "min_active_planes", "rtt_ring_size",
+    "min_active_evs", "rtt_ring_size",
 })
 
 
@@ -462,9 +462,9 @@ class SenderMrcAgent:
         interval_s = self.cfg.probe_interval_ms / 1000.0
         while not self._stop.is_set():
             timeouts = self.probe_clock.sweep_timeouts(self.clock_ns())
-            for plane, _path, _req_id in timeouts:
+            for plane, path, _req_id in timeouts:
                 self.table.record_probe_result(
-                    self.tenant, plane, success=False,
+                    self.tenant, plane, path, success=False,
                 )
             self._stop.wait(interval_s)
 
@@ -498,7 +498,7 @@ class SenderMrcAgent:
             if rtt_ns is None:
                 continue
             self.table.record_probe_result(
-                self.tenant, reply.plane_id,
+                self.tenant, reply.plane_id, reply.path_id,
                 success=True, rtt_ns=rtt_ns,
             )
 

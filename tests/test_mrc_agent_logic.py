@@ -410,7 +410,8 @@ class TestApplyLossReport(unittest.TestCase):
     def _table(self, **cfg):
         c = EVStateConfig(**cfg) if cfg else None
         return EVStateTable(
-            tenants=("green",), num_planes=self.NUM_PLANES, cfg=c,
+            tenants=("green",), num_planes=self.NUM_PLANES,
+            num_paths=self.NUM_PLANES, cfg=c,
         )
 
     def test_empty_report_noop(self):
@@ -426,7 +427,7 @@ class TestApplyLossReport(unittest.TestCase):
         )
         self.assertEqual(stats.reports_processed, 0)
         # No EV state changes either.
-        self.assertEqual(t.state("green", 0), EVState.UNKNOWN)
+        self.assertEqual(t.state("green", 0, 0), EVState.UNKNOWN)
 
     def test_uses_sender_counter_when_available(self):
         # Sender sent 100 on plane 0; receiver saw 50 -> 50% loss.
@@ -453,11 +454,11 @@ class TestApplyLossReport(unittest.TestCase):
         self.assertEqual(stats.paired_with_sent_window, 1)
         self.assertEqual(stats.fell_back_to_receiver_expected, 0)
         # Still UNKNOWN; needs another bad window to demote.
-        self.assertEqual(t.state("green", 0), EVState.UNKNOWN)
+        self.assertEqual(t.state("green", 0, 0), EVState.UNKNOWN)
 
     def test_consecutive_bad_windows_demote(self):
         t = self._table(loss_threshold=0.05, loss_demote_consecutive=2,
-                        min_active_planes=1)
+                        min_active_evs=1)
         ring = SentWindowRing(num_planes=self.NUM_PLANES)
         ring.push(SentWindow(
             start_ns=0, end_ns=100_000_000,
@@ -477,7 +478,7 @@ class TestApplyLossReport(unittest.TestCase):
             sent_ring=ring, received_at_ns=50_000_000,
             max_window_skew_ns=10**9,
         )
-        self.assertEqual(t.state("green", 0), EVState.ASSUMED_BAD)
+        self.assertEqual(t.state("green", 0, 0), EVState.ASSUMED_BAD)
 
     def test_falls_back_to_receiver_expected(self):
         # No SentWindow in ring. Use receiver's expected_local field.
