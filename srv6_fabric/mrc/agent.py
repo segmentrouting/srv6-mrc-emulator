@@ -73,6 +73,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from ..topo import (
     NUM_PLANES,
+    NUM_SPINES,
     PLANE_NICS,
     SPRAY_PROBE_PORT,
     SPRAY_REPORT_PORT,
@@ -313,6 +314,7 @@ class SenderMrcAgent:
         self.stats = LossFusionStats()
         self.probe_clock = ProbeClock(
             num_planes=NUM_PLANES,
+            num_spines=NUM_SPINES,
             probe_timeout_ns=config.probe_timeout_ms * 1_000_000,
         )
         self.sent_ring = SentWindowRing(num_planes=NUM_PLANES)
@@ -417,7 +419,9 @@ class SenderMrcAgent:
         while not self._stop.is_set():
             now_ns = self.clock_ns()
             for plane in range(NUM_PLANES):
-                req_id, tx_ns = self.probe_clock.emit(plane, now_ns=now_ns)
+                req_id, tx_ns = self.probe_clock.emit(
+                    plane, spine=0, now_ns=now_ns,
+                )
                 try:
                     payload = encode_probe(
                         req_id=req_id,
@@ -458,7 +462,7 @@ class SenderMrcAgent:
         interval_s = self.cfg.probe_interval_ms / 1000.0
         while not self._stop.is_set():
             timeouts = self.probe_clock.sweep_timeouts(self.clock_ns())
-            for plane, _req_id in timeouts:
+            for plane, _spine, _req_id in timeouts:
                 self.table.record_probe_result(
                     self.tenant, plane, success=False,
                 )
@@ -487,6 +491,7 @@ class SenderMrcAgent:
             rtt_ns = self.probe_clock.match_reply(
                 req_id=reply.req_id,
                 plane=reply.plane_id,
+                spine=reply.spine_id,
                 reply_tx_ns=reply.tx_ns,
                 now_ns=now_ns,
             )
