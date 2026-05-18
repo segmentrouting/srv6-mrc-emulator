@@ -26,9 +26,11 @@ from srv6_fabric.mrc.probe import (
 )
 
 
-# Default identity fields used everywhere we don't care about them. Picked
-# to be non-zero so a "field omitted" bug shows up as a value mismatch.
-_ID = dict(tenant_id=1, src_id=15, reply_port=9997)
+# Default identity fields used everywhere we don't care about them.
+# Picked to be non-zero so a "field omitted" bug shows up as a value
+# mismatch. spine_id defaults to a non-zero value too so a "spine
+# dropped" regression doesn't silently round-trip via 0.
+_ID = dict(spine_id=3, tenant_id=1, src_id=15, reply_port=9997)
 
 
 class TestProbeRoundTrip(unittest.TestCase):
@@ -36,25 +38,28 @@ class TestProbeRoundTrip(unittest.TestCase):
         b = encode_probe(req_id=42, plane_id=2, tx_ns=1_234_567_890, **_ID)
         p = decode_probe(b)
         self.assertEqual(p, Probe(
-            req_id=42, plane_id=2, tx_ns=1_234_567_890,
+            req_id=42, plane_id=2, spine_id=3, tx_ns=1_234_567_890,
             tenant_id=1, src_id=15, reply_port=9997,
         ))
 
     def test_roundtrip_max_values(self):
         b = encode_probe(
             req_id=0xFFFF, plane_id=0xFF, tx_ns=0xFFFFFFFFFFFFFFFF,
+            spine_id=0xFF,
             tenant_id=0xFFFF, src_id=0xFFFF, reply_port=0xFFFF,
         )
         p = decode_probe(b)
         self.assertEqual(p.req_id, 0xFFFF)
         self.assertEqual(p.plane_id, 0xFF)
+        self.assertEqual(p.spine_id, 0xFF)
         self.assertEqual(p.tx_ns, 0xFFFFFFFFFFFFFFFF)
         self.assertEqual(p.tenant_id, 0xFFFF)
         self.assertEqual(p.src_id, 0xFFFF)
         self.assertEqual(p.reply_port, 0xFFFF)
 
     def test_encoded_size(self):
-        # v2 wire format: 22B v1 base + 6B identity trailer = 28B.
+        # v3 wire format still fits in 28B — spine_id reuses the v2
+        # reserved byte after plane_id.
         b = encode_probe(req_id=0, plane_id=0, tx_ns=0, **_ID)
         self.assertEqual(len(b), 28)
 
@@ -69,10 +74,16 @@ class TestProbeRoundTrip(unittest.TestCase):
             encode_probe(req_id=0, plane_id=0, tx_ns=-1, **_ID)
         with self.assertRaises(ValueError):
             encode_probe(req_id=0, plane_id=0, tx_ns=0,
-                         tenant_id=-1, src_id=0, reply_port=0)
+                         spine_id=-1, tenant_id=1, src_id=0, reply_port=0)
         with self.assertRaises(ValueError):
             encode_probe(req_id=0, plane_id=0, tx_ns=0,
-                         tenant_id=0, src_id=0x10000, reply_port=0)
+                         spine_id=256, tenant_id=1, src_id=0, reply_port=0)
+        with self.assertRaises(ValueError):
+            encode_probe(req_id=0, plane_id=0, tx_ns=0,
+                         spine_id=0, tenant_id=-1, src_id=0, reply_port=0)
+        with self.assertRaises(ValueError):
+            encode_probe(req_id=0, plane_id=0, tx_ns=0,
+                         spine_id=0, tenant_id=0, src_id=0x10000, reply_port=0)
 
 
 class TestProbeReplyRoundTrip(unittest.TestCase):
@@ -83,7 +94,7 @@ class TestProbeReplyRoundTrip(unittest.TestCase):
         )
         r = decode_probe_reply(b)
         self.assertEqual(r, ProbeReply(
-            req_id=42, plane_id=2,
+            req_id=42, plane_id=2, spine_id=3,
             tx_ns=1_234_567_890, svc_time_ns=1_500,
             tenant_id=1, src_id=15, reply_port=9997,
         ))
@@ -107,9 +118,10 @@ class TestProbeReplyRoundTrip(unittest.TestCase):
         # identity at codec level (decoder just passes them through).
         b = encode_probe_reply(
             req_id=1, plane_id=0, tx_ns=0, svc_time_ns=0,
-            tenant_id=2, src_id=99, reply_port=5555,
+            spine_id=7, tenant_id=2, src_id=99, reply_port=5555,
         )
         r = decode_probe_reply(b)
+        self.assertEqual(r.spine_id, 7)
         self.assertEqual(r.tenant_id, 2)
         self.assertEqual(r.src_id, 99)
         self.assertEqual(r.reply_port, 5555)
@@ -130,10 +142,11 @@ class TestProbeMagicAndVersion(unittest.TestCase):
             decode_probe_reply(b)
 
     def test_decode_rejects_wrong_version(self):
-        # Hand-build a packet with version=1 (the now-retired wire fmt).
-        # We don't carry v1 backward compat — confirm decoder rejects.
+        # Hand-build a packet with version=2 (the now-retired wire fmt
+        # where the spine_id byte was reserved). We don't carry v2
+        # backward compat — confirm decoder rejects.
         good = encode_probe(req_id=1, plane_id=0, tx_ns=0, **_ID)
-        bad = bytes([good[0], 1]) + good[2:]
+        bad = bytes([good[0], 2]) + good[2:]
         with self.assertRaises(ProbeDecodeError):
             decode_probe(bad)
 
@@ -149,9 +162,9 @@ class TestProbeMagicAndVersion(unittest.TestCase):
         with self.assertRaises(ProbeDecodeError):
             decode_probe_reply(b[:10])
 
-    def test_decode_rejects_v1_size_packet(self):
-        # A 22B packet with v2 magic but not enough bytes for the
-        # identity trailer must be rejected, not silently zero-filled.
+    def test_decode_rejects_short_packet(self):
+        # A 22B packet with v3 magic+version but truncated mid-payload
+        # must be rejected, not silently zero-filled.
         b = encode_probe(req_id=1, plane_id=0, tx_ns=0, **_ID)
         with self.assertRaises(ProbeDecodeError):
             decode_probe(b[:22])
@@ -163,12 +176,18 @@ class TestLossReportRoundTrip(unittest.TestCase):
         r = decode_loss_report(b)
         self.assertEqual(r, LossReport(window_id=7, planes=()))
 
-    def test_multi_plane_roundtrip(self):
+    def test_multi_ev_roundtrip(self):
+        # Same plane appears with different spines — exactly the new v2
+        # capability. Two spines on plane 0, one on plane 1, etc.
         planes = [
-            PlaneLossRecord(plane_id=0, seen=1000, expected=1000, max_gap=0),
-            PlaneLossRecord(plane_id=1, seen=950, expected=1000, max_gap=5),
-            PlaneLossRecord(plane_id=2, seen=500, expected=1000, max_gap=99),
-            PlaneLossRecord(plane_id=3, seen=1000, expected=1000, max_gap=1),
+            PlaneLossRecord(plane_id=0, spine_id=2,
+                            seen=1000, expected=1000, max_gap=0),
+            PlaneLossRecord(plane_id=0, spine_id=5,
+                            seen=950, expected=1000, max_gap=5),
+            PlaneLossRecord(plane_id=1, spine_id=2,
+                            seen=500, expected=1000, max_gap=99),
+            PlaneLossRecord(plane_id=2, spine_id=7,
+                            seen=1000, expected=1000, max_gap=1),
         ]
         b = encode_loss_report(window_id=12345, planes=planes)
         r = decode_loss_report(b)
@@ -178,11 +197,12 @@ class TestLossReportRoundTrip(unittest.TestCase):
             self.assertEqual(got, want)
 
     def test_size_calculation(self):
-        # 8B header + N×16B per plane.
+        # 8B header + N×16B per EV. Record size unchanged from v1.
         b = encode_loss_report(
             window_id=0,
             planes=[
-                PlaneLossRecord(plane_id=p, seen=0, expected=0, max_gap=0)
+                PlaneLossRecord(plane_id=p, spine_id=0,
+                                seen=0, expected=0, max_gap=0)
                 for p in range(4)
             ],
         )
@@ -190,7 +210,7 @@ class TestLossReportRoundTrip(unittest.TestCase):
 
     def test_max_values(self):
         plane = PlaneLossRecord(
-            plane_id=0xFF, seen=0xFFFFFFFF,
+            plane_id=0xFF, spine_id=0xFF, seen=0xFFFFFFFF,
             expected=0xFFFFFFFF, max_gap=0xFFFFFFFF,
         )
         b = encode_loss_report(window_id=0xFFFF, planes=[plane])
@@ -200,7 +220,8 @@ class TestLossReportRoundTrip(unittest.TestCase):
 
     def test_tuple_accepted_as_input(self):
         # encode_loss_report accepts list or tuple.
-        planes = (PlaneLossRecord(plane_id=0, seen=1, expected=1, max_gap=0),)
+        planes = (PlaneLossRecord(plane_id=0, spine_id=0,
+                                  seen=1, expected=1, max_gap=0),)
         b = encode_loss_report(window_id=0, planes=planes)
         self.assertEqual(decode_loss_report(b).planes, planes)
 
@@ -208,13 +229,25 @@ class TestLossReportRoundTrip(unittest.TestCase):
 class TestLossReportRangeChecks(unittest.TestCase):
     def test_negative_seen_rejected(self):
         with self.assertRaises(ValueError):
-            PlaneLossRecord(plane_id=0, seen=-1, expected=10, max_gap=0)
+            PlaneLossRecord(plane_id=0, spine_id=0,
+                            seen=-1, expected=10, max_gap=0)
 
     def test_overflow_seen_rejected(self):
         with self.assertRaises(ValueError):
             PlaneLossRecord(
-                plane_id=0, seen=0x100000000, expected=10, max_gap=0,
+                plane_id=0, spine_id=0,
+                seen=0x100000000, expected=10, max_gap=0,
             )
+
+    def test_negative_spine_id_rejected(self):
+        with self.assertRaises(ValueError):
+            PlaneLossRecord(plane_id=0, spine_id=-1,
+                            seen=0, expected=0, max_gap=0)
+
+    def test_overflow_spine_id_rejected(self):
+        with self.assertRaises(ValueError):
+            PlaneLossRecord(plane_id=0, spine_id=256,
+                            seen=0, expected=0, max_gap=0)
 
     def test_negative_window_id_rejected(self):
         with self.assertRaises(ValueError):
@@ -236,17 +269,18 @@ class TestLossReportMalformedDecode(unittest.TestCase):
             decode_loss_report(b"\x00\x01\x02")
 
     def test_truncated_records(self):
-        # Header claims 4 planes but only 1 record follows.
+        # Header claims 4 records but only 1 follows.
         good = encode_loss_report(
             window_id=0,
             planes=[
-                PlaneLossRecord(plane_id=p, seen=0, expected=0, max_gap=0)
+                PlaneLossRecord(plane_id=p, spine_id=0,
+                                seen=0, expected=0, max_gap=0)
                 for p in range(4)
             ],
         )
         # Lop off the last 3 records (3 * 16 = 48 bytes).
         truncated = good[: -48]
-        # Header still says num_planes=4; decode should reject.
+        # Header still says num_records=4; decode should reject.
         with self.assertRaises(ProbeDecodeError):
             decode_loss_report(truncated)
 
@@ -257,19 +291,20 @@ class TestLossReportMalformedDecode(unittest.TestCase):
             decode_loss_report(b)
 
     def test_wrong_version(self):
+        # v1 loss reports are no longer accepted.
         b = encode_loss_report(window_id=0, planes=[])
         # version is byte index 1.
-        bad = bytes([b[0], 2]) + b[2:]
+        bad = bytes([b[0], 1]) + b[2:]
         with self.assertRaises(ProbeDecodeError):
             decode_loss_report(bad)
 
 
 class TestModuleSurface(unittest.TestCase):
     def test_version_constants(self):
-        # PROBE bumped to v2 (added identity trailer); LOSS_REPORT
-        # unchanged at v1.
-        self.assertEqual(PROBE_VERSION, 2)
-        self.assertEqual(LOSS_REPORT_VERSION, 1)
+        # PROBE bumped to v3 (spine_id reuses former reserved byte).
+        # LOSS_REPORT bumped to v2 (same change in each record).
+        self.assertEqual(PROBE_VERSION, 3)
+        self.assertEqual(LOSS_REPORT_VERSION, 2)
 
     def test_all_exports_present(self):
         for name in probe.__all__:

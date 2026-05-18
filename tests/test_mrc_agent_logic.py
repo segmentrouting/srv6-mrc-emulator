@@ -387,7 +387,7 @@ class TestApplyLossReport(unittest.TestCase):
             sent=(100, 100, 100, 100),
         ))
         report = LossReport(window_id=0, planes=(
-            PlaneLossRecord(plane_id=0, seen=50, expected=80, max_gap=2),
+            PlaneLossRecord(plane_id=0, spine_id=0, seen=50, expected=80, max_gap=2),
         ))
         stats = LossFusionStats()
         apply_loss_report(
@@ -411,7 +411,7 @@ class TestApplyLossReport(unittest.TestCase):
             sent=(100, 100, 100, 100),
         ))
         bad_report = LossReport(window_id=0, planes=(
-            PlaneLossRecord(plane_id=0, seen=50, expected=80, max_gap=2),
+            PlaneLossRecord(plane_id=0, spine_id=0, seen=50, expected=80, max_gap=2),
         ))
         # Two consecutive bad reports for plane 0.
         apply_loss_report(
@@ -431,7 +431,7 @@ class TestApplyLossReport(unittest.TestCase):
         t = self._table(loss_threshold=0.05, loss_demote_consecutive=2)
         ring = SentWindowRing(num_planes=self.NUM_PLANES)
         report = LossReport(window_id=0, planes=(
-            PlaneLossRecord(plane_id=1, seen=50, expected=80, max_gap=2),
+            PlaneLossRecord(plane_id=1, spine_id=0, seen=50, expected=80, max_gap=2),
         ))
         stats = LossFusionStats()
         apply_loss_report(
@@ -449,7 +449,7 @@ class TestApplyLossReport(unittest.TestCase):
         t = self._table()
         ring = SentWindowRing(num_planes=self.NUM_PLANES)
         report = LossReport(window_id=0, planes=(
-            PlaneLossRecord(plane_id=0, seen=0, expected=0, max_gap=0),
+            PlaneLossRecord(plane_id=0, spine_id=0, seen=0, expected=0, max_gap=0),
         ))
         stats = LossFusionStats()
         apply_loss_report(

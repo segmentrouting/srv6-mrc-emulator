@@ -423,6 +423,7 @@ class SenderMrcAgent:
                         req_id=req_id,
                         plane_id=plane,
                         tx_ns=tx_ns,
+                        spine_id=0,  # TODO(phase1b/step2): per-EV probes
                         tenant_id=self.tenant_id,
                         src_id=self.src_id,
                         reply_port=self._peer.report_port,
@@ -831,6 +832,7 @@ class ReceiverMrcAgent:
                     plane_id=probe.plane_id,
                     tx_ns=probe.tx_ns,
                     svc_time_ns=0,  # we don't measure service time today
+                    spine_id=probe.spine_id,  # echo per-EV identity back
                     tenant_id=probe.tenant_id,
                     src_id=probe.src_id,
                     reply_port=probe.reply_port,
