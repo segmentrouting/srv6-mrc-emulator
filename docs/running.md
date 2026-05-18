@@ -123,8 +123,61 @@ Under `topologies/4p-8x16/scenarios/`:
 | `plane-latency.yaml` | +N ms on one plane | loss% ≈ 0, reord and reord_max ↑↑ |
 | `plane-loss.yaml` | 5% random loss on one plane | loss% ≈ (plane_loss% / 4), modest reord |
 | `plane-blackhole.yaml` | 100% drop on one plane | loss% ≈ 25%, target plane shows rx=0, reord ↓ |
+| `green-ev-spray.yaml` | EV-spray full fan-out (4 planes * 8 spines) | balanced across all 32 EVs in `per_ev_sent` |
+| `green-ev-spray-n2.yaml` | EV-spray narrow (4 planes * 2 spines) | per-pair tcpdump alternates between 2 spine hextets |
 
 See each `.yaml` for the exact flow list, rates, and netem specs.
+
+### Spraying with EV-spray
+
+The `ev_spray` policy varies BOTH plane and spine per packet — every
+packet gets a new outer SID rotation, so a single flow walks `4 * N`
+distinct leaf-to-spine paths (entropy values, EVs) where `N` is
+`paths_per_plane`. Default `N = NUM_SPINES` (8 on the 4p-8x16
+topology).
+
+Two ways to enable it:
+
+```bash
+# 1. Scenario YAML (preferred): top-level paths_per_plane + ev_spray
+#    in the flow's policy field.
+sudo make scenario SCEN=green-ev-spray         # N=8, full fan-out
+sudo make scenario SCEN=green-ev-spray-n2      # N=2, easier to eyeball
+
+# 2. Manual two-host spray (no orchestrator). Start the receiver
+#    first (see "Manual two-host spray" above), then:
+docker exec green-host00 spray --role send \
+    --dst-id 15 --rate 1000pps --duration 5s --policy ev_spray:2
+# or use --paths-per-plane to override an env-set default:
+#   --policy ev_spray --paths-per-plane 4
+```
+
+What to look for in the report (`results/<scenario>.json`):
+
+- `per_plane_sent` — still balanced across 4 planes (plane rotates
+  every packet).
+- `per_ev_sent` — keyed `"P<p>:S<s>"`; with `paths_per_plane=8` every
+  pair shows ~125 packets per EV at 1000pps/5s; with `paths_per_plane=2`
+  exactly two spines are populated per pair (the subset is
+  hash-derived from the (src, dst) pair, so different pairs land on
+  different spine subsets).
+
+What to look for on the wire (tcpdump on a leaf eth1..eth4):
+
+```bash
+# On a leaf SONiC container:
+docker exec -it sonic-leaf-00-p0 bash -lc \
+  "tcpdump -i Ethernet0 -nn -c 20 udp port 9999"
+# Outer DA hextets `fc00:000<P>:f00<S>:e00<L>:d000::` should show
+# the `<S>` digit changing packet-to-packet. With paths_per_plane=2
+# you'll see exactly 2 distinct `<S>` values per src/dst pair.
+```
+
+Precedence for `paths_per_plane`:
+`ev_spray:N` in `--policy` > `--paths-per-plane` flag >
+`SRV6_PATHS_PER_PLANE` env > policy default (`NUM_SPINES`). The
+scenario orchestrator propagates the YAML's `paths_per_plane` via
+env, so flows that say only `policy: ev_spray` pick it up.
 
 ## Writing a new scenario
 

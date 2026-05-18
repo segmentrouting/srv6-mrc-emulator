@@ -383,5 +383,54 @@ report:
         self.assertEqual(len(s.faults), 1)
 
 
+class TestPathsPerPlane(unittest.TestCase):
+    """Top-level scenario `paths_per_plane: N` override for EV-spray."""
+
+    _BASE = """
+name: x
+flows:
+  - pairs: green-pairs-8
+    policy: ev_spray
+    rate: 1000pps
+    duration: 5s
+"""
+
+    def test_absent_defaults_to_none(self):
+        s = scenario.from_yaml_string(self._BASE)
+        self.assertIsNone(s.paths_per_plane)
+
+    def test_explicit_value_accepted(self):
+        from srv6_fabric.topo import NUM_SPINES
+        text = self._BASE + f"paths_per_plane: {NUM_SPINES}\n"
+        s = scenario.from_yaml_string(text)
+        self.assertEqual(s.paths_per_plane, NUM_SPINES)
+
+    def test_one_accepted(self):
+        text = self._BASE + "paths_per_plane: 1\n"
+        s = scenario.from_yaml_string(text)
+        self.assertEqual(s.paths_per_plane, 1)
+
+    def test_zero_rejected(self):
+        text = self._BASE + "paths_per_plane: 0\n"
+        with self.assertRaises(scenario.ScenarioError):
+            scenario.from_yaml_string(text)
+
+    def test_over_max_rejected(self):
+        from srv6_fabric.topo import NUM_SPINES
+        text = self._BASE + f"paths_per_plane: {NUM_SPINES + 1}\n"
+        with self.assertRaises(scenario.ScenarioError):
+            scenario.from_yaml_string(text)
+
+    def test_bool_rejected(self):
+        text = self._BASE + "paths_per_plane: true\n"
+        with self.assertRaises(scenario.ScenarioError):
+            scenario.from_yaml_string(text)
+
+    def test_string_rejected(self):
+        text = self._BASE + "paths_per_plane: 'four'\n"
+        with self.assertRaises(scenario.ScenarioError):
+            scenario.from_yaml_string(text)
+
+
 if __name__ == "__main__":
     unittest.main()

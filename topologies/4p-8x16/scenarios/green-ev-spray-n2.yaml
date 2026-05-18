@@ -1,0 +1,29 @@
+# green-ev-spray-n2.yaml — EV-spray with paths_per_plane=2.
+#
+# Easier lab-verification variant of green-ev-spray: only 2 spines per
+# pair, so each pair walks 4 planes * 2 spines = 8 EVs. The per-pair
+# spine subset is hash-derived (see topo.select_spines), so different
+# pairs land on different spine pairs — across 8 pairs the aggregate
+# still touches most/all spines, but any single pair's tcpdump shows a
+# clean 2-spine alternation per plane.
+#
+# Run:
+#   sudo make scenario SCEN=green-ev-spray-n2
+name: green-ev-spray-n2
+description: |
+  EV-spray with paths_per_plane=2. Per-pair fan-out is 8 EVs;
+  per-pair tcpdump shows alternating `f<S>` hextet between exactly
+  two values. Useful for visual wire-form validation.
+
+paths_per_plane: 2
+
+flows:
+  - pairs: green-pairs-8
+    policy: ev_spray
+    rate: 1000pps
+    duration: 5s
+
+faults: []
+
+report:
+  out: results/green-ev-spray-n2.json

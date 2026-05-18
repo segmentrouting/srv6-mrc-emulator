@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -78,13 +79,16 @@ def parse_duration(s: str) -> float:
     return val / 1000.0 if m.group(2) == "ms" else val
 
 
-def parse_policy(s: str, *, tenant: str, ev_config=None):
+def parse_policy(s: str, *, tenant: str, ev_config=None,
+                 paths_per_plane: int | None = None):
     """Convert CLI string into a SprayPolicy via policy_from_spec.
 
     Accepted forms:
         round_robin
         hash5tuple
         weighted:0.4,0.3,0.2,0.1
+        ev_spray              (uses paths_per_plane override or NUM_SPINES)
+        ev_spray:N            (explicit fan-out, overrides paths_per_plane arg)
         health_aware_mrc
 
     `health_aware_mrc` resolves the factory returned by policy_from_spec
@@ -94,11 +98,23 @@ def parse_policy(s: str, *, tenant: str, ev_config=None):
     own defaults are used. The probe and loss-report threads that feed
     the table live in cmd_send, which constructs a SenderMrcAgent from
     `policy.table` after this returns.
+
+    `paths_per_plane` is the scenario-level override forwarded from the
+    SRV6_PATHS_PER_PLANE env or --paths-per-plane CLI flag. It applies
+    only when the policy string is bare "ev_spray" (no explicit N).
+    Embedded "ev_spray:N" syntax always wins over the override, so a
+    user with a CLI policy spec doesn't get silently retuned by a
+    leftover env var.
     """
     s = s.strip()
     if s.startswith("weighted:"):
         weights = [float(w) for w in s.split(":", 1)[1].split(",")]
         return policy_from_spec({"weighted": weights})
+    if s.startswith("ev_spray:"):
+        n = int(s.split(":", 1)[1])
+        return policy_from_spec({"ev_spray": n})
+    if s == "ev_spray" and paths_per_plane is not None:
+        return policy_from_spec({"ev_spray": paths_per_plane})
     policy = policy_from_spec(s)
     if isinstance(policy, HealthAwareMrcFactory):
         # Lazy import: keeps stdlib-only imports at top of file and
@@ -156,7 +172,25 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
         # them; fall through and let the policy build fail loudly.
         pass
 
-    policy = parse_policy(args.policy, tenant=tenant, ev_config=ev_cfg)
+    # Resolve paths_per_plane: CLI flag wins over env var, env var wins
+    # over policy default. None means "let policy_from_spec use NUM_SPINES".
+    ppp: int | None = None
+    env_ppp = os.environ.get("SRV6_PATHS_PER_PLANE")
+    if env_ppp:
+        try:
+            ppp = int(env_ppp)
+        except ValueError:
+            print(
+                f"spray.py: SRV6_PATHS_PER_PLANE={env_ppp!r} is not an int",
+                file=sys.stderr,
+            )
+            return 2
+    if getattr(args, "paths_per_plane", None) is not None:
+        ppp = args.paths_per_plane
+
+    policy = parse_policy(
+        args.policy, tenant=tenant, ev_config=ev_cfg, paths_per_plane=ppp,
+    )
 
     # When the policy is health_aware_mrc, we own a live EVStateTable
     # via policy.table. Start a SenderMrcAgent to drive probes + ingest
@@ -361,9 +395,18 @@ def main() -> int:
                    help="(send) e.g. 5s, 500ms, or 0 to run until ^C")
     p.add_argument("--policy", type=str, default="round_robin",
                    help="(send) spray policy: round_robin (default), "
-                        "hash5tuple, 'weighted:0.4,0.3,0.2,0.1', or "
+                        "hash5tuple, 'weighted:0.4,0.3,0.2,0.1', "
+                        "ev_spray[:N] (EV-aware spray with N spines per "
+                        "plane; default N=NUM_SPINES), or "
                         "health_aware_mrc (auto-starts the SenderMrcAgent; "
                         "pair with --mrc on the receiver)")
+    p.add_argument("--paths-per-plane", type=int, default=None,
+                   help="(send) override the EV fan-out for ev_spray "
+                        "policies. Equivalent to ev_spray:N in --policy, "
+                        "but lets the scenario YAML's paths_per_plane "
+                        "field propagate via env without rewriting the "
+                        "policy string. CLI flag wins over env; env wins "
+                        "over policy default.")
     p.add_argument("--idle-timeout", type=parse_duration,
                    default=parse_duration("6s"),
                    help="(recv) auto-exit after this much silence "

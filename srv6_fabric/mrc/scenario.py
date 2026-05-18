@@ -53,7 +53,7 @@ from typing import Any
 
 from ..netem import normalize_spec, parse_target
 from ..policy import policy_from_spec
-from ..topo import NUM_LEAVES, TENANTS, host_name
+from ..topo import NUM_LEAVES, NUM_SPINES, TENANTS, host_name
 
 
 # --- public dataclasses -----------------------------------------------------
@@ -152,6 +152,13 @@ class Scenario:
     # with all-None fields) means "enable MRC, layer these tunables
     # over the defaults on both sender + receiver sides".
     mrc: MrcSpec | None = None
+    # Override the default fan-out for EV-spray policies (ev_spray and
+    # any future EV-aware variant). None = "use NUM_SPINES from topo"
+    # (full fan-out). Otherwise 1..NUM_SPINES. Non-EV policies ignore
+    # this field. Plumbed through to the spray policy at sender startup
+    # by the spray CLI (via SRV6_PATHS_PER_PLANE env var or the
+    # --paths-per-plane CLI flag).
+    paths_per_plane: int | None = None
 
 
 # --- named pair sets --------------------------------------------------------
@@ -202,7 +209,8 @@ def validate(doc: Any) -> Scenario:
         raise ScenarioError("$", "scenario must be a mapping at top level")
 
     _require_keys(doc, "$", required={"name", "flows"},
-                  optional={"description", "faults", "report", "mrc"})
+                  optional={"description", "faults", "report", "mrc",
+                            "paths_per_plane"})
 
     name = _require_str(doc, "$.name")
     description = _opt_str(doc, "$.description", default="")
@@ -222,6 +230,10 @@ def validate(doc: Any) -> Scenario:
     report = _validate_report(doc.get("report"), "$.report")
     mrc = _validate_mrc(doc.get("mrc"), "$.mrc") if "mrc" in doc else None
 
+    paths_per_plane = _validate_paths_per_plane(
+        doc.get("paths_per_plane"), "$.paths_per_plane"
+    )
+
     return Scenario(
         name=name,
         description=description,
@@ -229,6 +241,7 @@ def validate(doc: Any) -> Scenario:
         faults=faults,
         report=report,
         mrc=mrc,
+        paths_per_plane=paths_per_plane,
     )
 
 
@@ -346,6 +359,28 @@ def _validate_report(value: Any, path: str) -> ReportSpec:
     if out is not None and not isinstance(out, str):
         raise ScenarioError(f"{path}.out", "must be a string path")
     return ReportSpec(out=out)
+
+
+def _validate_paths_per_plane(value: Any, path: str) -> int | None:
+    """Validate top-level scenario `paths_per_plane: <int>` if present.
+
+    Returns None when absent (means "use NUM_SPINES at runtime"); raises
+    ScenarioError on a malformed value. Range is checked against the
+    *current* NUM_SPINES — a scenario with paths_per_plane=8 will fail
+    to load on a 2p-4x8 topology (NUM_SPINES=4), which is the right
+    behavior: the YAML is topology-specific.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ScenarioError(path, "must be an integer")
+    if not (1 <= value <= NUM_SPINES):
+        raise ScenarioError(
+            path,
+            f"must be 1..{NUM_SPINES} (NUM_SPINES on this topology), "
+            f"got {value}"
+        )
+    return value
 
 
 # --- mrc -------------------------------------------------------------------

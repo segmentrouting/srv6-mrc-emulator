@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, TYPE_CHECKING
 
-from .topo import NUM_PLANES, FlowKey
+from .topo import NUM_PLANES, NUM_SPINES, FlowKey, select_spines
 
 if TYPE_CHECKING:
     # Imported lazily inside HealthAwareMrc to avoid a circular import
@@ -47,6 +47,91 @@ class RoundRobin:
 
     def pick(self, seq: int, flow: FlowKey) -> int:
         return seq % NUM_PLANES
+
+
+@dataclass
+class EvSpray:
+    """Round-robin across the full EV set = NUM_PLANES * paths_per_plane.
+
+    Each EV is a (plane, spine) tuple. The spine subset for a given
+    (src, dst) pair is computed once via `select_spines()` and stays
+    constant for the lifetime of the policy; the round-robin walks
+    plane-major (plane 0 spines, then plane 1 spines, ...) so successive
+    packets visit different planes (giving the same anti-clustering
+    benefit as plain round-robin) while also varying spine within each
+    plane (giving leaf->spine ECMP entropy on the wire, which plain
+    round-robin lacks).
+
+    Use this when you want per-packet entropy across the full fabric,
+    not just per-plane. With paths_per_plane = NUM_SPINES (the default)
+    every spine on every plane is exercised; with paths_per_plane < N
+    the per-pair subset is hash-derived so different pairs use
+    different spine subsets and the whole fabric still sees traffic.
+
+    Returns:
+      pick(seq, flow) -> plane (backward-compat for callers that only
+        want the plane; computed from the EV the walk would choose).
+      pick_ev(seq, flow) -> (plane, spine) — preferred. The runner uses
+        this to build the outer DA's `<S>` hextet per packet.
+
+    Future step 3 (per-EV health) will subclass / extend this with an
+    "active EV mask" read from an EVStateTable, so a degraded EV gets
+    skipped on its turn. For step 1 every EV is always active.
+    """
+    paths_per_plane: int = NUM_SPINES
+    name: str = "ev_spray"
+
+    # Per-flow cache: FlowKey -> tuple of spine indices. EvSpray.pick is
+    # called once per packet so the dict lookup is the hot path; we
+    # accept it because the alternative (preselect at runner startup) is
+    # leaky when the same policy instance serves multiple flows.
+    _spine_subsets: dict = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        if not (1 <= self.paths_per_plane <= NUM_SPINES):
+            raise ValueError(
+                f"paths_per_plane must be 1..{NUM_SPINES}, "
+                f"got {self.paths_per_plane}"
+            )
+
+    def _spines_for_flow(self, flow: FlowKey) -> tuple[int, ...]:
+        """Per-flow spine subset, cached. Symmetric in flow direction."""
+        cached = self._spine_subsets.get(flow)
+        if cached is not None:
+            return cached
+        # FlowKey carries IPv6 strings, not host ids. Use the flow hash
+        # as a stand-in for (src_id, dst_id) since select_spines only
+        # needs a stable pair fingerprint. We canonicalize on addresses
+        # so both directions of the same pair get the same subset.
+        lo, hi = sorted((flow.src_addr, flow.dst_addr))
+        # Derive synthetic numeric ids from the address strings for
+        # select_spines (which expects ints). Hash to small ints so
+        # select_spines's FNV-1a step gets fresh entropy.
+        a = (hash(lo) & 0xFFFFFFFF) % 1024
+        b = (hash(hi) & 0xFFFFFFFF) % 1024
+        subset = select_spines(a, b, self.paths_per_plane)
+        self._spine_subsets[flow] = subset
+        return subset
+
+    def pick_ev(self, seq: int, flow: FlowKey) -> tuple[int, int]:
+        """Return (plane, spine) for this packet. Round-robin plane-major."""
+        spines = self._spines_for_flow(flow)
+        ev_count = NUM_PLANES * len(spines)
+        ev_idx = seq % ev_count
+        # plane-major: ev_idx = plane * len(spines) + spine_idx_in_subset
+        # ... but plane-major would visit (P0,S0), (P0,S1), ..., (P0,Sk-1),
+        # (P1,S0), .... That hot-spots a single plane for k packets in a
+        # row, which defeats the anti-clustering point of round-robin.
+        # Use spine-major instead: (P0,S0), (P1,S0), (P2,S0), (P3,S0),
+        # (P0,S1), (P1,S1), ... -- successive packets always change plane.
+        plane = ev_idx % NUM_PLANES
+        spine_idx = (ev_idx // NUM_PLANES) % len(spines)
+        return plane, spines[spine_idx]
+
+    def pick(self, seq: int, flow: FlowKey) -> int:
+        """Backward-compat shim returning just the plane."""
+        plane, _ = self.pick_ev(seq, flow)
+        return plane
 
 
 @dataclass
@@ -283,6 +368,10 @@ def policy_from_spec(spec) -> SprayPolicy:
             return RoundRobin()
         if spec == "hash5tuple":
             return Hash5Tuple()
+        if spec == "ev_spray":
+            # Bare form: full fan-out (paths_per_plane = NUM_SPINES). To
+            # tune, pass `{ev_spray: <int>}` in the YAML.
+            return EvSpray()
         if spec == "health_aware_mrc":
             return HealthAwareMrcFactory()
         raise ValueError(f"unknown policy: {spec!r}")
@@ -290,6 +379,8 @@ def policy_from_spec(spec) -> SprayPolicy:
         (kind, value), = spec.items()
         if kind == "weighted":
             return Weighted(weights=tuple(float(x) for x in value))
+        if kind == "ev_spray":
+            return EvSpray(paths_per_plane=int(value))
         if kind == "health_aware":
             return HealthAware(inner=policy_from_spec(value))
         raise ValueError(f"unknown policy kind: {kind!r}")

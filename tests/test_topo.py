@@ -265,5 +265,58 @@ class TestFlowKey(unittest.TestCase):
         self.assertNotEqual(base, topo.FlowKey("a", "b", 9, 2).hash5())
 
 
+class TestSelectSpines(unittest.TestCase):
+    """Deterministic per-pair spine subsets used by EV-spray."""
+
+    def test_returns_exactly_n_distinct(self):
+        # Spot-check several pairs and several N values; all must give
+        # exactly N distinct spine indices in [0, NUM_SPINES).
+        for src, dst in [(0, 15), (3, 12), (7, 8), (1, 1)]:
+            # Note: (1,1) is a self-pair; select_spines doesn't reject
+            # those since it has no concept of "different host required"
+            # — that's the caller's job. Still must return a valid set.
+            for n in range(1, topo.NUM_SPINES + 1):
+                got = topo.select_spines(src, dst, n)
+                self.assertEqual(len(got), n)
+                self.assertEqual(len(set(got)), n)
+                for s in got:
+                    self.assertGreaterEqual(s, 0)
+                    self.assertLess(s, topo.NUM_SPINES)
+
+    def test_full_fanout_is_permutation(self):
+        # n == NUM_SPINES means every spine appears exactly once.
+        got = topo.select_spines(0, 15, topo.NUM_SPINES)
+        self.assertEqual(sorted(got), list(range(topo.NUM_SPINES)))
+
+    def test_deterministic(self):
+        # Same inputs -> same output, every call.
+        a = topo.select_spines(2, 13, 4)
+        b = topo.select_spines(2, 13, 4)
+        self.assertEqual(a, b)
+
+    def test_symmetric_in_pair(self):
+        # (src,dst) and (dst,src) MUST yield the same subset so the
+        # reverse-direction sender sees the same EV identities.
+        forward = topo.select_spines(0, 15, 4)
+        reverse = topo.select_spines(15, 0, 4)
+        self.assertEqual(forward, reverse)
+
+    def test_rejects_out_of_range_n(self):
+        with self.assertRaises(ValueError):
+            topo.select_spines(0, 15, 0)
+        with self.assertRaises(ValueError):
+            topo.select_spines(0, 15, topo.NUM_SPINES + 1)
+        with self.assertRaises(ValueError):
+            topo.select_spines(0, 15, -1)
+
+    def test_order_is_stable_within_subset(self):
+        # The round-robin EV walk depends on the spine ORDER being
+        # stable, not just the set. Calling twice must give the same
+        # tuple in the same order.
+        a = topo.select_spines(4, 11, 3)
+        b = topo.select_spines(4, 11, 3)
+        self.assertEqual(a, b)
+
+
 if __name__ == "__main__":
     unittest.main()

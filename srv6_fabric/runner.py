@@ -84,8 +84,18 @@ class SenderResult:
     sent: int = 0
     elapsed_s: float = 0.0
     per_plane_sent: dict[int, int] = field(default_factory=dict)
+    # Per-EV send counts when EV-spray is active. Keyed by (plane, spine).
+    # Empty when the policy doesn't expose pick_ev(); per_plane_sent is
+    # the source of truth in that case. Reports include this in addition
+    # to (not instead of) per_plane_sent so the rolled-up plane view
+    # stays consistent across policies.
+    per_ev_sent: dict[tuple[int, int], int] = field(default_factory=dict)
     errors: int = 0
-    # Spine chosen for this run (informational; useful in reports).
+    # Spine chosen for this run (informational; useful in reports). When
+    # the policy is EV-aware (per_ev_sent populated) this field holds
+    # the legacy single-spine value from spine_for() for backward
+    # compatibility, but the meaningful per-packet picks live in
+    # per_ev_sent.
     spine: int = 0
 
     def to_dict(self) -> dict:
@@ -100,6 +110,13 @@ class SenderResult:
             "sent": self.sent,
             "elapsed_s": round(self.elapsed_s, 3),
             "per_plane_sent": dict(sorted(self.per_plane_sent.items())),
+            # Stringify EV tuple keys for JSON serializability; the
+            # canonical form "P<plane>:S<spine>" is human-readable and
+            # parses cleanly back into ints.
+            "per_ev_sent": {
+                f"P{p}:S{s}": n
+                for (p, s), n in sorted(self.per_ev_sent.items())
+            },
             "errors": self.errors,
         }
 
@@ -188,16 +205,27 @@ def run_sender(flow: FlowEndpoint,
     dst_inner = inner_addr(flow.tenant, flow.dst_id)
     flow_key = flow.to_flow_key()
 
+    # Detect EV-aware policies (those exposing pick_ev). For non-EV policies
+    # we precompute the outer DA once per plane at startup using
+    # spine_for(); for EV policies the spine varies per packet and the
+    # outer DA is built in the hot loop. We also precompute per-plane
+    # src_underlay and sendto sockaddr in both cases, since those don't
+    # depend on spine.
+    ev_aware = hasattr(policy, "pick_ev")
+
     # One raw socket per plane, all opened upfront so per-packet cost is
     # just a sendto.
     sockets: dict[int, socket.socket] = {}
+    plane_src_underlay: dict[int, str] = {}
     plane_meta: dict[int, tuple[str, str, tuple]] = {}
     try:
         for p in range(NUM_PLANES):
             sockets[p] = _open_send_socket(PLANE_NICS[p])
             src_u = host_underlay_addr(flow.tenant, p, flow.src_id)
-            outer_d = usid_outer_dst(flow.tenant, p, spine, flow.dst_id)
-            plane_meta[p] = (src_u, outer_d, (outer_d, 0, 0, 0))
+            plane_src_underlay[p] = src_u
+            # Legacy fixed-spine precompute used by non-EV policies.
+            outer_d_fixed = usid_outer_dst(flow.tenant, p, spine, flow.dst_id)
+            plane_meta[p] = (src_u, outer_d_fixed, (outer_d_fixed, 0, 0, 0))
 
         result = SenderResult(
             flow=flow, policy=policy.name,
@@ -214,13 +242,27 @@ def run_sender(flow: FlowEndpoint,
             while time.monotonic() < deadline:
                 if stop_event is not None and stop_event.is_set():
                     break
-                plane = policy.pick(seq, flow_key)
-                if not 0 <= plane < NUM_PLANES:
-                    raise RuntimeError(
-                        f"policy {policy.name!r} returned out-of-range "
-                        f"plane {plane}"
+                if ev_aware:
+                    plane, ev_spine = policy.pick_ev(seq, flow_key)
+                    if not 0 <= plane < NUM_PLANES:
+                        raise RuntimeError(
+                            f"policy {policy.name!r} returned out-of-range "
+                            f"plane {plane}"
+                        )
+                    src_u = plane_src_underlay[plane]
+                    outer_d = usid_outer_dst(
+                        flow.tenant, plane, ev_spine, flow.dst_id
                     )
-                src_u, outer_d, sa = plane_meta[plane]
+                    sa = (outer_d, 0, 0, 0)
+                else:
+                    plane = policy.pick(seq, flow_key)
+                    if not 0 <= plane < NUM_PLANES:
+                        raise RuntimeError(
+                            f"policy {policy.name!r} returned out-of-range "
+                            f"plane {plane}"
+                        )
+                    ev_spine = spine
+                    src_u, outer_d, sa = plane_meta[plane]
                 pkt = _build_packet_bytes(
                     src_u, outer_d, src_inner, dst_inner, seq, plane,
                 )
@@ -228,6 +270,10 @@ def run_sender(flow: FlowEndpoint,
                     sockets[plane].sendto(pkt, sa)
                     result.per_plane_sent[plane] = \
                         result.per_plane_sent.get(plane, 0) + 1
+                    if ev_aware:
+                        ev_key = (plane, ev_spine)
+                        result.per_ev_sent[ev_key] = \
+                            result.per_ev_sent.get(ev_key, 0) + 1
                     result.sent += 1
                     if progress_cb is not None:
                         progress_cb(seq, plane)

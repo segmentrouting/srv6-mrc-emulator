@@ -184,10 +184,22 @@ raw socket per plane bound via `SO_BINDTODEVICE`. Receiver sniffs at NIC
 pre-decap (yellow can't sniff post-decap on `lo` per-NIC).
 
 Notable flags:
-- `--policy {round_robin,hash5tuple,weighted:0.4,0.3,0.2,0.1,health_aware_mrc}`
+- `--policy {round_robin,hash5tuple,weighted:0.4,0.3,0.2,0.1,ev_spray[:N],health_aware_mrc}`
   — default `round_robin`. `health_aware_mrc` only does something useful
   when the sender also starts a `SenderMrcAgent` (auto-started from
-  `cmd_send` when this policy is selected).
+  `cmd_send` when this policy is selected). `ev_spray[:N]` varies BOTH
+  plane AND spine per packet (4 * N EVs total); bare `ev_spray` uses
+  the full fan-out (N = `NUM_SPINES` from `topo.yaml`). The outer DA's
+  `f<S>` hextet rotates packet-by-packet so each EV traces a distinct
+  leaf-to-spine path; the receiver doesn't care which EV a probe came
+  from, because the data-path runner doesn't use kernel routes for the
+  outer encap (scapy builds the wire form directly).
+- `--paths-per-plane N` — runtime override for `ev_spray` fan-out.
+  Equivalent to `ev_spray:N` in `--policy` but lets scenario YAML's
+  `paths_per_plane` field propagate via the `SRV6_PATHS_PER_PLANE` env
+  without rewriting the policy string. Order of precedence: explicit
+  `ev_spray:N` in `--policy` > `--paths-per-plane` CLI flag >
+  `SRV6_PATHS_PER_PLANE` env > policy default (`NUM_SPINES`).
 - `--mrc` — receiver-only flag; opens probe-reply + loss-emit sockets
   and starts a `ReceiverMrcAgent`. Off by default; baseline runs are
   unaffected.

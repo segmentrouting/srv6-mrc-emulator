@@ -86,7 +86,24 @@ class TestSenderResult(unittest.TestCase):
         self.assertEqual(d["sent"], 400)
         self.assertEqual(d["elapsed_s"], 1.002)   # rounded to 3dp
         self.assertEqual(d["per_plane_sent"], {0: 100, 1: 100, 2: 100, 3: 100})
+        # per_ev_sent always present in the dict shape, even when empty
+        # (non-EV policies leave it as an empty mapping).
+        self.assertEqual(d["per_ev_sent"], {})
         self.assertEqual(d["errors"], 0)
+
+    def test_per_ev_sent_serializes_as_p_s_keys(self):
+        # EV-aware runs populate per_ev_sent with (plane, spine) tuple
+        # keys; to_dict serializes those as "P<p>:S<s>" strings for
+        # JSON compatibility.
+        f = FlowEndpoint("green", 0, 15)
+        r = SenderResult(flow=f, policy="ev_spray",
+                         rate_pps=100, duration_s=1.0, spine=0,
+                         sent=4, elapsed_s=0.04,
+                         per_plane_sent={0: 1, 1: 1, 2: 1, 3: 1},
+                         per_ev_sent={(0, 0): 1, (1, 0): 1, (2, 0): 1, (3, 0): 1})
+        d = r.to_dict()
+        self.assertEqual(d["per_ev_sent"],
+                         {"P0:S0": 1, "P1:S0": 1, "P2:S0": 1, "P3:S0": 1})
 
     def test_per_plane_sent_sorted_in_dict(self):
         f = FlowEndpoint("green", 0, 1)

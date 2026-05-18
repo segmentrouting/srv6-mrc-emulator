@@ -157,6 +157,54 @@ def spine_for(src_id: int, dst_id: int) -> int:
     return (a * NUM_LEAVES + b) % NUM_SPINES
 
 
+def select_spines(src_id: int, dst_id: int, n: int) -> tuple[int, ...]:
+    """Deterministic hash-derived subset of `n` spine indices in [0, NUM_SPINES).
+
+    Used by EV-spray to pick which spines a given (src, dst) pair fans out
+    across. Returns the same tuple every time for the same inputs and is
+    symmetric in (src, dst) — the reverse-direction sender on the same pair
+    sees the same EV set, so EV identities are stable end-to-end.
+
+    Algorithm:
+      - Canonicalize (lo, hi) = sorted (src_id, dst_id) for symmetry.
+      - Seed an FNV-1a-style mixing from (lo, hi).
+      - Generate spine candidates by stepping through [0, NUM_SPINES) in a
+        hash-rotated order; collect the first n distinct entries.
+
+      When n == NUM_SPINES the rotation just produces a permutation of all
+      spines (every spine included); for n == 1 the result is one chosen
+      spine that is NOT necessarily the same as spine_for() — those are
+      separate functions with separate purposes.
+
+    Args:
+        src_id: source host id (0..NUM_LEAVES-1).
+        dst_id: destination host id (0..NUM_LEAVES-1).
+        n: number of spines to pick; must satisfy 1 <= n <= NUM_SPINES.
+
+    Returns:
+        Tuple of `n` distinct spine indices in deterministic order. The
+        order itself is stable per pair (so the round-robin selector
+        always walks spines in the same order for a given pair).
+    """
+    if not (1 <= n <= NUM_SPINES):
+        raise ValueError(
+            f"paths_per_plane must be 1..{NUM_SPINES}, got {n!r}"
+        )
+    lo, hi = (src_id, dst_id) if src_id < dst_id else (dst_id, src_id)
+    # FNV-1a 64-bit over the canonical pair; same constant as FlowKey.hash5
+    # so we get good distribution without a new mixing function.
+    h = 0xcbf29ce484222325
+    for b in f"{lo}|{hi}".encode():
+        h ^= b
+        h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    # Rotate the spine list by `h % NUM_SPINES` and take the first n.
+    # This gives a deterministic, well-distributed n-subset where the
+    # *order* within the subset is also stable (important for the
+    # round-robin EV walk).
+    offset = h % NUM_SPINES
+    return tuple(((offset + i) % NUM_SPINES) for i in range(n))
+
+
 # --- addresses --------------------------------------------------------------
 
 def host_underlay_addr(tenant: str, plane: int, host_id: int) -> str:

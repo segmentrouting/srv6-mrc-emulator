@@ -137,13 +137,19 @@ def policy_to_cli(spec: Any) -> str:
     """
     if isinstance(spec, str):
         # Bare strings pass straight through: round_robin, hash5tuple,
-        # health_aware_mrc. The spray.py side resolves health_aware_mrc
-        # into a bound HealthAwareMrc with its local EVStateTable.
+        # ev_spray, health_aware_mrc. The spray.py side resolves
+        # health_aware_mrc into a bound HealthAwareMrc with its local
+        # EVStateTable; ev_spray (bare) defaults to full fan-out and
+        # the scenario-level paths_per_plane override (if any) reaches
+        # the sender via the SRV6_PATHS_PER_PLANE env var rather than a
+        # CLI flag, so the bare policy string here is sufficient.
         return spec
     if isinstance(spec, dict) and len(spec) == 1:
         key, value = next(iter(spec.items()))
         if key == "weighted":
             return "weighted:" + ",".join(str(w) for w in value)
+        if key == "ev_spray":
+            return f"ev_spray:{int(value)}"
         if key == "health_aware":
             # The shim doesn't yet wrap policies in the legacy health-aware
             # mode (ICMPv6-driven down set). Surface this as a known
@@ -220,22 +226,38 @@ def _recv_argv(idle_timeout_s: float, *, mrc: bool) -> list[str]:
     return argv
 
 
-def _mrc_env(mrc: MrcSpec | None) -> dict[str, str] | None:
-    """Build the env dict passed to docker exec for an MRC scenario.
+def _scenario_env(mrc: MrcSpec | None,
+                  paths_per_plane: int | None) -> dict[str, str] | None:
+    """Build the env dict passed to docker exec for a scenario run.
 
-    Returns None when MRC is disabled — the orchestrator skips the
-    -e flags entirely in that case, keeping baseline runs identical
-    to pre-MRC behavior on the wire.
+    Bundles both MRC tunables (SRV6_MRC_CONFIG_JSON) and the EV-spray
+    fan-out override (SRV6_PATHS_PER_PLANE). Returns None when neither
+    knob is set, so non-MRC scenarios without EV-spray see no -e flags
+    and the on-wire behavior is identical to pre-EV runs.
+
+    paths_per_plane is propagated even when MRC is disabled, because
+    EV-spray is a sender-side concern independent of the MRC probe/EV
+    state machine.
     """
-    if mrc is None:
-        return None
-    return {"SRV6_MRC_CONFIG_JSON": mrc.to_env_json()}
+    env: dict[str, str] = {}
+    if mrc is not None:
+        env["SRV6_MRC_CONFIG_JSON"] = mrc.to_env_json()
+    if paths_per_plane is not None:
+        env["SRV6_PATHS_PER_PLANE"] = str(paths_per_plane)
+    return env or None
+
+
+# Backward-compat shim so external code (tests, etc.) that imports
+# _mrc_env still works. New code should call _scenario_env directly.
+def _mrc_env(mrc: MrcSpec | None) -> dict[str, str] | None:
+    return _scenario_env(mrc, paths_per_plane=None)
 
 
 def run_flows(flows: list[FlowRun], *,
               idle_timeout_s: float = RECV_IDLE_TIMEOUT_S,
               settle_s: float = RECEIVER_SETTLE_S,
               mrc: MrcSpec | None = None,
+              paths_per_plane: int | None = None,
               verbose: bool = False) -> tuple[list[dict], list[dict]]:
     """Run all flows concurrently. Returns (sender_records, receiver_records).
 
@@ -255,7 +277,7 @@ def run_flows(flows: list[FlowRun], *,
     max_dur = max((f.duration_s for f in flows), default=0.0)
     recv_max_wait = max_dur + idle_timeout_s + 30.0
 
-    env = _mrc_env(mrc)
+    env = _scenario_env(mrc, paths_per_plane)
     mrc_enabled = mrc is not None
 
     if verbose:
@@ -396,7 +418,9 @@ def run_scenario(scenario: Scenario, *,
         if scenario.faults:
             time.sleep(FAULT_SETTLE_S)
         sender_records, receiver_records = run_flows(
-            flows, mrc=scenario.mrc, verbose=verbose,
+            flows, mrc=scenario.mrc,
+            paths_per_plane=scenario.paths_per_plane,
+            verbose=verbose,
         )
     finally:
         try:

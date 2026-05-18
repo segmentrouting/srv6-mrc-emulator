@@ -255,5 +255,105 @@ class TestHealthAwareMrc(unittest.TestCase):
         self.assertIn(live.pick(0, F), range(NUM_PLANES))
 
 
+class TestEvSpray(unittest.TestCase):
+    """EV-spray round-robin across (plane, spine)."""
+
+    def _flow(self):
+        return FlowKey("2001:db8:bbbb::2", "2001:db8:bbbb:f::2", 9999, 9999)
+
+    def test_default_fanout_is_num_spines(self):
+        from srv6_fabric.topo import NUM_SPINES
+        p = policy.EvSpray()
+        self.assertEqual(p.paths_per_plane, NUM_SPINES)
+
+    def test_rejects_out_of_range(self):
+        with self.assertRaises(ValueError):
+            policy.EvSpray(paths_per_plane=0)
+        from srv6_fabric.topo import NUM_SPINES
+        with self.assertRaises(ValueError):
+            policy.EvSpray(paths_per_plane=NUM_SPINES + 1)
+
+    def test_pick_ev_returns_valid_plane_and_spine(self):
+        from srv6_fabric.topo import NUM_SPINES
+        p = policy.EvSpray(paths_per_plane=4)
+        flow = self._flow()
+        for seq in range(200):
+            plane, spine = p.pick_ev(seq, flow)
+            self.assertIn(plane, range(NUM_PLANES))
+            self.assertIn(spine, range(NUM_SPINES))
+
+    def test_pick_ev_round_robin_full_cycle(self):
+        """One full cycle visits every EV exactly once (plane-major
+        check: planes rotate fastest)."""
+        p = policy.EvSpray(paths_per_plane=4)
+        flow = self._flow()
+        ev_count = NUM_PLANES * 4
+        seen = [p.pick_ev(seq, flow) for seq in range(ev_count)]
+        self.assertEqual(len(set(seen)), ev_count,
+                         "round-robin must visit every EV once per cycle")
+
+    def test_pick_ev_plane_rotates_every_packet(self):
+        # Successive packets must visit different planes (spine-major
+        # walk). This is the anti-clustering property.
+        p = policy.EvSpray(paths_per_plane=4)
+        flow = self._flow()
+        planes = [p.pick_ev(seq, flow)[0] for seq in range(NUM_PLANES * 2)]
+        # Every NUM_PLANES-window should contain all planes.
+        for start in range(0, len(planes), NUM_PLANES):
+            window = planes[start:start + NUM_PLANES]
+            self.assertEqual(set(window), set(range(NUM_PLANES)))
+
+    def test_pick_returns_plane_only(self):
+        """pick() is the backward-compat shim and must return an int."""
+        p = policy.EvSpray(paths_per_plane=4)
+        flow = self._flow()
+        v = p.pick(0, flow)
+        self.assertIsInstance(v, int)
+        self.assertIn(v, range(NUM_PLANES))
+
+    def test_deterministic_per_flow(self):
+        p1 = policy.EvSpray(paths_per_plane=4)
+        p2 = policy.EvSpray(paths_per_plane=4)
+        flow = self._flow()
+        for seq in range(50):
+            self.assertEqual(p1.pick_ev(seq, flow), p2.pick_ev(seq, flow))
+
+    def test_full_fanout_uses_all_spines(self):
+        from srv6_fabric.topo import NUM_SPINES
+        p = policy.EvSpray()  # default = NUM_SPINES
+        flow = self._flow()
+        ev_count = NUM_PLANES * NUM_SPINES
+        seen_spines = {p.pick_ev(seq, flow)[1] for seq in range(ev_count)}
+        self.assertEqual(seen_spines, set(range(NUM_SPINES)))
+
+    def test_n_less_than_max_uses_subset(self):
+        from srv6_fabric.topo import NUM_SPINES
+        if NUM_SPINES < 2:
+            self.skipTest("requires NUM_SPINES >= 2 for subset test")
+        p = policy.EvSpray(paths_per_plane=2)
+        flow = self._flow()
+        ev_count = NUM_PLANES * 2
+        seen_spines = {p.pick_ev(seq, flow)[1] for seq in range(ev_count)}
+        # Exactly 2 distinct spines, both in [0, NUM_SPINES).
+        self.assertEqual(len(seen_spines), 2)
+        for s in seen_spines:
+            self.assertIn(s, range(NUM_SPINES))
+
+
+class TestEvSprayFromSpec(unittest.TestCase):
+    """policy_from_spec must accept the ev_spray forms."""
+
+    def test_bare_string(self):
+        p = policy.policy_from_spec("ev_spray")
+        self.assertIsInstance(p, policy.EvSpray)
+        from srv6_fabric.topo import NUM_SPINES
+        self.assertEqual(p.paths_per_plane, NUM_SPINES)
+
+    def test_dict_with_n(self):
+        p = policy.policy_from_spec({"ev_spray": 2})
+        self.assertIsInstance(p, policy.EvSpray)
+        self.assertEqual(p.paths_per_plane, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
