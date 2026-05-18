@@ -132,6 +132,40 @@ the `srv6_fabric.topo` ↔ `spray` reference-pairs map in sync.
    `seg6local End.DT6` rules are *decap* policies, intentionally not
    touched by `routes` apply/delete (they're installed by the
    generator).
+10. **Spine entropy via SID rotation, never kernel ECMP.** When EV-
+    spray varies the spine per packet, the runner builds a new outer
+    DA in scapy (`usid_outer_dst(tenant, plane, spine, dst_leaf)`)
+    and sends through the same plane-bound raw socket. Do NOT add
+    multipath/ECMP host routes per spine and rely on the kernel
+    hashing flows across them — that defeats per-packet EV identity
+    (the receiver-side health table needs every packet's EV to be
+    known to the sender, not chosen randomly by the kernel) and
+    would resurrect the same anycast/ECMP ambiguity that invariant 8
+    exists to prevent. Per-EV state attribution (planned for Phase
+    1b step 3) depends on the sender owning the spine choice.
+
+## Phase status (where the codebase is right now)
+
+- **Phase 1a (plane-aware MRC):** done, validated in lab. Plane-level
+  loss detection via receiver MRC agent; sender demotes lossy planes
+  in `health_aware_mrc` policy.
+- **Phase 1b step 1 (EV-spray data-path):** done. `EvSpray` policy
+  varies BOTH plane and spine per packet via per-packet outer-DA
+  rotation. Reports include `per_ev_sent` keyed `"P<p>:S<s>"`. No
+  health awareness — every EV is always active. Scenarios:
+  `green-ev-spray.yaml` (full fan-out) and `green-ev-spray-n2.yaml`
+  (narrow, easier to eyeball on tcpdump).
+- **Phase 1b step 2 (probes on scapy raw-socket):** not started.
+  Today's MRC probes use a UDP socket + per-plane `encap.red` route,
+  which only has plane granularity (4 routes), not EV granularity
+  (4 * NUM_SPINES routes). Step 2 moves the probe TX path to scapy
+  raw-socket using the same `usid_outer_dst()` helper as the data
+  path. Prerequisite for step 3.
+- **Phase 1b step 3 (per-EV health):** not started. New policy that
+  extends `EvSpray` with an "active EV mask" read from a per-EV
+  health table (analogous to `EVStateTable` for planes). On loss
+  detection at an EV granularity, the sender skips that EV on its
+  round-robin turn.
 
 ## Naming conventions
 
