@@ -47,8 +47,8 @@ The lab demonstrates several patterns that recur in hyperscale GPU fabrics:
 | Leaf locator | `fc00:000<P>:2<L>::/48` | p2-leaf10 → `fc00:0002:2a::/48` |
 | Leaf uA → spine | `fc00:000<P>:f00<S>::/48` | p2 leaf, toward spine03 → `fc00:0002:f003::/48` |
 | Spine uA → leaf | `fc00:000<P>:e00<L>::/48` | p2 spine, toward leaf10 → `fc00:0002:e00a::/48` |
-| Green tenant uDT6 | `fc00:000<P>:d000::/48` | per-plane on every leaf, decap into `Vrf-green` |
-| Yellow tenant uDT6 | `fc00:000<P>:d001::/48` | per-plane on every yellow host, `End.DT6 table 0` |
+| Green tenant uDT6 | `fc00:000<P>:d000::/48` | per-plane on every leaf, decap into `sonic Vrf-green` |
+| Yellow tenant uDT6 | `fc00:000<P>:d001::/48` | per-plane on every yellow host, `linux End.DT6 table 0` |
 | Fabric P2P | `2001:db8:fab:<S*16+L>::/127` | reused per plane (planes are L2-isolated) |
 | Green tenant address | `2001:db8:bbbb:<NN>::2` | **anycast** on all 4 host NICs (`nodad`); identical leaf-side `::1/64` on every plane's Ethernet32 in `Vrf-green` |
 | Yellow tenant address | `2001:db8:cccc:<NN>::2` | **anycast** on all 4 host NICs + `lo` (`nodad`); identical leaf-side `::1/64` on every plane's Ethernet36 (Phase 1a: mirrors green's plan with `bbbb`→`cccc`) |
@@ -71,33 +71,14 @@ then decap into green at the next hop" encodes as a single uSID-compressed
 IPv6 destination:
 
 ```
-fc00:0002:2a:f003:d000::
-└──┬───┘ └┬┘ └┬─┘ └┬─┘
-   │      │   │    └─ d000  : tenant-ID green → Vrf-green at egress leaf
-   │      │   └────── f003  : leaf uA toward spine 03 (in plane 2)
-   │      └────────── 2a    : leaf locator (leaf 0a = leaf 10)
-   └───────────────── 0002  : plane 2 block
+fc00:0002:f003:e00a:d000::
+└──┬───┘ └┬──┘ └┬─┘ └┬─┘
+   │      │     │    └─ d000  : tenant-ID green → Vrf-green at egress leaf
+   │      │     └────── e00a  : spine03 uA toward leaf10 (in plane 2)
+   │      └──────────── f003  : leafXY uA toward spine02 
+   └─────────────────── 0002  : plane 2 block
 ```
 
-Every label is unambiguous in isolation.
-
-## Topology counts
-
-| | Count |
-|---|---|
-| Planes | 4 |
-| Spines per plane | 8 |
-| Leaves per plane | 16 |
-| Hosts per color | 16 |
-| Total SONiC nodes | 96 |
-| Total host nodes | 32 |
-| Fabric links | 4 × 8 × 16 = 512 |
-| Host links | 4 × 16 × 2 = 128 |
-| **Total veth pairs** | **640** |
-
-Each `docker-sonic-vs` container needs roughly 1–1.5 GB resident memory and a
-portion of one CPU. Plan on **~150 GB RAM** and a multi-socket host (or scale
-the lab down — see "Reducing scale" below).
 
 ## Files
 
@@ -114,142 +95,6 @@ the lab down — see "Reducing scale" below).
 | `host-image/Dockerfile` | Builds `alpine-srv6-scapy:1.0` (host image: alpine + scapy + pip-installed `srv6_mrc`) |
 | `spray-protocol.md` | Tool writeup: SID lists the sprayer builds, run instructions, manual tcpdump checkpoints |
 
-## Deployment
-
-### 1. Pull / build required images
-
-```bash
-docker pull docker-sonic-vs:latest                # SONiC VS (build or pull)
-docker pull iejalapeno/alpine-srv6:1.0            # base host image
-make image                                        # build alpine-srv6-scapy:1.0
-                                                  # (equivalent to: docker build
-                                                  #  -f host-image/Dockerfile
-                                                  #  -t alpine-srv6-scapy:1.0 .)
-                                                  # One image serves every topology;
-                                                  # topo.yaml is bind-mounted at runtime.
-```
-
-### 2. Generate configs — already committed under `topologies/4p-8x16/config/`; re-run only if you change `topo.yaml`
-
-```bash
-make regen
-# or directly:
-python3 generators/fabric.py --topo topologies/4p-8x16/topo.yaml
-```
-
-Writes the topology and 96 sets of node configs into
-`topologies/4p-8x16/`.
-
-### 3. Bring up the lab
-
-```bash
-make deploy
-# or directly:
-sudo containerlab deploy -t topologies/4p-8x16/topology.clab.yaml
-```
-
-This stage:
-
-- Boots 96 SONiC + 32 Alpine containers in dependency order
-- Creates 640 veth pairs
-- Applies the host `exec:` blocks (host IP addresses, plane routes, yellow
-  `seg6local`)
-
-Expect 5–15 minutes on a well-provisioned host.
-
-### 4. Push SONiC configs
-
-```bash
-make config
-# or directly:
-scripts/config.sh all
-```
-
-This iterates every SONiC node and:
-
-1. Creates `Loopback0` if missing
-2. Copies `config_db.json` to `/etc/sonic/` and runs `sonic-cfggen --write-to-db`
-3. Restarts SONiC services (`supervisorctl restart all`)
-4. Sets up `vrfdefault`, `sr0`, IPv6 forwarding sysctls
-5. Brings every port up (`config interface startup`)
-6. Strips any default BGP instance (this lab has no BGP)
-7. Loads `frr.conf` via `vtysh -f`
-
-Other targets:
-
-```bash
-scripts/config.sh gen           # regenerate (same as `make regen`)
-scripts/config.sh leaf          # leaf tier only
-scripts/config.sh spine         # spine tier only
-scripts/config.sh p2-leaf0a     # one node
-```
-
-### 5. Verify
-
-```bash
-# Pick any leaf
-docker exec p2-leaf10 vtysh -c 'show segment-routing srv6 sid'
-docker exec p2-leaf10 vtysh -c 'show ipv6 route summary'
-
-# A green host: anycast tenant addr on all 4 NICs (same address each time)
-docker exec green-host00 ip -6 addr show | grep bbbb
-
-# A green host's plane-aggregate routes (one per NIC, anycast gateway)
-docker exec green-host00 ip -6 route | grep fc00
-
-# A yellow host: anycast cccc: address on eth1..eth4 + lo (Phase 1a)
-docker exec yellow-host00 ip -6 addr show | grep cccc
-
-# A yellow host should have 4 seg6local entries (one per plane NIC)
-docker exec yellow-host00 ip -6 route | grep seg6local
-```
-
-To see SRv6 packet spraying across all 4 planes, see [`spray-protocol.md`](./spray-protocol.md). Two terminals:
-
-```bash
-# Receiver
-docker exec -it green-host15 spray --role recv
-
-# Sender (round-robin spray across 4 planes to the same anycast dst)
-docker exec -it green-host00 spray --role send \
-    --dst-id 15 --rate 1000pps --duration 5s
-```
-
-Spot-check any hop by running `tcpdump -nn -i <Ethernet…> 'ip6 proto 41'`
-inside the relevant SONiC container.
-
-### Tear down
-
-```bash
-make teardown
-# or directly:
-sudo containerlab destroy -t topologies/4p-8x16/topology.clab.yaml -c
-```
-
-## Routing model: no BGP, no IGP
-
-Every node's `frr.conf` carries:
-
-- A single SRv6 locator (`MAIN`) with `behavior usid`
-- Static uA SIDs for each connected neighbor (in `f00<S>` / `e00<L>` form)
-- Static uDT6 SID `d000` on leaves → `Vrf-green` (green decap)
-- Static IPv6 routes for every other locator in the same plane, via the
-  appropriate connected `/127`. Leaves install 8-way ECMP per remote leaf
-  (one route via each spine); spines install one route per leaf.
-
-This is the **minimum data plane** an SRv6 controller needs:
-
-- Connected reachability so the outer-IPv6 destination of any encapsulated
-  packet has a FIB entry.
-- The full uA matrix so packets can hop spine ↔ leaf via uSID.
-- `d000` on every leaf so any path landing there can decap into `Vrf-green`.
-
-The controller layers on top:
-
-- Tenant-prefix routes inside `Vrf-green` (host /64 reachability)
-- SR policies / per-flow steering (e.g. plane affinity, congestion-aware
-  scheduling)
-- Yellow tenant routes (host-encap targets, plane selection)
 
 ## Tenant models in this lab
 

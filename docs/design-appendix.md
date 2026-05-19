@@ -5,11 +5,6 @@ options we considered, and *why* we chose what we chose. Read this if you want
 to understand the rationale, want to fork the lab and make different choices,
 or are evaluating similar trade-offs in a real deployment.
 
-The reference shape is the existing `01-sonic-vs/` lab (3×3 Clos, single
-plane, BGP underlay, three tenancy models). This lab keeps the SRv6 substrate,
-removes BGP, scales to 4 planes of 8×16, and drops the blue (network-based)
-tenant.
-
 ---
 
 ## 1. uA SID function-bit encoding
@@ -182,49 +177,8 @@ The price (4 seg6local entries per yellow host) is small and bounded.
 
 ---
 
-## 4. Removing BGP entirely
 
-The original 8×16 lab ran eBGP per leaf to each spine, with all forwarding
-actually done by static SRv6 SIDs — BGP existed mainly to advertise loopbacks
-and locators. Once a controller is in charge of installing all transit FIB,
-BGP is dead weight.
-
-Without BGP we still need *enough* FIB on each box for the outer-IPv6
-destination of any SR-encapsulated packet to forward:
-
-- **Spines:** need a route to every leaf locator in their plane. We install
-  one static route per leaf via the connected `/127`.
-- **Leaves:** need routes to every spine locator (single nexthop, the
-  connected `/127`) *and* every other leaf locator in the plane. The latter
-  go via all 8 spines as ECMP, since any spine can transit.
-
-That's the full data-plane substrate. uA SIDs handle hop-by-hop steering on
-top of that; uDT SIDs handle decap. The controller is responsible for
-*tenant prefix* routes (host /64s in `Vrf-green`, host-side encap targets,
-SR policies, plane affinity, etc.) — the static config is deliberately
-minimal.
-
-### What this gives up
-
-- **No automatic loopback redistribution.** Add a node, you add static
-  routes everywhere that needs to reach it. Fine for a generated lab; in
-  production you'd want IS-IS-SRv6 or the controller itself programming
-  these.
-- **No fast convergence on link failure.** Static routes don't react. In
-  production you'd lean on BFD-driven static, or use IS-IS for underlay
-  reachability and keep the controller for SR policy.
-
-### Why it's still useful
-
-The lab's goal is to demonstrate the *SRv6 substrate* a controller would
-build on. By removing BGP we make it explicit which entries are "data
-plane" (in `frr.conf`) versus "controller-installed" (programmed at
-runtime). It also means the lab boots without any IGP convergence wait —
-once `vtysh -f` returns, forwarding is live.
-
----
-
-## 5. Naming: `p<P>-{spine,leaf}<NN>` vs alternatives
+## 4. Naming: `p<P>-{spine,leaf}<NN>` vs alternatives
 
 We picked plane-as-prefix (`p2-leaf0a`) over plane-in-middle
 (`leaf-p2-0a`) for one simple reason: it sorts well. `ls config/` groups all
@@ -237,7 +191,7 @@ its NICs.
 
 ---
 
-## 6. Fabric P2P address reuse
+## 5. Fabric P2P address reuse
 
 `2001:db8:fab:<S*16+L>::/127` is identical in every plane. Planes are
 L2-isolated (different containerlab veth pairs, different physical ports
@@ -251,30 +205,7 @@ operational benefit. We reuse.
 
 ---
 
-## 7. Host port assignment on leaves
-
-Each leaf has 32 dataplane ports (`Ethernet0..Ethernet124`, step 4). 8 are
-used for spine uplinks (Ethernet0–28). That leaves 24 free for hosts. We
-use only two:
-
-- `Ethernet32` → `Vrf-green` → green-host on this leaf number
-- `Ethernet36` → default VRF → yellow-host on this leaf number
-
-**Why so few?** Because each color has only 16 hosts, one per leaf number,
-and each host already connects to all 4 planes via its `eth1..eth4`. So per
-leaf, in each plane, you have exactly one green host and one yellow host
-attached. Adding more hosts per leaf would mean adding hosts of more colors
-or oversubscribing — neither aligns with the "one host per leaf number,
-multi-plane" model.
-
-If you want a denser host count later, the obvious move is to add a third
-color (e.g. blue) and bind it to `Ethernet40` in another VRF (or default).
-The generator's `host_uplink_prefix()` and `write_topology_yaml()` hooks
-make this a small change.
-
----
-
-## 8. Scaling beyond one cluster
+## 6. Scaling beyond one cluster
 
 The `fc00:0000::/30` cluster aggregate sits inside `fc00::/16`. Multi-cluster
 WAN deployment would look like:
@@ -295,117 +226,3 @@ This lab models one cluster. The generator's plane-block prefix is
 parameterized in `plane_block_prefix(plane)` — adding a `CLUSTER_ID` offset
 is a one-line change if you want to spin up a second lab cluster on the same
 host without address overlap.
-
----
-
-## 9. What we'd reconsider in production
-
-A list, not exhaustive:
-
-- **IGP underlay.** IS-IS with SRv6 extensions (RFC 9352) for loopback /
-  locator reachability and fast convergence on link failure. Keeps the
-  static-SID/SR-policy split, drops the static IPv6 routes for transit.
-- **Per-VRF BGP for tenant prefix learning** (e.g. EVPN/MP-BGP in
-  Vrf-green) so that tenant prefixes don't need a controller round-trip
-  for every host add. The controller still owns SR policies; BGP owns
-  tenant reachability.
-- **Hierarchical SIDs / binding SIDs** for path compression once the SID
-  list grows. uSID compression already buys a lot, but at WAN scale you'll
-  want explicit binding SIDs at cluster boundaries.
-- **Telemetry and verification.** No mention here. In production,
-  per-SID hit counters (FRR/Linux nftables-based) and SR-policy
-  observability are essentials.
-- **Failure modeling for plane outages.** The current lab has no mechanism
-  to advertise/withdraw a plane on host-side. A real deployment would
-  surface plane state to hosts (via BFD-on-uplink, or controller
-  signaling) so green/yellow hosts can stop sending into a dead plane.
-
----
-
-## 10. Plane-independent inner addressing (MRC/SRv6 alignment)
-
-The original lab put plane identity in **both** the outer SID list and the
-inner tenant address (`bbbb:<P><NN>::2`, `cccc:<P><NN>::2`). That made each
-plane's flow look like a different /64 destination on the receiver — fine for
-deterministic single-plane delivery, **fatal for packet spraying**. A sprayed flow needs to
-land in one socket on one inner address regardless of which plane carried any
-given packet; otherwise the receiver's reorder buffer can't reconstruct the
-flow.
-
-We aligned with that model by collapsing the inner/tenant address space:
-
-- **Green** uses one anycast address per host, configured (with `nodad`) on
-  all four NICs: `2001:db8:bbbb:<NN>::2`. The leaf-side gateway
-  `2001:db8:bbbb:<NN>::1/64` is identical on every plane's leaf Ethernet32
-  in `Vrf-green` — connected /64 lookup after uDT6 decap delivers regardless
-  of which plane the SR-encap arrived on.
-- **Yellow** (Phase 1a) now mirrors green's anycast plan with
-  `bbbb`→`cccc`: identical `2001:db8:cccc:<NN>::2` configured `nodad` on
-  all four NICs *and* on `lo`. The leaf-side gateway
-  `2001:db8:cccc:<NN>::1/64` is identical on every plane's leaf
-  Ethernet36 (default VRF). The four per-plane `seg6local End.DT6`
-  entries are unchanged; they all decap into table 0, and the table-0
-  lookup hits the anycast on lo regardless of which NIC fired.
-
-  Pre-Phase-1a, yellow used a separate per-plane underlay
-  (`2001:db8:cccc:<P><NN>::2/64` on eth) and a `/128` loopback in a
-  parallel block (`2001:db8:cccd:<NN>::1/lo`). Both are retired: the
-  per-plane underlay was a workload-visible "footgun" (see
-  architecture.md §2.3) and the `cccd:` parallel block was an
-  unnecessary special case.
-
-The asymmetry between the two tenants is preserved exactly: green
-decaps at the leaf (so the plane-independence has to live in the leaf's
-connected gateway), yellow decaps at the host (so the plane-independence
-lives on the host's anycast eth1..eth4 + lo). The SID layer didn't
-change at all — `d000`, `d001`, `f00<S>`, `e00<L>` keep their meanings,
-and the per-plane `/32` blocks remain the authoritative carrier of
-plane identity.
-
-### Historical: loopback prefix choice (`cccd:` vs alternatives) — superseded by Phase 1a
-
-> **Phase 1a note:** This section is retained for historical context.
-> Yellow no longer uses a parallel `cccd:` block; it shares green's
-> anycast plan (`cccc:<NN>::2` on eth1..eth4 + lo). The analysis below
-> describes the *previous* design that placed the inner DA on a
-> dedicated `/128` on `lo` only.
-
-Three placements were considered for yellow's loopback:
-
-1. **`cccc:1<NN>::1/128` (in-block, reserved sub-block).** Reuses the existing
-   tenant prefix; risks collision if planes ever exceed 4 (today `<P>` is a
-   hex digit 0–3, so `1xxx` happens to be free).
-2. **`cccc:ff<NN>::1/128` (in-block, "no-plane" mnemonic).** Same block,
-   uses `ff` as a sentinel meaning "loopback". Cute; same long-term
-   collision class as (1).
-3. **`cccd:<NN>::1/128` (parallel block, +1 hextet).** Crystal separation
-   from the per-plane NIC space; impossible to confuse with a plane address;
-   reserves a parallel `bbbc:` slot if a green loopback is ever wanted.
-
-We originally picked (3); Phase 1a retired both the parallel block and
-the per-plane NIC underlay by collapsing yellow onto green's anycast
-plan, which removes the entire reason these alternatives existed.
-
-### Plane selection on the sender
-
-With the inner dst no longer encoding plane, the sender can no longer pick a
-plane just by choosing the destination address. Three substitutes are
-available:
-
-- **`-I ethN` on the host's connection** (what `routes.py` installs): SRv6
-  host route is installed once per `(dst, plane)` with a per-plane metric,
-  all sharing the same `/128` dst; the application forces NIC choice.
-  Simple, deterministic, models a controller that pins a flow to a NIC.
-  Note: this is one-way (sender-side) plane affinity only — replies do not
-  honor the incoming NIC unless additional policy routing is configured.
-- **Per-flow ECMP across the 4 NIC routes**: leave metrics equal, let Linux
-  hash. Models the spray case but isn't useful for a per-plane *test* runner.
-- **Custom send path** (the MRC paper's choice): user-space NIC selection per
-  packet. `srv6_mrc/cli/spray.py` (CLI: `spray`) implements this — raw socket per plane bound via
-  `SO_BINDTODEVICE`, builds its own outer IPv6 with the uSID list. Bypasses
-  the kernel routes entirely for sending; the receiver still benefits from
-  them for any non-spray traffic.
-
-`routes.py` uses the first model; `spray.py` uses the third. The second is
-a one-line change away (`metric` → all equal) if a kernel ECMP spray demo
-is ever needed.
