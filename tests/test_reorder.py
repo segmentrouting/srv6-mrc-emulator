@@ -1,7 +1,7 @@
 import unittest
 
-from srv6_fabric.reorder import FlowStats, ReorderTracker
-from srv6_fabric.topo import FlowKey
+from srv6_mrc.reorder import FlowStats, ReorderTracker
+from srv6_mrc.topo import FlowKey
 
 
 F = FlowKey("src", "dst", 9000, 9999)

@@ -1,11 +1,11 @@
-# Makefile for srv6_fabric
+# Makefile for srv6_mrc
 #
 # Convention: every target operates on a single TOPO (default 4p-8x16).
 # Override with `make TOPO=<name> <target>`; the topology directory is
 # expected at topologies/<TOPO>/ with a topo.yaml in it.
 #
 # Phases (run in order on first deploy):
-#   make image      build the host container image (alpine + scapy + srv6_fabric)
+#   make image      build the host container image (alpine + scapy + srv6_mrc)
 #   make regen      regenerate topology.clab.yaml + SONiC configs from topo.yaml
 #   make deploy     containerlab deploy
 #   make config     push SONiC + FRR configs into running containers
@@ -48,7 +48,7 @@ test: ## run the full unit test suite
 # --- image -----------------------------------------------------------------
 
 .PHONY: image
-image: ## build the host container image with srv6_fabric baked in
+image: ## build the host container image with srv6_mrc baked in
 	docker build -f host-image/Dockerfile -t $(IMAGE_TAG) .
 
 # --- generation ------------------------------------------------------------
@@ -81,7 +81,7 @@ ROUTES ?= full-mesh
 
 .PHONY: host-routes
 host-routes: ## install host kernel routes (override ROUTES=<name>, default full-mesh)
-	SRV6_TOPO=$(TOPO_YAML) $(PYTHON) -m srv6_fabric.cli.routes apply -f $(TOPO_DIR)/routes/$(ROUTES).yaml
+	SRV6_TOPO=$(TOPO_YAML) $(PYTHON) -m srv6_mrc.cli.routes apply -f $(TOPO_DIR)/routes/$(ROUTES).yaml
 
 # --- mrc scenarios ---------------------------------------------------------
 
@@ -89,7 +89,7 @@ SCEN ?= green-mrc-baseline
 
 .PHONY: scenario
 scenario: ## run an MRC scenario (override SCEN=<name>, default green-mrc-baseline)
-	$(PYTHON) -m srv6_fabric.mrc.run $(TOPO_DIR)/scenarios/$(SCEN).yaml --verbose
+	$(PYTHON) -m srv6_mrc.mrc.run $(TOPO_DIR)/scenarios/$(SCEN).yaml --verbose
 
 # --- housekeeping ----------------------------------------------------------
 

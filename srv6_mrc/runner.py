@@ -1,8 +1,8 @@
 """Send/recv library — the engine behind the `spray` CLI and the orchestrator.
 
-This module is the send/recv core. The CLI (`srv6_fabric/cli/spray.py`)
+This module is the send/recv core. The CLI (`srv6_mrc/cli/spray.py`)
 is a thin argparse shim around it, and the MRC orchestrator
-(`srv6_fabric/mrc/run.py`) drives it via `docker exec`.
+(`srv6_mrc/mrc/run.py`) drives it via `docker exec`.
 
 Layering rules:
   - Top-level imports are stdlib-only. Anything that needs scapy or
@@ -17,9 +17,9 @@ Layering rules:
     `path` carries the per-packet spine index (== MRC `path_id`) the
     sender chose for this packet's plane; non-EV-aware policies write
     path=0. The outer SRv6 packet is built via
-    `srv6_fabric.encap.build_outer_packet` on a plane-bound raw
+    `srv6_mrc.encap.build_outer_packet` on a plane-bound raw
     socket (`SO_BINDTODEVICE` per Invariant 8). Don't change this
-    without coordinating with `srv6_fabric/mrc/transport.py` — MRC
+    without coordinating with `srv6_mrc/mrc/transport.py` — MRC
     probes use the same encap helper.
 
 Public API:
@@ -158,7 +158,7 @@ def parse_payload(raw: bytes) -> Optional[tuple[int, int, int]]:
 def _open_send_socket(iface: str) -> socket.socket:
     """Back-compat shim for callers in this module.
 
-    The real implementation moved to `srv6_fabric.encap.open_raw_send_socket`
+    The real implementation moved to `srv6_mrc.encap.open_raw_send_socket`
     so the MRC sender agent can share the same socket setup pattern.
     Kept here under the old name to avoid touching every internal call
     site at once.
@@ -172,11 +172,11 @@ def _build_packet_bytes(src_underlay: str, dst_outer: str,
                         seq: int, plane: int, path: int) -> bytes:
     """Build full outer/inner/UDP bytes for one spray DATA packet.
 
-    Thin wrapper around `srv6_fabric.encap.build_outer_packet` that
+    Thin wrapper around `srv6_mrc.encap.build_outer_packet` that
     plugs the spray data payload into the shared encap builder. The
     MRC probe path uses the same builder with different ports and a
     PROBE / PROBE_REPLY / LOSS_REPORT payload — see
-    `srv6_fabric.mrc.agent`.
+    `srv6_mrc.mrc.agent`.
     """
     from .encap import build_outer_packet
     return build_outer_packet(

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """spray — userspace SRv6/uSID packet sprayer + receiver (CLI entry point).
 
-Thin wrapper around `srv6_fabric.runner`. The send/recv loops, payload
+Thin wrapper around `srv6_mrc.runner`. The send/recv loops, payload
 codec, address builders, and per-flow stats live in the library; this
 module is just the argparse surface. Installed as `/usr/local/bin/spray`
 in the lab host image via pyproject.toml's `[project.scripts]`.
@@ -44,13 +44,13 @@ import re
 import sys
 from dataclasses import asdict, is_dataclass
 
-from srv6_fabric.runner import (
+from srv6_mrc.runner import (
     FlowEndpoint, run_receiver, run_sender, detect_self_id,
 )
-from srv6_fabric.policy import (
+from srv6_mrc.policy import (
     policy_from_spec, HealthAwareMrc, HealthAwareMrcFactory,
 )
-from srv6_fabric.topo import (
+from srv6_mrc.topo import (
     NUM_PLANES, NUM_SPINES, PLANE_NICS, SPRAY_PORT,
     host_underlay_addr, inner_addr, usid_outer_dst, spine_for,
 )
@@ -118,7 +118,7 @@ def parse_policy(s: str, *, tenant: str, ev_config=None,
     if isinstance(policy, HealthAwareMrcFactory):
         # Lazy import: keeps stdlib-only imports at top of file and
         # mirrors the laziness around scapy elsewhere in the runner.
-        from srv6_fabric.mrc.ev_state import EVStateTable
+        from srv6_mrc.mrc.ev_state import EVStateTable
         # One tenant per sender process today. If we ever multiplex
         # tenants in a single sender, this becomes a per-host singleton.
         table = EVStateTable(
@@ -162,7 +162,7 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
     agent_cfg = None
     ev_cfg = None
     try:
-        from srv6_fabric.mrc.agent import load_configs_from_env
+        from srv6_mrc.mrc.agent import load_configs_from_env
         agent_cfg, ev_cfg = load_configs_from_env()
     except ValueError as e:
         print(f"spray.py: {e}", file=sys.stderr)
@@ -201,7 +201,7 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
     mrc_agent = None
     progress_cb = None
     if isinstance(policy, HealthAwareMrc):
-        from srv6_fabric.mrc.agent import SenderMrcAgent
+        from srv6_mrc.mrc.agent import SenderMrcAgent
         mrc_agent = SenderMrcAgent(
             tenant=policy.tenant,
             src_id=my_id,
@@ -284,10 +284,10 @@ def cmd_recv(args, tenant: str, my_id: int) -> int:
     mrc_agent = None
     on_packet = None
     if args.mrc:
-        from srv6_fabric.mrc.agent import (
+        from srv6_mrc.mrc.agent import (
             ReceiverMrcAgent, load_configs_from_env,
         )
-        from srv6_fabric.topo import (
+        from srv6_mrc.topo import (
             host_id_from_inner_addr, tenant_id as topo_tenant_id,
         )
         # Pull tunables from SRV6_MRC_CONFIG_JSON; receiver only uses

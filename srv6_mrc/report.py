@@ -85,7 +85,7 @@ class FlowRow:
     # health_aware_mrc; None otherwise so the JSON shape stays compact
     # on non-MRC flows. Shape: {"ev_state": <EVStateTable.snapshot()>,
     # "loss_fusion": <LossFusionStats fields>}. See
-    # srv6_fabric.cli.spray._loss_fusion_stats_to_dict for the producer.
+    # srv6_mrc.cli.spray._loss_fusion_stats_to_dict for the producer.
     mrc: dict[str, Any] | None = None
 
     def loss_pct(self) -> float | None:

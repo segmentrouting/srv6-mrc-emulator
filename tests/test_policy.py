@@ -1,8 +1,8 @@
 import unittest
 from collections import Counter
 
-from srv6_fabric import policy
-from srv6_fabric.topo import FlowKey, NUM_PLANES, NUM_SPINES
+from srv6_mrc import policy
+from srv6_mrc.topo import FlowKey, NUM_PLANES, NUM_SPINES
 
 
 F = FlowKey("2001:db8:bbbb:00::2", "2001:db8:bbbb:0f::2", 9999, 9999)
@@ -125,7 +125,7 @@ class TestHealthAwareMrc(unittest.TestCase):
     policy faithfully follows the table.
     """
     def _table(self, **cfg_overrides):
-        from srv6_fabric.mrc.ev_state import EVStateTable, EVStateConfig
+        from srv6_mrc.mrc.ev_state import EVStateTable, EVStateConfig
         cfg = EVStateConfig(**cfg_overrides) if cfg_overrides else None
         return EVStateTable(
             tenants=("green",), num_planes=NUM_PLANES,
@@ -154,7 +154,7 @@ class TestHealthAwareMrc(unittest.TestCase):
         for path in range(NUM_SPINES):
             for _ in range(3):
                 table.record_probe_result("green", 1, path, success=False)
-        from srv6_fabric.mrc.ev_state import EVState
+        from srv6_mrc.mrc.ev_state import EVState
         for path in range(NUM_SPINES):
             self.assertEqual(
                 table.state("green", 1, path), EVState.ASSUMED_BAD
@@ -200,7 +200,7 @@ class TestHealthAwareMrc(unittest.TestCase):
         # The policy assumes NUM_PLANES (the topology constant) matches
         # the table. A mismatch is a configuration bug, not a runtime
         # one; fail at construction.
-        from srv6_fabric.mrc.ev_state import EVStateTable
+        from srv6_mrc.mrc.ev_state import EVStateTable
         bad = EVStateTable(
             tenants=("green",), num_planes=NUM_PLANES + 1,
             num_paths=NUM_SPINES,
@@ -223,19 +223,19 @@ class TestEvSpray(unittest.TestCase):
         return FlowKey("2001:db8:bbbb::2", "2001:db8:bbbb:f::2", 9999, 9999)
 
     def test_default_fanout_is_num_spines(self):
-        from srv6_fabric.topo import NUM_SPINES
+        from srv6_mrc.topo import NUM_SPINES
         p = policy.EvSpray()
         self.assertEqual(p.paths_per_plane, NUM_SPINES)
 
     def test_rejects_out_of_range(self):
         with self.assertRaises(ValueError):
             policy.EvSpray(paths_per_plane=0)
-        from srv6_fabric.topo import NUM_SPINES
+        from srv6_mrc.topo import NUM_SPINES
         with self.assertRaises(ValueError):
             policy.EvSpray(paths_per_plane=NUM_SPINES + 1)
 
     def test_pick_ev_returns_valid_plane_and_spine(self):
-        from srv6_fabric.topo import NUM_SPINES
+        from srv6_mrc.topo import NUM_SPINES
         p = policy.EvSpray(paths_per_plane=4)
         flow = self._flow()
         for seq in range(200):
@@ -280,7 +280,7 @@ class TestEvSpray(unittest.TestCase):
             self.assertEqual(p1.pick_ev(seq, flow), p2.pick_ev(seq, flow))
 
     def test_full_fanout_uses_all_spines(self):
-        from srv6_fabric.topo import NUM_SPINES
+        from srv6_mrc.topo import NUM_SPINES
         p = policy.EvSpray()  # default = NUM_SPINES
         flow = self._flow()
         ev_count = NUM_PLANES * NUM_SPINES
@@ -288,7 +288,7 @@ class TestEvSpray(unittest.TestCase):
         self.assertEqual(seen_spines, set(range(NUM_SPINES)))
 
     def test_n_less_than_max_uses_subset(self):
-        from srv6_fabric.topo import NUM_SPINES
+        from srv6_mrc.topo import NUM_SPINES
         if NUM_SPINES < 2:
             self.skipTest("requires NUM_SPINES >= 2 for subset test")
         p = policy.EvSpray(paths_per_plane=2)
@@ -307,7 +307,7 @@ class TestEvSprayFromSpec(unittest.TestCase):
     def test_bare_string(self):
         p = policy.policy_from_spec("ev_spray")
         self.assertIsInstance(p, policy.EvSpray)
-        from srv6_fabric.topo import NUM_SPINES
+        from srv6_mrc.topo import NUM_SPINES
         self.assertEqual(p.paths_per_plane, NUM_SPINES)
 
     def test_dict_with_n(self):

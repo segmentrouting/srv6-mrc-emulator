@@ -34,12 +34,12 @@ import collections
 import time
 import unittest
 
-from srv6_fabric.mrc.agent import (
+from srv6_mrc.mrc.agent import (
     ReceiverMrcAgent, SenderMrcAgent,
 )
-from srv6_fabric.mrc.ev_state import EVStateConfig, EVStateTable
-from srv6_fabric.policy import HealthAwareMrc
-from srv6_fabric.topo import FlowKey, NUM_PLANES, NUM_SPINES, tenant_id as topo_tenant_id
+from srv6_mrc.mrc.ev_state import EVStateConfig, EVStateTable
+from srv6_mrc.policy import HealthAwareMrc
+from srv6_mrc.topo import FlowKey, NUM_PLANES, NUM_SPINES, tenant_id as topo_tenant_id
 
 # Reuse the loopback plumbing the I/O tests already built. Importing
 # from a sibling test module is unusual; the alternative is duplicating

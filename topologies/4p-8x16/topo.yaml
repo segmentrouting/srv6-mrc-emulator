@@ -1,7 +1,7 @@
 # topo.yaml — declarative parameters for this topology.
 #
 # This is the single source of truth. The generator reads it to emit
-# topology.clab.yaml + config/. The runtime srv6_fabric package reads
+# topology.clab.yaml + config/. The runtime srv6_mrc package reads
 # it (via SRV6_TOPO env var, defaulting to this file) to learn the
 # fabric dimensions.
 #
@@ -17,7 +17,7 @@ spines_per_plane: 8
 leaves_per_plane: 16
 
 # Tenants. The address blocks and SID function bits live in
-# srv6_fabric.topo for now (one set of constants for all current
+# srv6_mrc.topo for now (one set of constants for all current
 # tenants); listed here only for documentation. Future multi-tenant
 # topologies will move these into a tenants: dict consumed by the
 # generator and runtime.

@@ -16,7 +16,7 @@ docker exec -it yellow-host15 spray --role recv
 docker exec -it yellow-host00 spray --role send --dst-id 15 --rate 1000pps --duration 5s
 ```
 
-The `spray` CLI is pip-installed inside the host image (see `host-image/Dockerfile`); it lives at `/usr/local/bin/spray`. The image also bakes the topology descriptor at `/etc/srv6_fabric/topo.yaml` and exports `SRV6_TOPO` pointing at it. Rebuild the image when the package or topo.yaml changes; no bind mounts are required at runtime.
+The `spray` CLI is pip-installed inside the host image (see `host-image/Dockerfile`); it lives at `/usr/local/bin/spray`. The image also bakes the topology descriptor at `/etc/srv6_mrc/topo.yaml` and exports `SRV6_TOPO` pointing at it. Rebuild the image when the package or topo.yaml changes; no bind mounts are required at runtime.
 
 ---
 
@@ -186,7 +186,7 @@ The receiver itself prints a one-shot diagnostic on the first encapped frame so 
                                        N = paths-per-plane)
                                   health_aware_mrc        (MRC-aware
                                        weighted RR; reads EVStateTable)
-                              See srv6_fabric/policy.py for the full list.
+                              See srv6_mrc/policy.py for the full list.
 --idle-timeout Ns | Nms | 0   (recv) auto-exit after this much silence
                               following the first packet; default 6s,
                               0 disables (run until ^C)

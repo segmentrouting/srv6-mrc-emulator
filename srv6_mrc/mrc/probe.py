@@ -54,7 +54,7 @@ If we later bump beyond v3 / v2, decoders SHOULD accept previous
 versions for one release cycle.
 
 The codecs are pure functions — no scapy, no sockets, no clocks. Same
-test discipline as srv6_fabric/policy.py.
+test discipline as srv6_mrc/policy.py.
 
 See `docs/design-mrc.md` "Probe wire format" for the design rationale.
 """

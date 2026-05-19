@@ -20,7 +20,7 @@ PYTHONPATH=. python3 -m unittest discover -s tests -t .
 ```
 
 Expected: 329+ tests pass in ~1.5s. Use this as a fast smoke check
-after any edit to `srv6_fabric/*` or `srv6_fabric/cli/spray.py`.
+after any edit to `srv6_mrc/*` or `srv6_mrc/cli/spray.py`.
 
 To run a single test module or case:
 
@@ -63,7 +63,7 @@ sent counts will be unbalanced and `reord` should be 0.
 
 ## Scenario orchestrator
 
-`run-scenario` (`srv6_fabric/mrc/run.py`) reads a YAML scenario, spawns
+`run-scenario` (`srv6_mrc/mrc/run.py`) reads a YAML scenario, spawns
 receivers, runs senders in parallel via `docker exec`, applies/reverts
 `tc netem` faults, merges results, and renders an ASCII + JSON report.
 
@@ -382,10 +382,10 @@ report — that's a follow-up.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `KeyError: 'src_addr'` or similar in `spray` | Schema drift between `srv6_fabric/reorder.py` and consumers | Re-read `design-mrc.md` per-flow schema; both sides must use `src/dst/sport/dport/received/...` |
-| Every flow shows "no flow at receiver" + matching "orphan flow" warning | IPv6 string-form mismatch (zero-padded vs RFC 5952 compressed) | Already fixed in `srv6_fabric/report.py:_canon_addr()`; if it returns, check that both sides go through `_canon_addr` |
+| `KeyError: 'src_addr'` or similar in `spray` | Schema drift between `srv6_mrc/reorder.py` and consumers | Re-read `design-mrc.md` per-flow schema; both sides must use `src/dst/sport/dport/received/...` |
+| Every flow shows "no flow at receiver" + matching "orphan flow" warning | IPv6 string-form mismatch (zero-padded vs RFC 5952 compressed) | Already fixed in `srv6_mrc/report.py:_canon_addr()`; if it returns, check that both sides go through `_canon_addr` |
 | Sender PPS far below requested (e.g., 780 of 1000) | scapy packet build in the hot loop, host load | Not a correctness issue. Future optimization: precompute per-plane packet bytes, patch only seq+plane offsets |
-| `policy_to_cli: NotImplementedError` for `health_aware_mrc` | Stale; shouldn't happen. `health_aware_mrc` is wired through `srv6_fabric.mrc.run.policy_to_cli` and `cli/spray.py` as of MRC commit-2b. If you see it, you're on an old image — rebuild with `make image`. |
+| `policy_to_cli: NotImplementedError` for `health_aware_mrc` | Stale; shouldn't happen. `health_aware_mrc` is wired through `srv6_mrc.mrc.run.policy_to_cli` and `cli/spray.py` as of MRC commit-2b. If you see it, you're on an old image — rebuild with `make image`. |
 | `tc qdisc show` shows leftover `netem` after a run | orchestrator crashed before revert (rare) | `docker exec <host> tc qdisc del dev <nic> root` |
 
 ## Post-redeploy validation
@@ -491,7 +491,7 @@ collapsed rx socket isn't receiving probes. Check on a yellow host:
 docker exec yellow-host15 ss -6 -ulnp | grep 9999
 # Expected: one row, `[::]:9999`. NOT four rows on per-NIC underlay
 # addresses. If you see four rows, the agent is still on the per-plane
-# rx model — confirm `srv6_fabric/mrc/agent.py` is from commit 549dddb
+# rx model — confirm `srv6_mrc/mrc/agent.py` is from commit 549dddb
 # or later inside the image (rebuild with `make image`).
 ```
 
@@ -534,7 +534,7 @@ Expected (matching `green-mrc-plane-loss` semantics):
   round-robin reference).
 - Demotion of plane 2, NOT some other plane. If the demoted plane is
   wrong, payload-driven plane attribution is broken — re-check
-  `_probe_rx_loop` in `srv6_fabric/mrc/agent.py` (collapsed model
+  `_probe_rx_loop` in `srv6_mrc/mrc/agent.py` (collapsed model
   reads `probe.plane_id`, doesn't infer from socket).
 
 ### Step 4.4: yellow MRC plane-latency (regression fixture)
@@ -579,7 +579,7 @@ on to Phase 1b (module restructure). If any sub-step fails, share:
 Dry run
 ```bash
 SRV6_TOPO=topologies/4p-8x16/topo.yaml \
-  python3 -m srv6_fabric.mrc.run \
+  python3 -m srv6_mrc.mrc.run \
   topologies/4p-8x16/scenarios/yellow-ev-spray.yaml --dry-run --verbose
 ```
 

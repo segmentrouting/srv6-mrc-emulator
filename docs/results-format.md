@@ -2,7 +2,7 @@
 
 The `results/` directory at the repo root holds JSON reports written
 by `run-scenario --report <path>` (a.k.a.
-`srv6_fabric/mrc/run.py`). Each file is a single scenario run. Files
+`srv6_mrc/mrc/run.py`). Each file is a single scenario run. Files
 there are gitignored by convention — they're test artifacts, not
 source.
 

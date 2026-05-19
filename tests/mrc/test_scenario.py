@@ -1,6 +1,6 @@
 import unittest
 
-from srv6_fabric.mrc import scenario
+from srv6_mrc.mrc import scenario
 
 
 # --- minimal valid scenario fixture ----------------------------------------
@@ -402,7 +402,7 @@ flows:
         self.assertIsNone(s.paths_per_plane)
 
     def test_explicit_value_accepted(self):
-        from srv6_fabric.topo import NUM_SPINES
+        from srv6_mrc.topo import NUM_SPINES
         text = self._BASE + f"paths_per_plane: {NUM_SPINES}\n"
         s = scenario.from_yaml_string(text)
         self.assertEqual(s.paths_per_plane, NUM_SPINES)
@@ -418,7 +418,7 @@ flows:
             scenario.from_yaml_string(text)
 
     def test_over_max_rejected(self):
-        from srv6_fabric.topo import NUM_SPINES
+        from srv6_mrc.topo import NUM_SPINES
         text = self._BASE + f"paths_per_plane: {NUM_SPINES + 1}\n"
         with self.assertRaises(scenario.ScenarioError):
             scenario.from_yaml_string(text)

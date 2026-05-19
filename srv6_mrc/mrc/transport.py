@@ -13,7 +13,7 @@ S".  See AGENTS.md invariant 8 ("plane selection MUST be NIC-bound,
 not route-metric-bound") and the design note at the head of encap.py.
 
 The fix is to follow the data path exactly: build the outer SRv6
-header in user space (via `srv6_fabric.encap.build_outer_packet`) and
+header in user space (via `srv6_mrc.encap.build_outer_packet`) and
 write the resulting bytes to a raw IPv6 socket bound to the plane's
 NIC via SO_BINDTODEVICE. This is what `runner.py` already does for
 spray data packets; the MRC probe path now shares the same encap

@@ -108,10 +108,10 @@ the lab down — see "Reducing scale" below).
 | `topologies/<name>/topology.clab.yaml` | Containerlab topology (generated) |
 | `topologies/<name>/config/<node>/` | Per-node SONiC `config_db.json` and FRR `frr.conf` (generated) |
 | `scripts/config.sh` | Pushes generated configs into running SONiC containers |
-| `srv6_fabric/cli/routes.py` (CLI: `routes`) | Declarative SRv6 host-route manager (kubectl-style: `apply`, `delete`, `list`) |
+| `srv6_mrc/cli/routes.py` (CLI: `routes`) | Declarative SRv6 host-route manager (kubectl-style: `apply`, `delete`, `list`) |
 | `topologies/<name>/routes/*.yaml` | Ready-made route specs: reference pairs, full mesh, host00 fanout |
-| `srv6_fabric/cli/spray.py` (CLI: `spray`) | Userspace SRv6 packet sprayer (sender + receiver). MRC/SRv6 demo. See `spray-protocol.md`. |
-| `host-image/Dockerfile` | Builds `alpine-srv6-scapy:1.0` (host image: alpine + scapy + pip-installed `srv6_fabric`) |
+| `srv6_mrc/cli/spray.py` (CLI: `spray`) | Userspace SRv6 packet sprayer (sender + receiver). MRC/SRv6 demo. See `spray-protocol.md`. |
+| `host-image/Dockerfile` | Builds `alpine-srv6-scapy:1.0` (host image: alpine + scapy + pip-installed `srv6_mrc`) |
 | `spray-protocol.md` | Tool writeup: SID lists the sprayer builds, run instructions, manual tcpdump checkpoints |
 
 ## Deployment
@@ -353,7 +353,7 @@ Hosts will reduce to the new `leaves_per_plane` count. Re-run
 - `./running.md` — how to run MRC unit tests, manual two-host
   spray, and scenario-driven runs end-to-end.
 - `./results-format.md` — how to read the per-flow ASCII summary
-  and JSON reports `run-scenario` (`srv6_fabric/mrc/run.py`) produces.
+  and JSON reports `run-scenario` (`srv6_mrc/mrc/run.py`) produces.
 - `./design-appendix.md` — rationale for the major design decisions, including
   §10 on the plane-independent inner addressing that makes spray work.
 

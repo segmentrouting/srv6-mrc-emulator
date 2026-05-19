@@ -8,10 +8,10 @@ import json
 import unittest
 from unittest import mock
 
-from srv6_fabric.mrc.scenario import (
+from srv6_mrc.mrc.scenario import (
     FaultSpec, FlowPair, FlowSpec, ReportSpec, Scenario,
 )
-from srv6_fabric.mrc.run import (
+from srv6_mrc.mrc.run import (
     _ev_spray_n, _print_ev_preview, _recv_argv, _send_argv,
     expand_flows, faults_for_netem, policy_to_cli, run_flows, FlowRun,
 )
@@ -209,8 +209,8 @@ class TestRunFlows(unittest.TestCase):
             "green-host00", "green-host15"), stderr="",
             cmd=[], elapsed_s=1.0)
 
-        with mock.patch("srv6_fabric.mrc.run.docker_exec_async", return_value=recv_proc), \
-             mock.patch("srv6_fabric.mrc.run.docker_exec", return_value=send_res):
+        with mock.patch("srv6_mrc.mrc.run.docker_exec_async", return_value=recv_proc), \
+             mock.patch("srv6_mrc.mrc.run.docker_exec", return_value=send_res):
             senders, receivers = run_flows(flows, settle_s=0,
                                             idle_timeout_s=1.0)
         self.assertEqual(len(senders), 1)
@@ -223,8 +223,8 @@ class TestRunFlows(unittest.TestCase):
         recv_proc = _FakePopen(stdout=_ok_receiver_json())
         send_res = mock.Mock(rc=2, stdout="", stderr="boom",
                              cmd=[], elapsed_s=0.1)
-        with mock.patch("srv6_fabric.mrc.run.docker_exec_async", return_value=recv_proc), \
-             mock.patch("srv6_fabric.mrc.run.docker_exec", return_value=send_res):
+        with mock.patch("srv6_mrc.mrc.run.docker_exec_async", return_value=recv_proc), \
+             mock.patch("srv6_mrc.mrc.run.docker_exec", return_value=send_res):
             senders, receivers = run_flows(flows, settle_s=0,
                                             idle_timeout_s=1.0)
         self.assertEqual(senders, [])
@@ -237,8 +237,8 @@ class TestRunFlows(unittest.TestCase):
         send_res = mock.Mock(rc=0, stdout=_ok_sender_json(
             "green-host00", "green-host15"), stderr="",
             cmd=[], elapsed_s=1.0)
-        with mock.patch("srv6_fabric.mrc.run.docker_exec_async", return_value=recv_proc), \
-             mock.patch("srv6_fabric.mrc.run.docker_exec", return_value=send_res):
+        with mock.patch("srv6_mrc.mrc.run.docker_exec_async", return_value=recv_proc), \
+             mock.patch("srv6_mrc.mrc.run.docker_exec", return_value=send_res):
             senders, receivers = run_flows(flows, settle_s=0,
                                             idle_timeout_s=1.0)
         self.assertEqual(len(senders), 1)
@@ -259,8 +259,8 @@ class TestRunFlows(unittest.TestCase):
         send_res = mock.Mock(rc=0, stdout=_ok_sender_json(
             "green-host00", "green-host15"), stderr="",
             cmd=[], elapsed_s=1.0)
-        with mock.patch("srv6_fabric.mrc.run.docker_exec_async", side_effect=fake_async), \
-             mock.patch("srv6_fabric.mrc.run.docker_exec", return_value=send_res):
+        with mock.patch("srv6_mrc.mrc.run.docker_exec_async", side_effect=fake_async), \
+             mock.patch("srv6_mrc.mrc.run.docker_exec", return_value=send_res):
             run_flows(flows, settle_s=0, idle_timeout_s=1.0)
         self.assertEqual(recv_calls, ["green-host15"])
 
@@ -281,7 +281,7 @@ class TestEvSprayPreview(unittest.TestCase):
     def test_ev_spray_n_bare_falls_back_to_num_spines(self):
         # When scenario doesn't set paths_per_plane, bare ev_spray
         # means "use all spines" — matches sender CLI precedence.
-        from srv6_fabric.topo import NUM_SPINES
+        from srv6_mrc.topo import NUM_SPINES
         self.assertEqual(_ev_spray_n("ev_spray", None), NUM_SPINES)
 
     def test_ev_spray_n_returns_none_for_other_policies(self):

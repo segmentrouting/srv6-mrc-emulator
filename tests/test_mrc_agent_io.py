@@ -37,14 +37,14 @@ import time
 import unittest
 from typing import Dict, Tuple
 
-from srv6_fabric.mrc.agent import (
+from srv6_mrc.mrc.agent import (
     AgentConfig,
     ReceiverMrcAgent,
     SenderMrcAgent,
 )
-from srv6_fabric.mrc.ev_state import EVStateTable
-from srv6_fabric.mrc.transport import LoopbackUdpTransport
-from srv6_fabric.topo import (
+from srv6_mrc.mrc.ev_state import EVStateTable
+from srv6_mrc.mrc.transport import LoopbackUdpTransport
+from srv6_mrc.topo import (
     NUM_PLANES,
     NUM_SPINES,
     tenant_id as topo_tenant_id,

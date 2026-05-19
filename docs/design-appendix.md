@@ -401,7 +401,7 @@ available:
 - **Per-flow ECMP across the 4 NIC routes**: leave metrics equal, let Linux
   hash. Models the spray case but isn't useful for a per-plane *test* runner.
 - **Custom send path** (the MRC paper's choice): user-space NIC selection per
-  packet. `srv6_fabric/cli/spray.py` (CLI: `spray`) implements this — raw socket per plane bound via
+  packet. `srv6_mrc/cli/spray.py` (CLI: `spray`) implements this — raw socket per plane bound via
   `SO_BINDTODEVICE`, builds its own outer IPv6 with the uSID list. Bypasses
   the kernel routes entirely for sending; the receiver still benefits from
   them for any non-spray traffic.

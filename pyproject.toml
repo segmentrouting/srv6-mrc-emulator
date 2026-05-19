@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "srv6_fabric"
+name = "srv6_mrc"
 version = "0.1.0"
 description = "SRv6 fabric emulator + per-EV MRC behavior layer (probes, EV state, loss fusion, EV-aware spray) for AI-cluster networking research"
 readme = "README.md"
@@ -21,12 +21,12 @@ dev = ["scapy>=2.5", "PyYAML>=6.0"]
 [project.scripts]
 # These get installed into the Docker image's /usr/local/bin
 # via `pip install .` and become the user-facing CLI surface.
-spray = "srv6_fabric.cli.spray:main"
-routes = "srv6_fabric.cli.routes:main"
-run-scenario = "srv6_fabric.mrc.run:main"
+spray = "srv6_mrc.cli.spray:main"
+routes = "srv6_mrc.cli.routes:main"
+run-scenario = "srv6_mrc.mrc.run:main"
 
 [tool.setuptools.packages.find]
-include = ["srv6_fabric*"]
+include = ["srv6_mrc*"]
 
 [tool.setuptools.package-data]
-srv6_fabric = ["py.typed"]
+srv6_mrc = ["py.typed"]

@@ -11,7 +11,7 @@ running 0..7.
 This directory contains:
 
 - `topo.yaml` — declarative parameters (counts, image tag); source of
-  truth consumed by the generator and srv6_fabric runtime.
+  truth consumed by the generator and srv6_mrc runtime.
 - `topology.clab.yaml` — generated containerlab file. Regenerate via
   `make TOPO=2p-4x8 regen`.
 - `config/` — generated per-node SONiC `config_db.json` + `frr.conf`.

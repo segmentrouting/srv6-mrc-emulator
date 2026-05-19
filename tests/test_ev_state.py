@@ -1,4 +1,4 @@
-"""Unit tests for srv6_fabric.mrc.ev_state.
+"""Unit tests for srv6_mrc.mrc.ev_state.
 
 Tests are deterministic — no clock, no threads, no sockets. The state
 machine is driven entirely by `record_probe_result()` and
@@ -12,7 +12,7 @@ shape), and a separate section exercises multi-path semantics.
 import threading
 import unittest
 
-from srv6_fabric.mrc.ev_state import (
+from srv6_mrc.mrc.ev_state import (
     EVState,
     EVStateConfig,
     EVStateTable,

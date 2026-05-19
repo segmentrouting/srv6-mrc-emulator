@@ -6,7 +6,7 @@
 # vs 96 + 32 in the reference design).
 #
 # Single source of truth: the generator reads this file to emit
-# topology.clab.yaml + config/, and the runtime srv6_fabric package
+# topology.clab.yaml + config/, and the runtime srv6_mrc package
 # reads it (via SRV6_TOPO, baked into the container image) to learn
 # the fabric dimensions.
 
@@ -19,7 +19,7 @@ spines_per_plane: 4
 leaves_per_plane: 8
 
 # Tenants. Address blocks and SID function bits live in
-# srv6_fabric.topo (currently shared across all topologies); listed
+# srv6_mrc.topo (currently shared across all topologies); listed
 # here only for documentation.
 tenants:
   - green

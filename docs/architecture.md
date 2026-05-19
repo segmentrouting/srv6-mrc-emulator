@@ -150,14 +150,14 @@ template") describes a two-step specialization:
                                          outer dst IPv6
 ```
 
-Our emulator does the analog of this in two places. `srv6_fabric/cli/routes.py`
+Our emulator does the analog of this in two places. `srv6_mrc/cli/routes.py`
 (`build_segs`, `inner_addr`) installs kernel `seg6 encap` routes
 keyed by inner address with one route per plane (metrics 100..103) —
 this is the *kernel-encap* data path, used by simple connectivity
 tests (ping, etc.) and as a debugging fallback. The MRC data and
 control paths (EV-spray, probes, loss reports) bypass these routes
 and build the outer packet in user space via
-`srv6_fabric.encap.build_outer_packet`, so the "EV[k] picks plane"
+`srv6_mrc.encap.build_outer_packet`, so the "EV[k] picks plane"
 step happens in the sender process — not in the FIB. Plane selection
 on the wire is still NIC-bound via `SO_BINDTODEVICE` on `eth(P+1)`
 (invariant 8); spine entropy comes from per-packet outer-DA rotation
@@ -221,7 +221,7 @@ The Phase 1 module restructure tracked in `design-mrc.md` will physically
 separate the three roles:
 
 ```
-srv6_fabric/
+srv6_mrc/
 ├── workload/       # generators that name inner addresses only
 │   ├── spray.py    # current cli/spray.py minus the encap fast-path
 │   └── patterns.py # collective-shaped traffic (Phase 2)

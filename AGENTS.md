@@ -29,7 +29,7 @@ Tenants:
 ## Repo layout
 
 ```
-srv6_fabric/           Python package
+srv6_mrc/           Python package
   topo.py              fabric constants + addressing helpers (reads topo.yaml)
   runner.py, policy.py, reorder.py, netem.py, report.py, health.py
   cli/spray.py         userspace SRv6 packet generator (CLI: `spray`)
@@ -53,9 +53,9 @@ topologies/<name>/
   scenarios/           MRC scenario YAMLs
   routes/              route-spec YAMLs for `routes apply`
 
-host-image/Dockerfile  alpine + scapy + pip-installed srv6_fabric
+host-image/Dockerfile  alpine + scapy + pip-installed srv6_mrc
 scripts/config.sh      push configs to running containers
-tests/                 329 unit tests mirroring srv6_fabric/ layout
+tests/                 329 unit tests mirroring srv6_mrc/ layout
 docs/                  consolidated design + runbook docs
 results/               scenario output JSON (gitignored)
 Makefile               operator workflow entry point
@@ -67,7 +67,7 @@ Makefile               operator workflow entry point
 leaves, container images, clab topology name. The generator
 (`generators/fabric.py --topo <path>`) reads it and emits
 `topology.clab.yaml` + the per-node `config/*` SONiC config snippets in
-the same directory. The `srv6_fabric.topo` runtime module also reads
+the same directory. The `srv6_mrc.topo` runtime module also reads
 it at import time (via the `SRV6_TOPO` env var, defaulting to
 `topologies/4p-8x16/topo.yaml`).
 
@@ -78,24 +78,24 @@ it at import time (via the `SRV6_TOPO` env var, defaulting to
 Files that must stay in sync because they share addressing/SID-list shape:
 
 - `generators/fabric.py` (writes routes into SONiC + host configs)
-- `srv6_fabric/cli/routes.py` (parses + writes host-side `ip -6 route`
+- `srv6_mrc/cli/routes.py` (parses + writes host-side `ip -6 route`
   SRv6 routes)
-- `srv6_fabric/cli/spray.py` (CLI; delegates encoding to
-  `srv6_fabric.runner`)
-- `srv6_fabric/topo.py` (fabric constants + `usid_outer_dst()` — the
+- `srv6_mrc/cli/spray.py` (CLI; delegates encoding to
+  `srv6_mrc.runner`)
+- `srv6_mrc/topo.py` (fabric constants + `usid_outer_dst()` — the
   SID-list builder the runner uses)
-- `srv6_fabric/runner.py` (wire format: `!QBB` seq+plane+path, 32B pad,
+- `srv6_mrc/runner.py` (wire format: `!QBB` seq+plane+path, 32B pad,
   sport=dport=SPRAY_PORT)
-- `srv6_fabric/encap.py` (shared `build_outer_packet()` +
+- `srv6_mrc/encap.py` (shared `build_outer_packet()` +
   `open_raw_send_socket()` helpers — used by both `runner.py` for data
   packets and `mrc/transport.py` for SRv6-encapped probes)
-- `srv6_fabric/mrc/transport.py` (`MrcTransport` ABC + `Srv6RawTransport`
+- `srv6_mrc/mrc/transport.py` (`MrcTransport` ABC + `Srv6RawTransport`
   + `LoopbackUdpTransport`; the agent does all I/O through this)
 
 If you change the SID-list shape, the per-plane block layout, or any
 tenant naming/addressing, all of these must be updated. The
 `test_reference_pairs_match_spray` test in `tests/test_topo.py` locks
-the `srv6_fabric.topo` ↔ `spray` reference-pairs map in sync.
+the `srv6_mrc.topo` ↔ `spray` reference-pairs map in sync.
 
 ## Hard invariants (do not violate)
 
@@ -166,7 +166,7 @@ the `srv6_fabric.topo` ↔ `spray` reference-pairs map in sync.
   attribute per-EV stats.
 - **Phase 1b step 2 (per-EV scapy raw-socket probes):** done. Probe TX
   moved off the per-plane UDP+`encap.red`-route path onto a shared
-  `srv6_fabric/encap.build_outer_packet()` raw-socket builder — the
+  `srv6_mrc/encap.build_outer_packet()` raw-socket builder — the
   same helper the data path uses for EV-spray. Probes are now per
   `(plane, path)` EV, so probe granularity matches data-path EV
   granularity (NUM_PLANES × NUM_SPINES probes per round). All I/O for
@@ -214,7 +214,7 @@ Concretely:
 
 ## Tooling specifics
 
-### `routes` (`srv6_fabric/cli/routes.py`)
+### `routes` (`srv6_mrc/cli/routes.py`)
 
 Declarative kubectl-style route manager. Requires PyYAML.
 Spec format: `apiVersion: srv6-lab/v1`, `kind: RouteSet`, with `pairs`
@@ -239,15 +239,15 @@ routes list   [--host h1,h2] [--tenant green|yellow] [-o wide|raw]
 - `-o wide` — full per-plane path: `p<P>-leaf<src> -> p<P>-spine<NN> -> p<P>-leaf<dst>  (eth<P+1> metric 10<P>)`
 - `-o raw` / `--raw` — literal `ip -6 route` lines
 
-### `spray` (`srv6_fabric/cli/spray.py`)
+### `spray` (`srv6_mrc/cli/spray.py`)
 
 Userspace SRv6 sprayer, image `alpine-srv6-scapy:1.0`. The image
-pip-installs the `srv6_fabric` package at build time, so `spray` lives
+pip-installs the `srv6_mrc` package at build time, so `spray` lives
 at `/usr/local/bin/spray` inside every host container — no bind mounts
 needed for code. The active topology's `topo.yaml` is bind-mounted
 into each host container at runtime by containerlab (per the
 `binds:` block in `topology.clab.yaml`), landing at
-`/etc/srv6_fabric/topo.yaml`; the image exports `SRV6_TOPO` pointing
+`/etc/srv6_mrc/topo.yaml`; the image exports `SRV6_TOPO` pointing
 at that path. This means a single image serves every topology
 variant — the topology identity moves with the container, not the
 image.
@@ -281,11 +281,11 @@ Notable flags:
 
 The orchestrator sets `SRV6_MRC_CONFIG_JSON` on every `docker exec` when
 the scenario has an `mrc:` block. Both `cmd_send` and `cmd_recv` decode
-it via `srv6_fabric.mrc.agent.load_configs_from_env()` into
+it via `srv6_mrc.mrc.agent.load_configs_from_env()` into
 `(AgentConfig, EVStateConfig | None)`. Unknown keys, bad JSON, or
 non-object payloads fail loud rather than reverting to defaults.
 
-### `run-scenario` (`srv6_fabric/mrc/run.py`)
+### `run-scenario` (`srv6_mrc/mrc/run.py`)
 
 Docker-host-side orchestrator for MRC scenarios. Loads a scenario YAML,
 applies fault injection via `nsenter ... tc qdisc add ...` against host
@@ -306,8 +306,8 @@ without touching the lab.
 `health_aware_mrc` is the live MRC policy. It reads weights from an
 `EVStateTable` shared with a `SenderMrcAgent` running in the same
 process. All probe / reply / loss-report I/O is delegated to an
-`MrcTransport` (`srv6_fabric/mrc/transport.py`): `Srv6RawTransport`
-in the lab (raw-socket SRv6 encap via `srv6_fabric.encap`),
+`MrcTransport` (`srv6_mrc/mrc/transport.py`): `Srv6RawTransport`
+in the lab (raw-socket SRv6 encap via `srv6_mrc.encap`),
 `LoopbackUdpTransport` in unit tests. There is one code path; the
 agent never branches on transport.
 
@@ -398,20 +398,20 @@ same commit set as their green counterparts as of Phase 1b step 2.
 Per-host MRC agent w/ IPC (deduplicate probes across N flows on
 one host) is the next milestone.
 
-### Gotcha: rebuild the image whenever `srv6_fabric/` changes
+### Gotcha: rebuild the image whenever `srv6_mrc/` changes
 
 `make image` runs `docker build`; layer caching has occasionally
-shipped a stale `srv6_fabric` package inside the container even after
+shipped a stale `srv6_mrc` package inside the container even after
 a clean `git pull`. Symptom is line-number mismatches between local
 tracebacks and container tracebacks. When in doubt:
 
 ```bash
 docker build --no-cache -f host-image/Dockerfile -t alpine-srv6-scapy:1.0 .
 docker run --rm alpine-srv6-scapy:1.0 \
-    wc -l /usr/lib/python3.12/site-packages/srv6_fabric/mrc/agent.py
+    wc -l /usr/lib/python3.12/site-packages/srv6_mrc/mrc/agent.py
 ```
 
-The line count should match the local `srv6_fabric/mrc/agent.py`.
+The line count should match the local `srv6_mrc/mrc/agent.py`.
 Roadmapped: a `make image` sanity rail to fail the build if the line
 count drifts.
 
@@ -465,7 +465,7 @@ make test
   `fc00:0:f000:e00f:d000::` are equal but the strings differ. Anywhere
   that compares IPv6 addresses-as-strings, route them through
   `ipaddress.IPv6Address` first. See `_canon_addr()` in
-  `srv6_fabric/report.py`.
+  `srv6_mrc/report.py`.
 
 ## Things to avoid
 

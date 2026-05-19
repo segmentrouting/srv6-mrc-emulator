@@ -11,7 +11,7 @@
 # few percent, loss should be ~0, reorder should match baseline.
 #
 # Run:
-#   python3 -m srv6_fabric.mrc.run \
+#   python3 -m srv6_mrc.mrc.run \
 #       topologies/4p-8x16/scenarios/green-mrc-baseline.yaml --verbose
 
 name: green-mrc-baseline

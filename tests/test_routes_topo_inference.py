@@ -2,15 +2,15 @@
 
 The bug this guards against: when an operator runs
 
-    python3 -m srv6_fabric.cli.routes apply -f topologies/2p-4x8/routes/full-mesh.yaml
+    python3 -m srv6_mrc.cli.routes apply -f topologies/2p-4x8/routes/full-mesh.yaml
 
-on the deploy host with no `SRV6_TOPO` exported, srv6_fabric.topo silently
+on the deploy host with no `SRV6_TOPO` exported, srv6_mrc.topo silently
 falls back to the default (4p-8x16) topology. The route generator then
 iterates 4 planes instead of 2 and emits hundreds of spurious `eth3`/`eth4`
 route failures against hosts that only have `eth1`/`eth2`.
 
-`srv6_fabric.cli.routes._infer_srv6_topo_from_argv` peeks at argv before
-importing srv6_fabric.topo and sets SRV6_TOPO from the `-f`/`--file` path
+`srv6_mrc.cli.routes._infer_srv6_topo_from_argv` peeks at argv before
+importing srv6_mrc.topo and sets SRV6_TOPO from the `-f`/`--file` path
 so the topo constants come out correct.
 """
 
@@ -22,22 +22,22 @@ import unittest
 from pathlib import Path
 
 # Import the bare function — no side effects, no topo import in this module
-# scope. We MUST NOT `from srv6_fabric.cli import routes` at module scope
-# because that would also import srv6_fabric.topo and freeze its constants
+# scope. We MUST NOT `from srv6_mrc.cli import routes` at module scope
+# because that would also import srv6_mrc.topo and freeze its constants
 # for the rest of the test process.
 
 _HERE = Path(__file__).resolve().parent
-_ROUTES_PY = _HERE.parent / "srv6_fabric" / "cli" / "routes.py"
+_ROUTES_PY = _HERE.parent / "srv6_mrc" / "cli" / "routes.py"
 
 
 def _load_inference_func():
     """Load just the `_infer_srv6_topo_from_argv` symbol via exec, without
-    triggering the `from srv6_fabric import topo` at the bottom of routes.py.
+    triggering the `from srv6_mrc import topo` at the bottom of routes.py.
 
     We slice the source up to the topo import line and exec only that prefix.
     Cheaper and more hermetic than importing the whole module."""
     src = _ROUTES_PY.read_text()
-    marker = "from srv6_fabric import topo as _topo"
+    marker = "from srv6_mrc import topo as _topo"
     idx = src.index(marker)
     prefix = src[:idx]
     ns: dict = {}
@@ -111,7 +111,7 @@ class TestInferSrv6Topo(unittest.TestCase):
 
     def test_nonexistent_topo_yaml(self):
         # Path-shape matches but topo.yaml isn't on disk -> None, so
-        # srv6_fabric.topo's own fallback handles it.
+        # srv6_mrc.topo's own fallback handles it.
         with tempfile.TemporaryDirectory() as td:
             spec = Path(td) / "topologies" / "fake-99" / "routes" / "x.yaml"
             spec.parent.mkdir(parents=True)
@@ -135,7 +135,7 @@ class TestRoutesModuleHonorsInferredTopo(unittest.TestCase):
             sys.argv = ["routes.py", "apply", "-f",
                         "topologies/2p-4x8/routes/full-mesh.yaml"]
             src = _ROUTES_PY.read_text()
-            marker = "from srv6_fabric import topo as _topo"
+            marker = "from srv6_mrc import topo as _topo"
             prefix = src[: src.index(marker)]
             ns: dict = {"__name__": "__not_main__"}
             exec(compile(prefix, str(_ROUTES_PY), "exec"), ns)
@@ -160,7 +160,7 @@ class TestRoutesModuleHonorsInferredTopo(unittest.TestCase):
             sys.argv = ["routes.py", "apply", "-f",
                         "topologies/2p-4x8/routes/full-mesh.yaml"]
             src = _ROUTES_PY.read_text()
-            marker = "from srv6_fabric import topo as _topo"
+            marker = "from srv6_mrc import topo as _topo"
             prefix = src[: src.index(marker)]
             ns: dict = {"__name__": "__not_main__"}
             exec(compile(prefix, str(_ROUTES_PY), "exec"), ns)

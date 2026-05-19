@@ -29,7 +29,7 @@ from pathlib import Path
 def _find_default_topo_yaml() -> Path:
     """Locate topologies/4p-8x16/topo.yaml relative to this file.
 
-    srv6_fabric/topo.py is at <root>/srv6_fabric/topo.py, so the default
+    srv6_mrc/topo.py is at <root>/srv6_mrc/topo.py, so the default
     topology is two levels up + topologies/4p-8x16/topo.yaml.
     """
     here = Path(__file__).resolve()
@@ -44,7 +44,7 @@ def _load_topo() -> dict:
       2. <repo>/topologies/4p-8x16/topo.yaml (development default)
 
     Falls back to a hardcoded 4p-8x16 dict if neither file is reachable
-    AND yaml is missing — keeps `import srv6_fabric.topo` working in
+    AND yaml is missing — keeps `import srv6_mrc.topo` working in
     truly minimal environments (e.g., schema-only tooling).
     """
     path_str = os.environ.get("SRV6_TOPO")

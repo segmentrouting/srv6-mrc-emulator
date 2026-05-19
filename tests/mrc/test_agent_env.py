@@ -1,4 +1,4 @@
-"""Tests for srv6_fabric.mrc.agent.load_configs_from_env.
+"""Tests for srv6_mrc.mrc.agent.load_configs_from_env.
 
 This is the bridge between the scenario YAML's `mrc:` block (validated
 into MrcSpec, serialised by MrcSpec.to_env_json, propagated through
@@ -17,7 +17,7 @@ import os
 import unittest
 from unittest import mock
 
-from srv6_fabric.mrc.agent import (
+from srv6_mrc.mrc.agent import (
     MRC_CONFIG_ENV, AgentConfig, load_configs_from_env,
 )
 

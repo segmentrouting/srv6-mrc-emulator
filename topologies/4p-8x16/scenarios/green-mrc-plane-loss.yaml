@@ -19,7 +19,7 @@
 # workloads where you don't want to demote on a single noisy window.
 #
 # Run:
-#   python3 -m srv6_fabric.mrc.run \
+#   python3 -m srv6_mrc.mrc.run \
 #       topologies/4p-8x16/scenarios/green-mrc-plane-loss.yaml --verbose
 
 name: green-mrc-plane-loss

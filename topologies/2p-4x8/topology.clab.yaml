@@ -133,7 +133,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.200
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:bbbb:00::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:bbbb:00::2/64 dev eth2 nodad"
@@ -146,7 +146,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.201
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:bbbb:01::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:bbbb:01::2/64 dev eth2 nodad"
@@ -159,7 +159,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.202
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:bbbb:02::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:bbbb:02::2/64 dev eth2 nodad"
@@ -172,7 +172,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.203
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:bbbb:03::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:bbbb:03::2/64 dev eth2 nodad"
@@ -185,7 +185,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.204
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:bbbb:04::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:bbbb:04::2/64 dev eth2 nodad"
@@ -198,7 +198,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.205
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:bbbb:05::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:bbbb:05::2/64 dev eth2 nodad"
@@ -211,7 +211,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.206
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:bbbb:06::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:bbbb:06::2/64 dev eth2 nodad"
@@ -224,7 +224,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.207
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:bbbb:07::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:bbbb:07::2/64 dev eth2 nodad"
@@ -237,7 +237,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.208
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:cccc:00::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:cccc:00::2/64 dev eth2 nodad"
@@ -253,7 +253,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.209
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:cccc:01::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:cccc:01::2/64 dev eth2 nodad"
@@ -269,7 +269,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.210
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:cccc:02::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:cccc:02::2/64 dev eth2 nodad"
@@ -285,7 +285,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.211
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:cccc:03::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:cccc:03::2/64 dev eth2 nodad"
@@ -301,7 +301,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.212
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:cccc:04::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:cccc:04::2/64 dev eth2 nodad"
@@ -317,7 +317,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.213
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:cccc:05::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:cccc:05::2/64 dev eth2 nodad"
@@ -333,7 +333,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.214
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:cccc:06::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:cccc:06::2/64 dev eth2 nodad"
@@ -349,7 +349,7 @@ topology:
       image: alpine-srv6-scapy:1.0
       mgmt-ipv4: 172.20.18.215
       binds:
-        - topo.yaml:/etc/srv6_fabric/topo.yaml:ro
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
       exec:
         - "ip -6 addr add 2001:db8:cccc:07::2/64 dev eth1 nodad"
         - "ip -6 addr add 2001:db8:cccc:07::2/64 dev eth2 nodad"

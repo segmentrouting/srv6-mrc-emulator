@@ -40,16 +40,16 @@ from typing import Any
 
 # Allow `python3 mrc/run.py ...` and `python3 -m mrc.run ...` both to work.
 # When invoked as a script (no package context), prepend project root so
-# `from srv6_fabric...` succeeds.
+# `from srv6_mrc...` succeeds.
 if __package__ in (None, ""):
     _ROOT = Path(__file__).resolve().parent.parent
     if str(_ROOT) not in sys.path:
         sys.path.insert(0, str(_ROOT))
 
-from srv6_fabric.netem import Fault, Netem
-from srv6_fabric.report import ScenarioReport
-from srv6_fabric.mrc.scenario import MrcSpec, Scenario, from_yaml_file
-from srv6_fabric.topo import (NUM_PLANES, NUM_SPINES, inner_addr,
+from srv6_mrc.netem import Fault, Netem
+from srv6_mrc.report import ScenarioReport
+from srv6_mrc.mrc.scenario import MrcSpec, Scenario, from_yaml_file
+from srv6_mrc.topo import (NUM_PLANES, NUM_SPINES, inner_addr,
                               select_spines_for_addrs, usid_outer_dst)
 
 

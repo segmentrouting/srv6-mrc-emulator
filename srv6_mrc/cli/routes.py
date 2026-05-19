@@ -62,17 +62,17 @@ except ImportError:
 
 
 # ----------------------------------------------------------------------------
-# topology selection (must run before srv6_fabric.topo import)
+# topology selection (must run before srv6_mrc.topo import)
 # ----------------------------------------------------------------------------
 
 def _infer_srv6_topo_from_argv(argv: list[str]) -> str | None:
     """If argv contains `-f topologies/<X>/routes/<Y>.yaml` (or `--file=...`),
     return the matching `topologies/<X>/topo.yaml`. Otherwise None.
 
-    This lets `python3 -m srv6_fabric.cli.routes apply -f
+    This lets `python3 -m srv6_mrc.cli.routes apply -f
     topologies/2p-4x8/routes/full-mesh.yaml` automatically run against the
     2p-4x8 topology even if the operator forgot to export $SRV6_TOPO on
-    the deploy host. Without this, srv6_fabric.topo falls back to the
+    the deploy host. Without this, srv6_mrc.topo falls back to the
     default (4p-8x16) and the route generator iterates the wrong number
     of planes, attempting `eth3`/`eth4` on hosts that only have
     `eth1`/`eth2` and producing hundreds of spurious failures.
@@ -112,21 +112,21 @@ def _infer_srv6_topo_from_argv(argv: list[str]) -> str | None:
     return str(topo_yaml) if topo_yaml.exists() else None
 
 
-# Set $SRV6_TOPO from argv path before importing srv6_fabric.topo (which reads
+# Set $SRV6_TOPO from argv path before importing srv6_mrc.topo (which reads
 # the env at *its* import time). Operator-supplied $SRV6_TOPO always wins.
 if not os.environ.get("SRV6_TOPO"):
     _inferred = _infer_srv6_topo_from_argv(sys.argv[1:])
     if _inferred:
         os.environ["SRV6_TOPO"] = _inferred
 
-from srv6_fabric import topo as _topo
+from srv6_mrc import topo as _topo
 
 
 # ----------------------------------------------------------------------------
 # constants
 # ----------------------------------------------------------------------------
 
-# Sourced from the active topo.yaml via srv6_fabric.topo (env: SRV6_TOPO).
+# Sourced from the active topo.yaml via srv6_mrc.topo (env: SRV6_TOPO).
 # Do not hardcode values here — every topology supplies its own.
 TOPO = _topo.CLAB_TOPOLOGY_NAME
 NUM_PLANES = _topo.NUM_PLANES
@@ -138,7 +138,7 @@ KIND = "RouteSet"
 WORKERS = 16      # parallel docker exec for apply/delete/list
 
 # Reference (lo, hi) pair -> chosen transit spine. Imported from
-# srv6_fabric.topo so the table tracks the active topology. Topologies
+# srv6_mrc.topo so the table tracks the active topology. Topologies
 # without an entry fall through to a hash in spine_for() below.
 REFERENCE_PAIRS_SPINES = _topo.REFERENCE_PAIRS_SPINES
 

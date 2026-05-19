@@ -1,4 +1,4 @@
-"""Tests for srv6_fabric.runner — pieces that don't need raw sockets or scapy.
+"""Tests for srv6_mrc.runner — pieces that don't need raw sockets or scapy.
 
 The send/recv loops themselves require CAP_NET_RAW and live NICs; those
 are exercised in the lab via the orchestrator. Here we cover the
@@ -6,11 +6,11 @@ serialization, dataclasses, and host-id parsing logic that are pure.
 """
 import unittest
 
-from srv6_fabric.runner import (
+from srv6_mrc.runner import (
     FlowEndpoint, SenderResult, detect_self_id,
     encode_payload, host_for, parse_payload,
 )
-from srv6_fabric.topo import SPRAY_PORT
+from srv6_mrc.topo import SPRAY_PORT
 
 
 class TestPayloadCodec(unittest.TestCase):

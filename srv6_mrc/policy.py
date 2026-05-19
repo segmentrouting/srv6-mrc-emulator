@@ -25,7 +25,7 @@ from .topo import (NUM_PLANES, NUM_SPINES, FlowKey,
 
 if TYPE_CHECKING:
     # Imported lazily inside HealthAwareMrc to avoid a circular import
-    # between srv6_fabric.policy and srv6_fabric.mrc.ev_state.
+    # between srv6_mrc.policy and srv6_mrc.mrc.ev_state.
     from .mrc.ev_state import EVStateTable
 
 

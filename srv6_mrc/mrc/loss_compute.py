@@ -9,7 +9,7 @@ needs to:
 
 The receiver sent us `(seen[plane], expected_local[plane])` where
 `expected_local` is its observed flow-seq span on that plane (an upper
-bound on packets sent on the plane; see srv6_fabric/mrc/loss_window.py
+bound on packets sent on the plane; see srv6_mrc/mrc/loss_window.py
 for derivation). We have a much better number — our own `sent[plane]`
 counter for the matching emit window — when we can pair them up.
 

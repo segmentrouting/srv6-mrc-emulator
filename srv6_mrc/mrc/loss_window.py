@@ -33,7 +33,7 @@ of the loss-ratio computation.
 
 Windowing
 ---------
-Per the agreed design (see commit message for srv6_fabric/mrc/probe.py):
+Per the agreed design (see commit message for srv6_mrc/mrc/probe.py):
 
     - Receiver opens a window at recv_first_packet_in_window_at_ns.
     - On each data packet, the accountant increments seen[ev] and

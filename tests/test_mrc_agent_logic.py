@@ -1,9 +1,9 @@
 """Unit tests for the pure-logic pieces of the MRC agent.
 
 Covers:
-  - srv6_fabric.mrc.probe_clock.ProbeClock
-  - srv6_fabric.mrc.loss_window.LossWindowTable
-  - srv6_fabric.mrc.loss_compute.{SentWindow, SentWindowRing,
+  - srv6_mrc.mrc.probe_clock.ProbeClock
+  - srv6_mrc.mrc.loss_window.LossWindowTable
+  - srv6_mrc.mrc.loss_compute.{SentWindow, SentWindowRing,
     compute_loss_ratio, apply_loss_report}
 
 These modules are sockets-free; they're the inner loop that the
@@ -14,17 +14,17 @@ picture.
 
 import unittest
 
-from srv6_fabric.mrc.ev_state import EVState, EVStateConfig, EVStateTable
-from srv6_fabric.mrc.loss_compute import (
+from srv6_mrc.mrc.ev_state import EVState, EVStateConfig, EVStateTable
+from srv6_mrc.mrc.loss_compute import (
     LossFusionStats,
     SentWindow,
     SentWindowRing,
     apply_loss_report,
     compute_loss_ratio,
 )
-from srv6_fabric.mrc.loss_window import LossWindowTable
-from srv6_fabric.mrc.probe import LossReport, PlaneLossRecord
-from srv6_fabric.mrc.probe_clock import ProbeClock
+from srv6_mrc.mrc.loss_window import LossWindowTable
+from srv6_mrc.mrc.probe import LossReport, PlaneLossRecord
+from srv6_mrc.mrc.probe_clock import ProbeClock
 
 
 # ---------------------------------------------------------------------------

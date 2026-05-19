@@ -60,7 +60,7 @@ caller-driven stop is responsive too (used by tests).
 Transport abstraction
 ---------------------
 All on-the-wire I/O is delegated to an `MrcTransport` (see
-`srv6_fabric.mrc.transport`):
+`srv6_mrc.mrc.transport`):
 
   Srv6RawTransport  (lab)
       Per-plane AF_INET6 SOCK_RAW IPPROTO_RAW sockets bound via
@@ -128,7 +128,7 @@ DEFAULT_PROBE_TIMEOUT_MS = 100
 DEFAULT_LOSS_WINDOW_MS = 200
 DEFAULT_MAX_WINDOW_SKEW_MS = 500
 # DEFAULT_RECV_BUFSIZE and DEFAULT_SOCKET_TIMEOUT_S now live in
-# srv6_fabric.mrc.transport and are re-imported above so existing
+# srv6_mrc.mrc.transport and are re-imported above so existing
 # call sites in this module keep working unchanged.
 
 
@@ -238,7 +238,7 @@ class SenderMrcAgent:
 
     All on-the-wire I/O is delegated to `self.transport` (an
     MrcTransport). In the lab the default Srv6RawTransport builds
-    SRv6-encapped probes via `srv6_fabric.encap.build_outer_packet`
+    SRv6-encapped probes via `srv6_mrc.encap.build_outer_packet`
     and writes them to per-plane raw sockets bound via
     SO_BINDTODEVICE. In tests a LoopbackUdpTransport is passed in
     explicitly via the `transport=` kwarg so no encap or CAP_NET_RAW
@@ -446,7 +446,7 @@ class SenderMrcAgent:
         types after the kernel decaps the SRv6 carrier (lab) or after
         the loopback transport delivers the raw payload (tests). We
         dispatch by the first byte (the magic field that every wire
-        format defines uniquely — see srv6_fabric.mrc.probe).
+        format defines uniquely — see srv6_mrc.mrc.probe).
         """
         try:
             sock = self.transport.recv_reply_socket()

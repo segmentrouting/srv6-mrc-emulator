@@ -1,4 +1,4 @@
-"""Unit tests for srv6_fabric.mrc.probe.
+"""Unit tests for srv6_mrc.mrc.probe.
 
 Wire-format codec tests only — no sockets. Round-trip every encode with
 its matching decode; verify magic/version checking; verify truncation
@@ -8,8 +8,8 @@ and range checks reject malformed input cleanly.
 
 import unittest
 
-from srv6_fabric.mrc import probe
-from srv6_fabric.mrc.probe import (
+from srv6_mrc.mrc import probe
+from srv6_mrc.mrc.probe import (
     LossReport,
     LOSS_REPORT_VERSION,
     PROBE_VERSION,

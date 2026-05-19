@@ -22,19 +22,19 @@ Read this in the context of:
 
 | Requirement | Where it lives |
 |---|---|
-| One logical flow → many planes (spray) | `srv6_fabric/cli/spray.py` (CLI: `spray`) |
-| Plane choice per packet by **policy** (hash / weighted / health-aware) | `srv6_fabric/policy.py` |
-| Many concurrent flows in one test run | `srv6_fabric/runner.py` |
-| Per-flow reorder distance measurement at receiver | `srv6_fabric/reorder.py` |
-| Plane failure injection (loss, delay, blackhole) | `topologies/<name>/scenarios/*.yaml` driving `tc netem` via `srv6_fabric/netem.py` |
+| One logical flow → many planes (spray) | `srv6_mrc/cli/spray.py` (CLI: `spray`) |
+| Plane choice per packet by **policy** (hash / weighted / health-aware) | `srv6_mrc/policy.py` |
+| Many concurrent flows in one test run | `srv6_mrc/runner.py` |
+| Per-flow reorder distance measurement at receiver | `srv6_mrc/reorder.py` |
+| Plane failure injection (loss, delay, blackhole) | `topologies/<name>/scenarios/*.yaml` driving `tc netem` via `srv6_mrc/netem.py` |
 | Plane-health signal from fabric → host | EV Probes + receiver loss feedback (see *Detection & re-spray* below) |
-| Run orchestration (start recv on N hosts, drive senders, collect) | `srv6_fabric/mrc/run.py` (CLI: `run-scenario`) |
-| Result collection / per-scenario reports | `srv6_fabric/report.py` |
+| Run orchestration (start recv on N hosts, drive senders, collect) | `srv6_mrc/mrc/run.py` (CLI: `run-scenario`) |
+| Result collection / per-scenario reports | `srv6_mrc/report.py` |
 
 ## Module layout
 
 ```
-srv6_fabric/
+srv6_mrc/
 ├── topo.py              # fabric constants + addressing (reads topo.yaml)
 ├── policy.py            # SprayPolicy: round_robin | hash5tuple | weighted
 │                        # | ev_spray | health_aware_mrc
@@ -155,7 +155,7 @@ veth is the cleanest place because
 4. Trivially reversible: `tc qdisc del`.
 
 Injection runs on the **container host**, not inside the container, because
-`tc` on a veth peer needs root in the host netns. `srv6_fabric/netem.py` shells
+`tc` on a veth peer needs root in the host netns. `srv6_mrc/netem.py` shells
 out to `ip netns` and `tc` via `docker inspect`-resolved netns paths, with
 the same per-plane mapping the senders already use.
 
@@ -202,7 +202,7 @@ over plain UDP/SRv6.
 **1. EV Probes (active, OCP-faithful).** Every `probe_interval_ms` the
 sender emits one `PROBE` packet per `(tenant, plane, path)` EV — i.e.
 `NUM_PLANES × NUM_SPINES` probes per round on the 4p-8x16 lab (32
-probes/round). Each probe is built via `srv6_fabric.encap.build_outer_packet`
+probes/round). Each probe is built via `srv6_mrc.encap.build_outer_packet`
 and emitted on a plane-bound raw socket — the same code path the
 EV-spray data plane uses. The receiver echoes a `PROBE_REPLY`
 immediately, on the same `(plane, path)` the inbound PROBE arrived on.
@@ -345,7 +345,7 @@ mrc:
 | `min_active_evs` | `max(1, num_planes // 2)` | Floor matching OCP's `ev_min_active`. On 4 planes this is 2. |
 | `rtt_ring_size` | `128` | RTT samples retained per plane for diagnostics (no policy effect today). |
 
-Validation lives in `srv6_fabric/mrc/scenario.py` (`_validate_mrc`):
+Validation lives in `srv6_mrc/mrc/scenario.py` (`_validate_mrc`):
 unknown subkeys, negative or zero ints, out-of-range loss ratios, and
 booleans-where-ints-expected all raise `ScenarioError` at load time.
 The orchestrator serialises only the *set* fields into
@@ -372,7 +372,7 @@ sendto). MRC adds:
   consulted by the `health_aware_mrc` policy on every `pick()`.
 
 All probe / reply / loss-report I/O goes through `MrcTransport`
-(`srv6_fabric/mrc/transport.py`). There is no socket creation in the
+(`srv6_mrc/mrc/transport.py`). There is no socket creation in the
 agent itself; constructing a different transport is how the unit
 tests run agents end-to-end on loopback without root or SRv6.
 
@@ -433,18 +433,18 @@ It does **not** speak to SONiC at all. Everything MRC-level is host-side.
 | Item | Status |
 |---|---|
 | Design doc (this file) | done |
-| `srv6_fabric/topo.py`, `policy.py`, `reorder.py` | done |
-| `srv6_fabric/runner.py` (send/recv core; `spray` is a thin CLI shim) | done |
-| `srv6_fabric/encap.py` (shared raw-socket outer-packet builder) | done |
-| `srv6_fabric/netem.py` | done |
-| `srv6_fabric/mrc/run.py` orchestrator (CLI: `run-scenario`) | done |
+| `srv6_mrc/topo.py`, `policy.py`, `reorder.py` | done |
+| `srv6_mrc/runner.py` (send/recv core; `spray` is a thin CLI shim) | done |
+| `srv6_mrc/encap.py` (shared raw-socket outer-packet builder) | done |
+| `srv6_mrc/netem.py` | done |
+| `srv6_mrc/mrc/run.py` orchestrator (CLI: `run-scenario`) | done |
 | `topologies/4p-8x16/scenarios/green-mrc-baseline.yaml` (smoke test) | done |
 | `topologies/4p-8x16/scenarios/yellow-baseline.yaml` | done |
 | `topologies/4p-8x16/scenarios/green-mrc-plane-{loss,latency}.yaml` | done |
 | Yellow fault scenarios: `yellow-plane-{loss,blackhole,latency}.yaml` | TODO |
-| `srv6_fabric/mrc/ev_state.py` EVStateTable + state machine | done |
-| `srv6_fabric/mrc/probe.py` PROBE / PROBE_REPLY / LOSS_REPORT wire format | done |
-| `srv6_fabric/policy.py` `health_aware_mrc` wired to EVStateTable | done |
+| `srv6_mrc/mrc/ev_state.py` EVStateTable + state machine | done |
+| `srv6_mrc/mrc/probe.py` PROBE / PROBE_REPLY / LOSS_REPORT wire format | done |
+| `srv6_mrc/policy.py` `health_aware_mrc` wired to EVStateTable | done |
 | Sender agent: probe emit + RX demux + state mutation (`mrc/agent.py` `SenderMrcAgent`) | done |
 | Receiver agent: probe-reply emit + LOSS_REPORT emit (`mrc/agent.py` `ReceiverMrcAgent`) | done |
 | Scenario YAML schema: `mrc:` block (enabled + tunables) | done |

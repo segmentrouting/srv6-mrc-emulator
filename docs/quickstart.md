@@ -144,7 +144,7 @@ on `lo`. The kernel `seg6 encap` route below targets the *peer*'s
 anycast, which is not locally assigned, so the encap path works. The
 spray / MRC data and control paths bypass kernel `seg6 encap` routes
 entirely as of Phase 1b — they build the outer in user space via
-`srv6_fabric/encap.py` (`build_outer_packet`). The manual route below
+`srv6_mrc/encap.py` (`build_outer_packet`). The manual route below
 is kept as a debugging fallback so simple `ping`/`tcpdump` flows still
 exercise SRv6 encap.
 
@@ -209,9 +209,9 @@ See *`routes --help`* for `delete -f`, `delete --all`, and `list` subcommands.
 
 ### Spray a flow across all 4 planes (MRC demo)
 
-`spray` (source: `srv6_fabric/cli/spray.py`) is a userspace SRv6/uSID packet generator that splits a single logical flow round-robin across all 4 fabric planes — the **MRC/SRv6** model as described [Here](https://cdn.openai.com/pdf/resilient-ai-supercomputer-networking-using-mrc-and-srv6.pdf).
+`spray` (source: `srv6_mrc/cli/spray.py`) is a userspace SRv6/uSID packet generator that splits a single logical flow round-robin across all 4 fabric planes — the **MRC/SRv6** model as described [Here](https://cdn.openai.com/pdf/resilient-ai-supercomputer-networking-using-mrc-and-srv6.pdf).
 
-The `spray` CLI runs inside the Alpine host containers using a scapy-equipped image (`alpine-srv6-scapy:1.0`, built from `host-image/Dockerfile`). The `srv6_fabric` package is pip-installed into the image at build time, so `spray` lives at `/usr/local/bin/spray` inside every host. The image also bakes the matching `topo.yaml` at `/etc/srv6_fabric/topo.yaml` and exports `SRV6_TOPO`. No bind mounts are needed at runtime; rebuild the image (`make image`) when the package or `topo.yaml` changes.
+The `spray` CLI runs inside the Alpine host containers using a scapy-equipped image (`alpine-srv6-scapy:1.0`, built from `host-image/Dockerfile`). The `srv6_mrc` package is pip-installed into the image at build time, so `spray` lives at `/usr/local/bin/spray` inside every host. The image also bakes the matching `topo.yaml` at `/etc/srv6_mrc/topo.yaml` and exports `SRV6_TOPO`. No bind mounts are needed at runtime; rebuild the image (`make image`) when the package or `topo.yaml` changes.
 
 
 Start the receiver on the destination host (sniffs all 4 NICs):

@@ -54,7 +54,7 @@ For detail on multi-tenant design for SRv6 AI factories see [`docs/design-multi-
 ## Layout
 
 ```
-srv6_fabric/           Python package: topology constants, runtime libs
+srv6_mrc/           Python package: topology constants, runtime libs
   topo.py              fabric dimensions + addressing helpers (reads topo.yaml)
   runner.py            spray sender/receiver core
   encap.py             shared raw-socket SRv6 outer-packet builder
@@ -95,12 +95,12 @@ topologies/
     README.md          per-topology design notes
 
 host-image/
-  Dockerfile           alpine + scapy + pip-installed srv6_fabric
+  Dockerfile           alpine + scapy + pip-installed srv6_mrc
 
 scripts/
   config.sh            push config_db.json + frr.conf into containers
 
-tests/                 unittest mirror of srv6_fabric/ layout
+tests/                 unittest mirror of srv6_mrc/ layout
 docs/                  consolidated design + runbook documentation
 results/               scenario JSON output (gitignored)
 ```
@@ -120,7 +120,7 @@ results/               scenario JSON output (gitignored)
 # 0. install Python deps for the controller side
 pip install -e '.[dev]'
 
-# 1. build the host image (alpine + scapy + srv6_fabric)
+# 1. build the host image (alpine + scapy + srv6_mrc)
 #    One image (alpine-srv6-scapy:1.0) serves every topology;
 #    topo.yaml is bind-mounted into containers at runtime.
 make image
@@ -178,7 +178,7 @@ make TOPO=2p-4x8 scenario SCEN=yellow-baseline
 (`alpine-srv6-scapy:1.0`) serves every topology, because each variant's
 `topo.yaml` is bind-mounted into its host containers at runtime (via
 the generated `topology.clab.yaml`). Inside a container, the runtime
-reads `SRV6_TOPO=/etc/srv6_fabric/topo.yaml`. Outside containers (lab
+reads `SRV6_TOPO=/etc/srv6_mrc/topo.yaml`. Outside containers (lab
 host, dev box), it reads `topologies/<name>/topo.yaml` relative to the
 repo root, picking the active variant from `TOPO=`.
 

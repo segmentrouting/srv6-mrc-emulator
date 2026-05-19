@@ -1,6 +1,6 @@
 import unittest
 
-from srv6_fabric import topo
+from srv6_mrc import topo
 
 
 class TestTopoConstants(unittest.TestCase):
@@ -12,7 +12,7 @@ class TestTopoConstants(unittest.TestCase):
         self.assertEqual(topo.SPRAY_PORT, 9999)
 
     def test_reference_pairs_match_spray(self):
-        # Must match the `spray` reference-pairs map (srv6_fabric.cli.spray)
+        # Must match the `spray` reference-pairs map (srv6_mrc.cli.spray)
         # and routes.py:REFERENCE_PAIRS_SPINES exactly. If you change one,
         # change them all.
         expected = {
@@ -406,7 +406,7 @@ class TestSelectSpinesForAddrs(unittest.TestCase):
         # Compute in a subprocess with a different PYTHONHASHSEED.
         out = subprocess.check_output([
             sys.executable, "-c",
-            "from srv6_fabric.topo import select_spines_for_addrs; "
+            "from srv6_mrc.topo import select_spines_for_addrs; "
             "import json; "
             "print(json.dumps(list(select_spines_for_addrs("
             "'2001:db8:bbbb::2','2001:db8:bbbb:f::2',4))))"

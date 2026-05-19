@@ -1,4 +1,4 @@
-"""Unit tests for srv6_fabric (topo, policy, reorder, ...).
+"""Unit tests for srv6_mrc (topo, policy, reorder, ...).
 
 Run from this directory:
     python3 -m unittest discover -s tests -v
