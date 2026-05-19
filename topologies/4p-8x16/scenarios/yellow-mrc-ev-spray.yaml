@@ -58,7 +58,7 @@ paths_per_plane: 8
 flows:
   - pairs: yellow-pairs-8
     policy: health_aware_mrc
-    rate: 1000pps
+    rate: 500pps
     duration: 60s
 
 faults: []

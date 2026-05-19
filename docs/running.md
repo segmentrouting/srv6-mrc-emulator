@@ -114,21 +114,84 @@ docker exec <host> tc qdisc del dev <nic> root
 
 ## Bundled scenarios
 
-Under `topologies/4p-8x16/scenarios/`:
+All scenarios live in `topologies/4p-8x16/scenarios/`. They split into
+five families based on what part of the system they exercise; the
+"Spray policy" column is the key axis (it picks how packets fan out;
+everything else is window-dressing on top).
 
-| Scenario | Purpose | Expect |
-|---|---|---|
-| `baseline.yaml` | All planes healthy, 8 well-known pairs | loss% ≈ 0, modest reord from per-plane jitter |
-| `hash5tuple.yaml` | Single-plane pinning per flow | per-plane unbalanced, reord = 0 |
-| `plane-latency.yaml` | +N ms on one plane | loss% ≈ 0, reord and reord_max ↑↑ |
-| `plane-loss.yaml` | 5% random loss on one plane | loss% ≈ (plane_loss% / 4), modest reord |
-| `plane-blackhole.yaml` | 100% drop on one plane | loss% ≈ 25%, target plane shows rx=0, reord ↓ |
-| `green-ev-spray.yaml` | EV-spray full fan-out (4 planes * 8 spines) | balanced across all 32 EVs in `per_ev_sent` |
-| `green-ev-spray-n2.yaml` | EV-spray narrow (4 planes * 2 spines) | per-pair tcpdump alternates between 2 spine hextets |
-| `yellow-ev-spray.yaml` | Yellow EV-spray, full fan-out | balanced 32 EVs; validates yellow's 2-uSID outer survives per-packet spine rotation |
-| `yellow-ev-spray-n2.yaml` | Yellow EV-spray, narrow (4 planes * 2 spines) | per-pair host-side decap stays clean across both spine choices |
+Quick-pick guide:
 
-See each `.yaml` for the exact flow list, rates, and netem specs.
+- **First time? Or smoke test after a redeploy:** `baseline` (green)
+  / `yellow-baseline`. Confirms the fabric is alive.
+- **EV-spray data path (no health feedback):** `green-ev-spray` or
+  `yellow-ev-spray`. Validates the per-packet outer-SID rotation
+  hits all 32 entropy values without MRC in the loop.
+- **MRC end-to-end (per-plane only):** `green-mrc-baseline` /
+  `yellow-mrc-baseline`. Smallest scenario that actually runs the
+  EV-state machine and loss feedback loop.
+- **MRC end-to-end (full per-EV granularity, phase 1b step 2):**
+  `green-mrc-ev-spray` / `yellow-mrc-ev-spray`. Demote a single
+  (plane, path) cell, not a whole plane.
+- **Failure injection with netem (programmatic, no manual `ip link`):**
+  the `*-plane-loss` / `*-plane-latency` / `plane-blackhole`
+  scenarios use `tc qdisc add` on a chosen plane's veth.
+
+| Scenario | Family | Tenant | Spray policy | `paths_per_plane` | MRC | Faults | Expect |
+|---|---|---|---|---|---|---|---|
+| `baseline.yaml` | smoke | green | `hash5tuple` (default) | n/a | off | none | loss≈0, modest reord from per-plane jitter |
+| `yellow-baseline.yaml` | smoke | yellow | `hash5tuple` | n/a | off | none | as above on the host-decap data path |
+| `hash5tuple.yaml` | smoke | green | `hash5tuple` (explicit) | n/a | off | none | each flow pins a single plane; reord = 0 |
+| `plane-latency.yaml` | static fault | green | `hash5tuple` | n/a | off | netem delay on one plane | loss≈0, `reord_max` ↑↑ |
+| `plane-loss.yaml` | static fault | green | `hash5tuple` | n/a | off | 5% random loss on one plane | loss≈(plane_loss% / 4), modest reord |
+| `plane-blackhole.yaml` | static fault | green | `hash5tuple` | n/a | off | 100% drop on one plane | loss≈25%, target plane rx=0, reord ↓ |
+| `green-ev-spray.yaml` | EV-spray | green | `ev_spray` | 8 | off | none | balanced across all 32 EVs in `per_ev_sent` |
+| `green-ev-spray-n2.yaml` | EV-spray | green | `ev_spray` | 2 | off | none | per-pair tcpdump alternates between 2 spine hextets |
+| `yellow-ev-spray.yaml` | EV-spray | yellow | `ev_spray` | 8 | off | none | balanced 32 EVs; validates yellow's 2-uSID outer rotates correctly |
+| `yellow-ev-spray-n2.yaml` | EV-spray | yellow | `ev_spray` | 2 | off | none | host-side decap stays clean across both spine choices |
+| `green-mrc-baseline.yaml` | MRC plane-coarse | green | `health_aware_mrc` | 1 (default) | on | none | EV table = 4 cells all GOOD; no-op on clean fabric |
+| `yellow-mrc-baseline.yaml` | MRC plane-coarse | yellow | `health_aware_mrc` | 1 (default) | on | none | as above; also exercises Phase 1a collapsed rx socket |
+| `green-mrc-plane-loss.yaml` | MRC plane-coarse | green | `health_aware_mrc` | 1 | on | netem loss on one plane | EV table demotes the affected plane → ASSUMED_BAD; loss% drops post-demote |
+| `yellow-mrc-plane-loss.yaml` | MRC plane-coarse | yellow | `health_aware_mrc` | 1 | on | netem loss on one plane | as above on host-decap path |
+| `green-mrc-plane-latency.yaml` | MRC plane-coarse | green | `health_aware_mrc` | 1 | on | netem delay on one plane | RTT p99 climbs on affected plane; latency-based signal only (no demote unless config tuned) |
+| `yellow-mrc-plane-latency.yaml` | MRC plane-coarse | yellow | `health_aware_mrc` | 1 | on | netem delay on one plane | as above |
+| `green-mrc-ev-spray.yaml` | MRC per-EV | green | `health_aware_mrc` | 8 | on | none (manual link-shut recommended) | exercises phase 1b step 2: per-EV `seen/sent` accounting; demote a single (plane, path) cell |
+| `yellow-mrc-ev-spray.yaml` | MRC per-EV | yellow | `health_aware_mrc` | 8 | on | none (manual link-shut recommended) | as above on host-decap path |
+
+Spray-policy cheatsheet:
+
+- `hash5tuple` — pin each flow to one plane by 5-tuple hash. No
+  spraying inside a flow. Good for smoke tests; pinpoints whether
+  the data path itself works.
+- `ev_spray` — rotate plane *and* spine every packet. Pure data-
+  plane fan-out across `4 * paths_per_plane` entropy values. No
+  health awareness; broken EVs keep getting traffic.
+- `health_aware_mrc` — same per-packet rotation as `ev_spray`, but
+  the weight grid is driven by the EV state machine. Broken EVs
+  drop to weight 0; survivors absorb the slack. This is the policy
+  that actually consumes MRC loss feedback and probe RTT.
+
+Family cheatsheet:
+
+- **smoke** — clean fabric, simple policy. If this is broken,
+  nothing else will work; start here after every redeploy.
+- **static fault** — netem on one plane, no MRC. Validates the
+  fabric handles a degraded plane gracefully when the spray policy
+  is health-blind. Establishes a "without MRC" reference number.
+- **EV-spray** — per-packet plane+spine rotation, no MRC. Validates
+  the 32-EV fan-out plumbing (outer SID rebuild, yellow's second
+  uSID, hash-derived spine subsets when `paths_per_plane < N`).
+- **MRC plane-coarse** — MRC on, `paths_per_plane=1`. Each plane is
+  a single EV from the policy's perspective. Tests pre-Phase-1b
+  loss/probe semantics; useful regression baseline.
+- **MRC per-EV** — MRC on, `paths_per_plane=8`. Each plane is 8
+  independent EVs. Tests phase 1b step 2: per-EV `(plane, path)`
+  loss attribution, per-EV demote, surviving siblings absorbing the
+  load. Manual link shut on `p<P>-spine<S>` is the recommended
+  failure: it maps to exactly 1/32 of the EV grid.
+
+Run any scenario with `sudo make scenario SCEN=<name>` (drop the
+`.yaml` suffix). See each file for the exact flow list, rates, and
+netem specs.
 
 ### Spraying with EV-spray
 
