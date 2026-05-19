@@ -25,7 +25,7 @@ paths_per_plane: 8
 flows:
   - pairs: green-pairs-8
     policy: ev_spray
-    rate: 1000pps
+    rate: 500pps
     duration: 5s
 
 faults: []

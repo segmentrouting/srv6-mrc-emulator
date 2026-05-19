@@ -1,82 +1,12 @@
 # Running MRC
 
-Practical guide for running MRC scenarios and tests against a deployed
-4-plane fabric. For *what* MRC is and the design rationale, see
-`design-mrc.md`. For *how to read* the resulting JSON / ASCII reports,
-see `results-format.md`.
-
 All commands below assume you are at the repo root with the fabric
-already deployed (`make deploy`).
+already deployed and configured  (`make deploy && make config`).
 
-## Unit tests
 
-Pure-Python, stdlib unittest, no network or container access needed.
-Run from the repo root:
+### Running scenarios
 
-```bash
-make test
-# or directly:
-PYTHONPATH=. python3 -m unittest discover -s tests -t .
-```
-
-Expected: 367 tests pass in ~1.5s. Use this as a fast smoke check
-after any edit to `srv6_mrc/*` or `srv6_mrc/cli/spray.py`.
-
-To run a single test module or case:
-
-```bash
-PYTHONPATH=. python3 -m unittest tests.test_report
-PYTHONPATH=. python3 -m unittest tests.test_report.TestMatchingHappyPath
-PYTHONPATH=. python3 -m unittest tests.test_report.TestMatchingHappyPath.test_single_flow_matched
-```
-
-## Manual two-host spray (no orchestrator)
-
-Useful for ad-hoc debugging or sanity-checking a single host pair. Two
-terminals on the lab host.
-
-**Receiver** (start first; self-exits after `--idle-timeout`):
-
-```bash
-docker exec green-host15 spray --role recv --idle-timeout 6s
-```
-
-**Sender** (start after the receiver banner appears, ~1s settle):
-
-```bash
-docker exec green-host00 spray --role send \
-    --dst-id 15 --rate 1000pps --duration 5s
-```
-
-Add `--json` to either side for machine-readable output (pipe through
-`jq .` to validate).
-
-Pick a different spray policy with `--policy`:
-
-```bash
-docker exec green-host00 spray --role send \
-    --dst-id 15 --rate 1000pps --duration 5s --policy hash5tuple
-```
-
-With `hash5tuple` a single flow pins to a single plane — per-plane
-sent counts will be unbalanced and `reord` should be 0.
-
-## Scenario orchestrator
-
-`run-scenario` (`srv6_mrc/mrc/run.py`) reads a YAML scenario, spawns
-receivers, runs senders in parallel via `docker exec`, applies/reverts
-`tc netem` faults, merges results, and renders an ASCII + JSON report.
-
-**Dry run** (parses YAML, prints planned flows and netem argvs, no
-containers touched):
-
-```bash
-run-scenario topologies/4p-8x16/scenarios/green-mrc-baseline.yaml --dry-run
-# or via make:
-make scenario SCEN=green-mrc-baseline   # add --dry-run by editing the Makefile target
-```
-
-**Real run**:
+#### Baseline
 
 ```bash
 run-scenario topologies/4p-8x16/scenarios/green-mrc-baseline.yaml \

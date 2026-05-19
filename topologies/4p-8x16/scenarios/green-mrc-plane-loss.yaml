@@ -33,7 +33,7 @@ flows:
   - pairs:
       - { tenant: green, src: 0, dst: 15 }
     policy: health_aware_mrc
-    rate: 2000pps
+    rate: 500pps
     duration: 8s
 
 faults:

@@ -23,7 +23,7 @@ description: |
 flows:
   - pairs: green-pairs-8
     policy: health_aware_mrc
-    rate: 1000pps
+    rate: 500pps
     duration: 5s
 
 faults: []

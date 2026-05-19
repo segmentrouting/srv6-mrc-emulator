@@ -214,3 +214,14 @@ This lab models one cluster. The generator's plane-block prefix is
 parameterized in `plane_block_prefix(plane)` — adding a `CLUSTER_ID` offset
 is a one-line change if you want to spin up a second lab cluster on the same
 host without address overlap.
+
+### Validate SRv6 static SID count per node
+```bash
+for p in 0 1 2 3; do
+  for l in $(seq -w 0 15); do
+    n=$(docker exec p${p}-leaf${l} ip -6 route show table all 2>/dev/null | grep -cE "seg6local|End\.")
+    printf "p%s-leaf%s: %s   " "$p" "$l" "$n"
+  done
+  echo
+done
+```
