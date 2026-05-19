@@ -144,14 +144,14 @@ make config
 make host-routes
 
 # 6. run a traffic scenario (spray + per-plane stats + reorder histograms)
-make scenario SCEN=baseline           # green tenant, no faults
-make scenario SCEN=yellow-baseline    # yellow tenant, no faults
+make scenario SCEN=green-mrc-baseline      # green tenant, MRC enabled, no faults
+make scenario SCEN=yellow-baseline         # yellow tenant, round_robin, no faults
 
-# roadmap traffic scenarios
-make scenario SCEN=plane-loss         # 1% loss on plane 2
-make scenario SCEN=plane-blackhole    # plane 2 unreachable
-make scenario SCEN=plane-latency      # plane 2 +5ms one-way
-make scenario SCEN=hash5tuple         # per-flow hash spraying
+# MRC scenarios
+make scenario SCEN=green-mrc-plane-loss        # 1% loss on plane 2 (green, MRC)
+make scenario SCEN=green-mrc-plane-latency     # plane 2 +5ms (green, MRC)
+make scenario SCEN=green-mrc-ev-spray          # per-EV sender control (green, MRC)
+make scenario SCEN=yellow-mrc-ev-spray         # per-EV sender control (yellow, MRC)
 ```
 
 Ad-hoc diagnostics:
@@ -173,7 +173,7 @@ existing 2-plane variant:
 
 ```bash
 make TOPO=2p-4x8 regen deploy config host-routes
-make TOPO=2p-4x8 scenario SCEN=baseline
+make TOPO=2p-4x8 scenario SCEN=yellow-baseline
 ```
 
 `make image` only needs to run once -- the same host image

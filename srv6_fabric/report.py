@@ -101,11 +101,57 @@ class FlowRow:
 
 # --- top-level report -------------------------------------------------------
 
+
+def _missing_evs(
+    per_ev_sent: dict[str, int],
+    topology_dims: tuple[int, int],
+) -> list[tuple[int, int]]:
+    """Enumerate EVs in the topology that received zero packets.
+
+    Keys in `per_ev_sent` are in the canonical form "P<plane>:S<spine>"
+    (see SenderResult.to_dict). topology_dims is (num_planes, paths_per_plane).
+    Returns a sorted list of (plane, path) tuples for any EV in the
+    full grid that does NOT appear (with count > 0) in per_ev_sent.
+    """
+    num_planes, paths_per_plane = topology_dims
+    used: set[tuple[int, int]] = set()
+    for k, n in per_ev_sent.items():
+        if n <= 0:
+            continue
+        # Tolerate malformed keys rather than crashing the renderer.
+        try:
+            p_part, s_part = k.split(":", 1)
+            p = int(p_part.lstrip("P"))
+            s = int(s_part.lstrip("S"))
+        except (ValueError, AttributeError):
+            continue
+        used.add((p, s))
+    missing = [
+        (p, s)
+        for p in range(num_planes)
+        for s in range(paths_per_plane)
+        if (p, s) not in used
+    ]
+    return missing
+
+
 @dataclass
 class ScenarioReport:
     scenario: str
     flows: list[FlowRow] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # (num_planes, paths_per_plane) for this scenario's topology. Used
+    # by render_ascii to show the per-flow "evs used/expected" column
+    # and to list any unused EVs. None when unknown (legacy callers /
+    # tests that don't care).
+    topology_dims: tuple[int, int] | None = None
+
+    @property
+    def expected_evs(self) -> int | None:
+        if self.topology_dims is None:
+            return None
+        p, s = self.topology_dims
+        return p * s
 
     # ----- construction ---------------------------------------------------
 
@@ -113,18 +159,23 @@ class ScenarioReport:
     def from_records(cls,
                      scenario_name: str,
                      sender_records: list[dict],
-                     receiver_records: list[dict]) -> "ScenarioReport":
+                     receiver_records: list[dict],
+                     topology_dims: tuple[int, int] | None = None,
+                     ) -> "ScenarioReport":
         """Merge raw JSON records into a ScenarioReport.
 
         sender_records: list of dicts from `SenderResult.to_dict()`
         receiver_records: list of dicts from `run_receiver(...)`
+        topology_dims: (num_planes, paths_per_plane) for this scenario.
+            Renderer uses this to show the per-flow "used/expected" EV
+            count and to list any unused EVs by index.
 
         Matching strategy (see module docstring): by host names from the
         sender side, and by inner IPv6 addresses on the receiver side
         (FlowStats keys flows by `(src, dst, sport, dport)` where src/dst
         are IPv6 strings).
         """
-        report = cls(scenario=scenario_name)
+        report = cls(scenario=scenario_name, topology_dims=topology_dims)
 
         # Build dst_host -> receiver record map for O(1) lookup.
         recv_by_host: dict[str, dict] = {}
@@ -282,7 +333,7 @@ class ScenarioReport:
 
         hdr = (f"  {'flow':<30}  {'policy':<14} "
                f"{'sent':>6} {'rx':>6} {'loss%':>7} "
-               f"{'reord':>6} {'max':>4}")
+               f"{'reord':>6} {'max':>4} {'evs':>7}")
         lines.append(hdr)
         lines.append("  " + "-" * (len(hdr) - 2))
 
@@ -293,11 +344,31 @@ class ScenarioReport:
             max_str = "-" if f.reorder_max is None else str(f.reorder_max)
             lp = f.loss_pct()
             loss_str = "-" if lp is None else f"{lp:.2f}%"
+            # EV column: "used/expected" when this flow is EV-aware AND
+            # we know the topology denominator; "used" when EV-aware but
+            # denominator unknown; "-" for non-EV policies.
+            used = len(f.per_ev_sent)
+            if used == 0:
+                evs_str = "-"
+            elif self.expected_evs is None:
+                evs_str = str(used)
+            else:
+                evs_str = f"{used}/{self.expected_evs}"
             lines.append(
                 f"  {flow_label:<30}  {f.policy:<14} "
                 f"{f.sent:>6} {rx_str:>6} {loss_str:>7} "
-                f"{reord_str:>6} {max_str:>4}"
+                f"{reord_str:>6} {max_str:>4} {evs_str:>7}"
             )
+            # When EV-aware and we know the denominator, list any EVs
+            # the sender never selected. Common cause: the EV was
+            # demoted to assumed_bad by the MRC agent.
+            if (used > 0
+                    and self.expected_evs is not None
+                    and used < self.expected_evs):
+                assert self.topology_dims is not None
+                missing = _missing_evs(f.per_ev_sent, self.topology_dims)
+                if missing:
+                    lines.append(f"      ! unused EVs: {missing}")
             for note in f.notes:
                 lines.append(f"      ! {note}")
 

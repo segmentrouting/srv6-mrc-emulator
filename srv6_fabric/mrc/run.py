@@ -17,9 +17,9 @@ Drives a single MRC experiment end-to-end:
     7. Print ASCII summary; optionally write JSON to `report.out`.
 
 Run:
-    python3 -m mrc.run scenarios/baseline.yaml
-    python3 -m mrc.run scenarios/plane-loss.yaml --dry-run
-    python3 -m mrc.run scenarios/baseline.yaml --report out.json
+    python3 -m mrc.run scenarios/green-mrc-baseline.yaml
+    python3 -m mrc.run scenarios/green-mrc-plane-loss.yaml --dry-run
+    python3 -m mrc.run scenarios/green-mrc-baseline.yaml --report out.json
 
 This file is *not* designed to be imported by the host containers — it runs
 on the docker host (no scapy required, no raw sockets used here).
@@ -476,8 +476,14 @@ def run_scenario(scenario: Scenario, *,
         except Exception as e:
             print(f"  ! revert failed: {e}", file=sys.stderr)
 
+    paths_per_plane = (
+        scenario.paths_per_plane
+        if scenario.paths_per_plane is not None
+        else NUM_SPINES
+    )
     return ScenarioReport.from_records(
         scenario.name, sender_records, receiver_records,
+        topology_dims=(NUM_PLANES, paths_per_plane),
     )
 
 

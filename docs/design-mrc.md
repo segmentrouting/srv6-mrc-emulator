@@ -438,9 +438,9 @@ It does **not** speak to SONiC at all. Everything MRC-level is host-side.
 | `srv6_fabric/encap.py` (shared raw-socket outer-packet builder) | done |
 | `srv6_fabric/netem.py` | done |
 | `srv6_fabric/mrc/run.py` orchestrator (CLI: `run-scenario`) | done |
-| `topologies/4p-8x16/scenarios/baseline.yaml` (smoke test) | done |
+| `topologies/4p-8x16/scenarios/green-mrc-baseline.yaml` (smoke test) | done |
 | `topologies/4p-8x16/scenarios/yellow-baseline.yaml` | done |
-| `topologies/4p-8x16/scenarios/plane-{loss,blackhole,latency}.yaml` (green) | done |
+| `topologies/4p-8x16/scenarios/green-mrc-plane-{loss,latency}.yaml` | done |
 | Yellow fault scenarios: `yellow-plane-{loss,blackhole,latency}.yaml` | TODO |
 | `srv6_fabric/mrc/ev_state.py` EVStateTable + state machine | done |
 | `srv6_fabric/mrc/probe.py` PROBE / PROBE_REPLY / LOSS_REPORT wire format | done |

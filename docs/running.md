@@ -71,25 +71,25 @@ receivers, runs senders in parallel via `docker exec`, applies/reverts
 containers touched):
 
 ```bash
-run-scenario topologies/4p-8x16/scenarios/baseline.yaml --dry-run
+run-scenario topologies/4p-8x16/scenarios/green-mrc-baseline.yaml --dry-run
 # or via make:
-make scenario SCEN=baseline   # add --dry-run by editing the Makefile target
+make scenario SCEN=green-mrc-baseline   # add --dry-run by editing the Makefile target
 ```
 
 **Real run**:
 
 ```bash
-run-scenario topologies/4p-8x16/scenarios/baseline.yaml \
-    --report results/baseline.json
+run-scenario topologies/4p-8x16/scenarios/green-mrc-baseline.yaml \
+    --report results/green-mrc-baseline.json
 # or:
-make scenario SCEN=baseline
+make scenario SCEN=green-mrc-baseline
 ```
 
 Scenarios that inject faults need `sudo` because `tc netem` is applied
 via `nsenter` into container network namespaces:
 
 ```bash
-sudo run-scenario topologies/4p-8x16/scenarios/plane-loss.yaml \
+sudo run-scenario topologies/4p-8x16/scenarios/green-mrc-plane-loss.yaml \
     --report results/plane-loss.json
 ```
 
@@ -207,7 +207,7 @@ Two ways to enable it:
 # 1. Scenario YAML (preferred): top-level paths_per_plane + ev_spray
 #    in the flow's policy field.
 sudo make scenario SCEN=green-ev-spray         # N=8, full fan-out
-sudo make scenario SCEN=green-ev-spray-n2      # N=2, easier to eyeball
+sudo make scenario SCEN=green-ev-spray         # N=8, full fan-out (use this; -n2 variant has been retired)
 
 # 2. Manual two-host spray (no orchestrator). Start the receiver
 #    first (see "Manual two-host spray" above), then:
@@ -400,9 +400,9 @@ through these in order — each step gates the next:
 4. Manual two-host spray (above) — fabric carries packets
 5. Same with `--json` — receiver schema parses
 6. Same with `--policy hash5tuple` — policy plumbing works
-7. `run-scenario topologies/4p-8x16/scenarios/baseline.yaml --dry-run`
+7. `run-scenario topologies/4p-8x16/scenarios/green-mrc-baseline.yaml --dry-run`
    — scenario parses
-8. `make scenario SCEN=baseline` — orchestrator + merge + render pipeline works
+8. `make scenario SCEN=green-mrc-baseline` — orchestrator + merge + render pipeline works
 9. Three fault scenarios in order — netem inject + revert works
 10. `make scenario SCEN=green-mrc-baseline` — MRC enabled, clean fabric,
     should look like step 8's output
@@ -522,9 +522,9 @@ make scenario SCEN=yellow-mrc-plane-loss
 Compare against the round-robin reference:
 
 ```bash
-sudo make scenario SCEN=plane-loss     # round-robin baseline (already green-validated)
+sudo make scenario SCEN=green-mrc-plane-loss     # MRC variant (was previously plane-loss round_robin)
 jq '.flows[0].per_plane_sent, .flows[0].per_plane_loss, .flows[0].loss' \
-    results/plane-loss.json results/yellow-mrc-plane-loss.json
+    results/green-mrc-plane-loss.json results/yellow-mrc-plane-loss.json
 ```
 
 Expected (matching `green-mrc-plane-loss` semantics):
@@ -580,12 +580,12 @@ Dry run
 ```bash
 SRV6_TOPO=topologies/4p-8x16/topo.yaml \
   python3 -m srv6_fabric.mrc.run \
-  topologies/4p-8x16/scenarios/yellow-ev-spray-n2.yaml --dry-run --verbose
+  topologies/4p-8x16/scenarios/yellow-ev-spray.yaml --dry-run --verbose
 ```
 
 2 spine fabric slice:
 ```bash
-sudo make scenario SCEN=yellow-ev-spray-n2
+sudo make scenario SCEN=yellow-ev-spray
 ```
 
 Filtered:

@@ -293,8 +293,8 @@ veths, runs `spray` send/recv inside the relevant containers via
 `docker exec`, and merges the JSON output into a `ScenarioReport`.
 
 ```
-run-scenario topologies/4p-8x16/scenarios/baseline.yaml --verbose
-run-scenario topologies/4p-8x16/scenarios/plane-loss.yaml --dry-run
+run-scenario topologies/4p-8x16/scenarios/green-mrc-baseline.yaml --verbose
+run-scenario topologies/4p-8x16/scenarios/green-mrc-plane-loss.yaml --dry-run
 ```
 
 `--dry-run` prints the plan plus the exact `nsenter ... tc qdisc add ...`
@@ -429,7 +429,7 @@ its model — ping with `-I eth<N>` to force outbound plane — couldn't verify
 the return path: ICMPv6 replies bypass any plane affinity (the kernel just
 picks the lowest-metric route to the source's anycast address), so planes
 1..N-1 always reported FAIL. End-to-end verification is now via
-`make scenario SCEN=baseline`, which uses spray (sender-side plane
+`make scenario SCEN=green-mrc-baseline`, which uses spray (sender-side plane
 selection via SO_BINDTODEVICE) and measures per-plane stats at the receiver.
 
 ## Test command (run from repo root)
@@ -495,8 +495,8 @@ make regen                                                   # generate topo + c
 make deploy                                                  # containerlab deploy
 make config                                                  # push SONiC configs (auto-verifies + repairs)
 make host-routes                                             # full-mesh per-tenant host kernel routes
-make scenario SCEN=baseline                                  # green tenant baseline
-make scenario SCEN=yellow-baseline                           # yellow tenant baseline
+make scenario SCEN=green-mrc-baseline                        # green tenant baseline (MRC)
+make scenario SCEN=yellow-baseline                           # yellow tenant baseline (round_robin)
 
 docker exec -d yellow-host15 spray --role recv
 docker exec yellow-host00 spray --role send \
@@ -518,19 +518,19 @@ also repairs.
 For MRC end-to-end:
 
 ```
-make scenario SCEN=baseline           # green, no faults, round_robin
-make scenario SCEN=yellow-baseline    # yellow, no faults, round_robin
-make scenario SCEN=plane-loss         # 1% loss on plane 2 (green, round_robin)
-make scenario SCEN=plane-blackhole    # plane 2 unreachable (green, round_robin)
-make scenario SCEN=plane-latency      # plane 2 +5ms (green, round_robin)
-make scenario SCEN=hash5tuple         # hash spray policy (green)
+make scenario SCEN=green-mrc-baseline    # green tenant, MRC enabled, no faults
+make scenario SCEN=yellow-baseline       # yellow tenant, round_robin, no faults
+make scenario SCEN=green-mrc-plane-loss  # 1% loss on plane 2 + MRC demote
+make scenario SCEN=green-mrc-plane-latency  # plane 2 +5ms + MRC (RTT not yet a demote signal)
 
 # Health-aware MRC variants (turn the agents on):
 make scenario SCEN=green-mrc-baseline     # clean fabric + MRC; should match baseline
 make scenario SCEN=green-mrc-plane-loss   # 5% loss on plane 2 + MRC; loss should
-                                          # drop well below plane-loss.yaml after demote
+                                          # drop well below round_robin after demote
 make scenario SCEN=green-mrc-plane-latency # 10ms on plane 3 + MRC; currently no
                                           # demote (RTT not a signal yet)
+make scenario SCEN=green-mrc-ev-spray     # per-EV sender control (green)
+make scenario SCEN=yellow-mrc-ev-spray    # per-EV sender control (yellow)
 ```
 
 Expect ~0% loss on baselines, balanced per-plane counts, low

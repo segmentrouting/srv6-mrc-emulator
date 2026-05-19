@@ -14,7 +14,7 @@
 #
 # Day-to-day:
 #   make test       unit tests (165 tests, ~0.3s)
-#   make scenario SCEN=baseline   run an MRC scenario from topologies/<TOPO>/scenarios/
+#   make scenario SCEN=green-mrc-baseline   run an MRC scenario from topologies/<TOPO>/scenarios/
 #   make help       this message
 
 TOPO ?= 4p-8x16

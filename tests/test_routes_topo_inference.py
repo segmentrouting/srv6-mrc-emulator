@@ -106,7 +106,7 @@ class TestInferSrv6Topo(unittest.TestCase):
         # e.g. `-f topologies/2p-4x8/scenarios/foo.yaml` is not a routes
         # spec; conservatively return None rather than guessing.
         self.assertIsNone(self.fn(
-            ["apply", "-f", "topologies/2p-4x8/scenarios/baseline.yaml"]
+            ["apply", "-f", "topologies/2p-4x8/scenarios/yellow-baseline.yaml"]
         ))
 
     def test_nonexistent_topo_yaml(self):

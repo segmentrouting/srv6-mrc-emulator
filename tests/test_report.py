@@ -230,5 +230,71 @@ class TestSerialization(unittest.TestCase):
         self.assertEqual(rep.flows[0].per_ev_sent, {})
 
 
+class TestEvColumnAscii(unittest.TestCase):
+    """The `evs` column and the 'unused EVs' note in render_ascii."""
+
+    def _ev_sender(self, **kw):
+        per_ev = {f"P{p}:S{s}": 50 for p in range(4) for s in range(8)}
+        # Simulate (1, 6) demoted to assumed_bad: zero packets sent on it.
+        per_ev.pop("P1:S6")
+        return _sender(
+            policy="health_aware_mrc",
+            per_ev_sent=per_ev,
+            **kw,
+        )
+
+    def test_evs_column_shows_used_over_expected(self):
+        rep = ScenarioReport.from_records(
+            "ev-scen", [self._ev_sender()], [],
+            topology_dims=(4, 8),
+        )
+        out = rep.render_ascii()
+        self.assertIn("31/32", out)
+        self.assertIn("unused EVs: [(1, 6)]", out)
+
+    def test_evs_column_dash_for_non_ev_policy(self):
+        rep = ScenarioReport.from_records(
+            "ev-scen", [_sender()], [],
+            topology_dims=(4, 8),
+        )
+        out = rep.render_ascii()
+        # No "/N" pattern on the round_robin row; the policy column is
+        # round_robin and the evs column should be a bare dash.
+        rr_line = [
+            ln for ln in out.splitlines()
+            if "round_robin" in ln and "->" in ln
+        ][0]
+        # Last column is evs; expect "-" not "<int>/<int>".
+        self.assertRegex(rr_line.rstrip(), r"\s-\s*$")
+
+    def test_no_evs_denominator_when_topology_dims_missing(self):
+        rep = ScenarioReport.from_records(
+            "ev-scen", [self._ev_sender()], [],
+        )
+        # No topology_dims: render must not crash; show used count alone
+        # and skip the "unused EVs:" line.
+        out = rep.render_ascii()
+        ev_line = [
+            ln for ln in out.splitlines()
+            if "health_aware_mrc" in ln and "->" in ln
+        ][0]
+        # Last column is `evs` right-aligned to width 7.
+        self.assertTrue(ev_line.rstrip().endswith(" 31"))
+        self.assertNotIn("/32", out)
+        self.assertNotIn("unused EVs", out)
+
+    def test_no_unused_note_when_all_evs_used(self):
+        per_ev = {f"P{p}:S{s}": 50 for p in range(4) for s in range(8)}
+        rep = ScenarioReport.from_records(
+            "ev-scen",
+            [_sender(policy="ev_spray", per_ev_sent=per_ev)],
+            [],
+            topology_dims=(4, 8),
+        )
+        out = rep.render_ascii()
+        self.assertIn("32/32", out)
+        self.assertNotIn("unused EVs", out)
+
+
 if __name__ == "__main__":
     unittest.main()

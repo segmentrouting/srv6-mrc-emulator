@@ -29,5 +29,5 @@ make image                            # one image (alpine-srv6-scapy:1.0)
 make TOPO=2p-4x8 deploy
 make TOPO=2p-4x8 config
 make TOPO=2p-4x8 host-routes
-make TOPO=2p-4x8 scenario SCEN=baseline
+make TOPO=2p-4x8 scenario SCEN=yellow-baseline
 ```
