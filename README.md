@@ -1,24 +1,22 @@
 # srv6-ai-fabric
 
-A research-grade simulator for Cisco's Multi-plane Reliable Connectivity
-(MRC) approach to AI-fabric networking, layered on top of a static SRv6
-uSID dataplane in [SONiC](https://sonic-net.github.io/SONiC/) +
-[containerlab](https://containerlab.dev/) + Linux kernel SRv6.
+A research-grade simulator for Multipath Reliable Connection
+(MRC) layered on top of a static SRv6 uSID dataplane. The simulator uses 
+[containerlab](https://containerlab.dev/) to deploy a multiplane fabric of
+dockerized SONiC-VS instances and SRv6 capable Alpine linux containers 
+simulating hosts.
 
 The reference topology is a **4-plane × 8-spine × 16-leaf Clos** carrying
-two tenants (`green`, `yellow`) with anycast hosts. The generator is
-parameterized via `topo.yaml`, so additional Clos variants are
-straightforward to add under `topologies/<name>/`.
+two tenants (`green`, `yellow`). This repository also includes a topology 
+generator tool so additional topologies can be added under `topologies/<name>/`.
 
 ## Key Elements
 
-- **Pure-static control plane.** No BGP, no IGP. Every leaf carries its
-  own SRv6 locator + transit SIDs as `static-sids` in FRR (pushed by
-  `scripts/config.sh`), and every host carries its tenant routes as
-  kernel `ip -6 route ... encap seg6 ...` entries (pushed by the
-  controller-side `routes` CLI from a YAML route spec). Both layers are
-  generated declaratively from `topo.yaml` -- no runtime control plane.
-- **Self-healing config push.** `make config` runs `scripts/config.sh`
+- **Pure-static control plane**: No BGP, no IGP. Every leaf carries its
+  own SRv6 locator + transit SIDs as `static-sids` in FRR
+- **config.sh shell script**: containerlab deploys the topology,  
+  `scripts/config.sh` pushes the sonic nodes' config_db.json and FRR configs.
+- **Self-healing config push**: `make config` runs `scripts/config.sh`
   which pushes FRR config to every switch in parallel, then verifies
   that the kernel FIB on each leaf contains the expected number of
   `seg6local` entries (the count is derived per-node from the

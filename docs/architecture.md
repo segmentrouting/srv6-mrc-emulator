@@ -8,17 +8,8 @@ one describes **why the layers are structured the way they are** and how
 that structure maps to the production system in the OpenAI/Microsoft MRC +
 SRv6 paper (`resilient-ai-supercomputer-networking-using-mrc-and-srv6.md`).
 
-The emulator was originally written as a single "spray runner" with the MRC
-control loop bolted on. As multi-tenant support landed and yellow-tenant
-lab debugging exposed an addressing bug, it became clear that the
-production architecture has three distinct roles that we had been
-collapsing into one process. This doc names those roles, fixes the
-addressing model against them, and records where we diverge from the paper
-and why.
-
-## 1. Three roles
-
-In a production MRC deployment there are three clearly separated systems:
+In a production MRC deployment there are three clearly separated systems or roles,
+which the MRC emulator tries to capture or model:
 
 | Role            | Production analog                          | Emulator analog                                   |
 |-----------------|--------------------------------------------|---------------------------------------------------|
