@@ -1,0 +1,71 @@
+# yellow-mrc-ev-spray.yaml — yellow tenant, health_aware_mrc with full
+# EV fan-out (4 planes * 8 spines = 32 EVs per src/dst pair).
+#
+# This is the scenario that exercises commit 4 of phase 1b step 2: the
+# per-EV data payload (!QBB seq/plane/path), per-EV LossWindowTable on
+# the receiver, per-EV SentWindow on the sender, and per-EV apply_loss_
+# report fusion that demotes individual (plane, path) cells of the
+# EVStateTable rather than collapsing to whole-plane verdicts.
+#
+# Why we need it (vs yellow-mrc-baseline.yaml):
+#   yellow-mrc-baseline runs MRC but without paths_per_plane, so the
+#   policy effectively spreads across 4 EVs (one per plane). A single
+#   broken leaf-spine link looks like "100% loss on the affected plane"
+#   and the plane-coarse machinery already in place would have handled
+#   it. This scenario sets paths_per_plane: 8 so a broken link maps to
+#   exactly 1/32 of the EVs and the policy must demote that one cell
+#   while keeping the other 7 EVs on the same plane in service.
+#
+# What to look for:
+#   * `mrc.ev_table.tenants.yellow`: pre-failure, all 32 cells in
+#     state=good (or unknown for the first window). Post-failure, the
+#     broken cell shows state=assumed_bad with a non-zero
+#     consecutive_loss_demote_windows and zero weight; remaining 31
+#     cells unchanged.
+#   * `per_ev_sent`: pre-failure uniform ~3.1% each. Post-failure the
+#     broken cell drops toward 0; the other 31 cells absorb its share
+#     (~3.2% each). The transition is in the time-series — first ~1-2
+#     loss windows of uniform spray with loss on the bad cell, then
+#     redistribution.
+#   * `loss_pct`: spikes to ~3% during detection, falls toward 0 once
+#     the policy rebalances and the bad cell is no longer fed.
+#
+# Failure injection (manual, while the job is running):
+#   On the lab host, pick a leaf-spine link and shut it. E.g. to
+#   blackhole EV (plane=0, path=2) for any flow whose receiver is on
+#   leaf03:
+#       docker exec p0-spine02 config interface shutdown Ethernet12
+#   Restore with `startup` of the same interface. (For programmatic
+#   netem-based variants see yellow-mrc-plane-loss.yaml.)
+#
+# Prerequisites:
+#   make host-routes   # host-side End.DT6 for yellow inner anycast
+#
+# Run:
+#   make scenario SCEN=yellow-mrc-ev-spray
+#   # Then, in another shell, shut a leaf-spine link mid-run.
+
+name: yellow-mrc-ev-spray
+description: |
+  Yellow tenant health_aware_mrc spray with full per-EV fan-out
+  (32 EVs per pair). Exercises per-EV loss attribution end-to-end:
+  data payload carries (plane, path), receiver records per-EV
+  seen/expected, sender's SentWindow is per-EV, apply_loss_report
+  demotes the single bad (plane, path) cell on link failure.
+
+paths_per_plane: 8
+
+flows:
+  - pairs: yellow-pairs-8
+    policy: health_aware_mrc
+    rate: 1000pps
+    duration: 60s
+
+faults: []
+
+# Enable MRC with defaults — presence of the block (even empty) flips
+# the orchestrator to start the per-host MRC agents.
+mrc: {}
+
+report:
+  out: results/yellow-mrc-ev-spray.json

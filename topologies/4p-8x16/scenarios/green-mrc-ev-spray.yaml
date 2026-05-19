@@ -1,0 +1,42 @@
+# green-mrc-ev-spray.yaml — green tenant, health_aware_mrc with full
+# EV fan-out (4 planes * 8 spines = 32 EVs per src/dst pair).
+#
+# Green counterpart of yellow-mrc-ev-spray.yaml. Same per-EV health-
+# feedback test surface but on the simpler one-uSID outer (leaf-decap
+# End.DT6) data path. Use this as the cleaner baseline when debugging
+# the MRC feedback loop end-to-end — if green works and yellow doesn't,
+# the bug is in the host-side decap / 2-uSID outer; if both fail, the
+# bug is in the MRC plumbing itself.
+#
+# What to look for: same as yellow-mrc-ev-spray.yaml. Pre-failure
+# uniform ~3.1% per EV; post-failure the broken (plane, path) cell
+# drops to ~0% and the remaining 31 EVs absorb its share.
+#
+# Failure injection (manual): same recipe as yellow-mrc-ev-spray.yaml —
+# `docker exec p<P>-spine<S> config interface shutdown Ethernet<port>`
+# breaks EV (plane=P, path=S) for any flow landing on that leaf.
+#
+# Run:
+#   make scenario SCEN=green-mrc-ev-spray
+
+name: green-mrc-ev-spray
+description: |
+  Green tenant health_aware_mrc spray with full per-EV fan-out
+  (32 EVs per pair). Companion to yellow-mrc-ev-spray.yaml; same
+  per-EV loss-attribution and rebalancing semantics on green's
+  leaf-decap End.DT6 data path.
+
+paths_per_plane: 8
+
+flows:
+  - pairs: green-pairs-8
+    policy: health_aware_mrc
+    rate: 1000pps
+    duration: 60s
+
+faults: []
+
+mrc: {}
+
+report:
+  out: results/green-mrc-ev-spray.json
