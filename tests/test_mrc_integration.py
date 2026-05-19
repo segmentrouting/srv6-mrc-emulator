@@ -43,11 +43,10 @@ from srv6_fabric.topo import FlowKey, NUM_PLANES, NUM_SPINES, tenant_id as topo_
 
 # Reuse the loopback plumbing the I/O tests already built. Importing
 # from a sibling test module is unusual; the alternative is duplicating
-# ~80 lines of port allocation + socket factories, which would drift
-# the moment the agent's construction signature changes.
+# ~80 lines of port allocation + transport construction, which would
+# drift the moment the agent's construction signature changes.
 from tests.test_mrc_agent_io import (  # noqa: E402
-    FAST_CONFIG, PORTS, _PeerOverride, _build_receiver_factory,
-    _build_sender_factory, _wait_for,
+    FAST_CONFIG, PORTS, _build_loopback_pair, _wait_for,
 )
 
 
@@ -67,26 +66,22 @@ def _build_pair(table: EVStateTable):
     Returns (sender, receiver, flow_key). Caller is responsible for
     .start() and .stop() on both agents.
     """
-    sender_probe_base = PORTS.take(NUM_PLANES)
     sender_report_port = PORTS.take(1)
-    recv_probe_base = PORTS.take(NUM_PLANES)
+    receiver_probe_port = PORTS.take(1)
 
-    s_probe_factory, s_report_factory = _build_sender_factory(
-        sender_probe_base, sender_report_port,
+    sender_xport, receiver_xport = _build_loopback_pair(
+        sender_report_port=sender_report_port,
+        receiver_probe_port=receiver_probe_port,
     )
     sender = SenderMrcAgent(
         tenant="green", src_id=0, dst_id=15,
         table=table, config=FAST_CONFIG,
-        sockets_factory=s_probe_factory,
-        report_socket_factory=s_report_factory,
+        transport=sender_xport,
     )
-    _PeerOverride(sender, recv_probe_base, sender_report_port)
-
-    r_probe_factory = _build_receiver_factory(recv_probe_base)
     receiver = ReceiverMrcAgent(
         tenant="green", my_id=15,
         config=FAST_CONFIG,
-        sockets_factory=r_probe_factory,
+        transport=receiver_xport,
     )
 
     flow_key = (topo_tenant_id("green"), 0, 15)

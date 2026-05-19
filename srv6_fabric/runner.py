@@ -151,39 +151,38 @@ def parse_payload(raw: bytes) -> Optional[tuple[int, int, int]]:
 # --- send -------------------------------------------------------------------
 
 def _open_send_socket(iface: str) -> socket.socket:
-    """Raw IPv6 socket bound to a single NIC via SO_BINDTODEVICE.
+    """Back-compat shim for callers in this module.
 
-    Per AGENTS.md invariant 8 — plane selection MUST be NIC-bound, not
-    route-metric-bound. Kernel ECMP would defeat plane spray since green's
-    inner dst is anycast.
+    The real implementation moved to `srv6_fabric.encap.open_raw_send_socket`
+    so the MRC sender agent can share the same socket setup pattern.
+    Kept here under the old name to avoid touching every internal call
+    site at once.
     """
-    s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_RAW)
-    try:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode())
-    except PermissionError as e:
-        raise PermissionError(
-            f"SO_BINDTODEVICE on {iface} needs CAP_NET_RAW. "
-            "Run inside the alpine host containers or as root."
-        ) from e
-    return s
+    from .encap import open_raw_send_socket
+    return open_raw_send_socket(iface)
 
 
 def _build_packet_bytes(src_underlay: str, dst_outer: str,
                         src_inner: str, dst_inner: str,
                         seq: int, plane: int, path: int) -> bytes:
-    """Build full outer/inner/UDP bytes. Lazy-imports scapy."""
-    # Local import keeps the orchestrator side (no scapy) able to import this
-    # module without an error. AGENTS.md notes scapy noise on import.
-    import logging as _logging
-    _logging.getLogger("scapy.runtime").setLevel(_logging.ERROR)
-    from scapy.all import IPv6, UDP  # type: ignore
+    """Build full outer/inner/UDP bytes for one spray DATA packet.
 
-    payload = encode_payload(seq, plane, path)
-    inner = (IPv6(src=src_inner, dst=dst_inner)
-             / UDP(sport=SPRAY_PORT, dport=SPRAY_PORT)
-             / payload)
-    outer = IPv6(src=src_underlay, dst=dst_outer, nh=41) / inner
-    return bytes(outer)
+    Thin wrapper around `srv6_fabric.encap.build_outer_packet` that
+    plugs the spray data payload into the shared encap builder. The
+    MRC probe path uses the same builder with different ports and a
+    PROBE / PROBE_REPLY / LOSS_REPORT payload — see
+    `srv6_fabric.mrc.agent`.
+    """
+    from .encap import build_outer_packet
+    return build_outer_packet(
+        src_underlay=src_underlay,
+        dst_outer=dst_outer,
+        src_inner=src_inner,
+        dst_inner=dst_inner,
+        sport=SPRAY_PORT,
+        dport=SPRAY_PORT,
+        payload=encode_payload(seq, plane, path),
+    )
 
 
 def run_sender(flow: FlowEndpoint,

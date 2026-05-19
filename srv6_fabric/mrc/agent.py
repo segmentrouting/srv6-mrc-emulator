@@ -20,29 +20,35 @@ and exposes two coordinator classes:
 Threading model
 ---------------
 SenderMrcAgent runs FOUR daemon threads:
-  - emit thread: every probe_interval_ms, send one PROBE per plane
-  - reply-RX thread per plane: blocks on per-plane probe socket,
-    decodes replies, calls ProbeClock.match_reply, pushes RTT into
-    EVStateTable
-  - report-RX thread: blocks on the report socket, decodes
-    LOSS_REPORTs, calls loss_compute.apply_loss_report
+  - emit thread: every probe_interval_ms, send one PROBE per
+    `(plane, path)` EV (NUM_PLANES * NUM_SPINES probes per round)
+  - rx thread (1 total): blocks on the single reply socket
+    (sender's well-known report port) and demultiplexes by magic
+    byte — PROBE_REPLY -> ProbeClock.match_reply -> EVStateTable;
+    LOSS_REPORT -> loss_compute.apply_loss_report. The unified
+    socket model matches the actual wire (PROBE_REPLYs and
+    LOSS_REPORTs both land on SPRAY_REPORT_PORT after the kernel
+    decaps the SRv6 carrier).
   - timeout-sweep thread: every probe_interval_ms, calls
     ProbeClock.sweep_timeouts, pushes each timeout into EVStateTable
     as a failed probe
+  - window-rotate thread: snapshots the per-EV sent counters into
+    a SentWindow and pushes it into the SentWindowRing every
+    loss_window_ms
 
-Plus a small piece of state on the sender hot path: a SentWindowRing
-that the runner's progress_cb feeds via `agent.record_sent(plane)`.
-The agent's window-rotate thread closes a SentWindow every
-loss_window_ms and pushes it into the ring for the report-RX thread
-to find.
+Plus a small piece of state on the sender hot path: per-EV TX counters
+that the runner's progress_cb feeds via `agent.record_sent(plane, path)`.
 
-ReceiverMrcAgent runs THREE daemon threads per agent:
-  - probe-RX thread per plane: blocks on per-plane probe socket,
-    decodes PROBE, builds + sends PROBE_REPLY on the same socket
-    (so the reply goes back via the same plane NIC); also caches
-    sender's reply_addr for the loss-report emitter
+ReceiverMrcAgent runs TWO daemon threads per agent:
+  - probe-RX thread (1 total): blocks on the receiver's well-known
+    probe socket, decodes PROBE, builds + sends a PROBE_REPLY back on
+    the same `(plane, path)` EV the PROBE arrived on (extracted from
+    the payload). The reply is SRv6-encapped via the transport so
+    plane symmetry is preserved on the wire.
   - loss-emit thread: every loss_window_ms, snapshot each known flow
-    in LossWindowTable, encode LOSS_REPORT, sendto cached reply_addr
+    in LossWindowTable, encode LOSS_REPORT, send it via the transport
+    on the (plane, path) EV cached from the last PROBE we received
+    from that sender.
 
 Plus: `agent.record_data(flow_key, plane, path, seq)` hooked into the
 existing data-receive path so the LossWindowTable sees data packets.
@@ -51,35 +57,42 @@ All threads are daemons; they exit when the main thread does. Each
 thread checks `self._stop.is_set()` on its select/sleep wakeups so a
 caller-driven stop is responsive too (used by tests).
 
-Lab vs test
------------
-In a real container deployment, sockets are AF_INET6 + SO_BINDTODEVICE
-on e<plane-NIC>. In tests, the BIND_TO_DEVICE flag is suppressed and
-sockets bind to ::1 with a per-plane port offset (each "plane" gets a
-distinct port so test traffic doesn't conflict). The construction
-helpers below accept a `use_loopback: bool` flag controlling this.
+Transport abstraction
+---------------------
+All on-the-wire I/O is delegated to an `MrcTransport` (see
+`srv6_fabric.mrc.transport`):
+
+  Srv6RawTransport  (lab)
+      Per-plane AF_INET6 SOCK_RAW IPPROTO_RAW sockets bound via
+      SO_BINDTODEVICE to PLANE_NICS[p]. Sends are
+      `encap.build_outer_packet` outputs so probes follow the same
+      EV-steered SRv6 path as data. RX uses a single UDP listener
+      on the well-known port (kernel decaps inbound).
+  LoopbackUdpTransport  (tests)
+      Per-plane UDP sockets on ::1, no encap, per-plane port
+      offsets for plane attribution. Sender and receiver typically
+      live in one test process.
+
+The agent never branches on `use_loopback` directly; that flag lives
+in `AgentConfig` only to decide which transport to construct by
+default. Tests inject their own transport via the `transport=` kwarg.
 """
 
 from __future__ import annotations
 
 import logging
 import socket
-import sys
 import threading
 import time
-from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 from ..topo import (
     NUM_PLANES,
     NUM_SPINES,
-    PLANE_NICS,
     SPRAY_PROBE_PORT,
     SPRAY_REPORT_PORT,
-    host_probe_peer_addr,
     tenant_id as topo_tenant_id,
-    tenant_name as topo_tenant_name,
 )
 from .ev_state import EVStateTable
 from .loss_compute import (
@@ -90,8 +103,6 @@ from .loss_compute import (
 )
 from .loss_window import LossWindowTable
 from .probe import (
-    LossReport,
-    Probe,
     ProbeDecodeError,
     decode_loss_report,
     decode_probe,
@@ -101,6 +112,13 @@ from .probe import (
     encode_probe_reply,
 )
 from .probe_clock import ProbeClock
+from .transport import (
+    DEFAULT_RECV_BUFSIZE,
+    DEFAULT_SOCKET_TIMEOUT_S,
+    LoopbackUdpTransport,
+    MrcTransport,
+    Srv6RawTransport,
+)
 
 
 log = logging.getLogger(__name__)
@@ -112,8 +130,9 @@ DEFAULT_PROBE_INTERVAL_MS = 200
 DEFAULT_PROBE_TIMEOUT_MS = 100
 DEFAULT_LOSS_WINDOW_MS = 200
 DEFAULT_MAX_WINDOW_SKEW_MS = 500
-DEFAULT_RECV_BUFSIZE = 4096
-DEFAULT_SOCKET_TIMEOUT_S = 0.25  # how often blocking RX threads wake to check stop
+# DEFAULT_RECV_BUFSIZE and DEFAULT_SOCKET_TIMEOUT_S now live in
+# srv6_fabric.mrc.transport and are re-imported above so existing
+# call sites in this module keep working unchanged.
 
 
 @dataclass
@@ -204,63 +223,8 @@ def load_configs_from_env(
     return AgentConfig(**agent_kwargs), ev_cfg
 
 
-# --- socket helpers --------------------------------------------------------
-
-def _open_udp_socket(
-    *,
-    iface: Optional[str],
-    bind_addr: str,
-    bind_port: int,
-    use_loopback: bool,
-) -> socket.socket:
-    """Open an AF_INET6 UDP socket, optionally bound to a NIC.
-
-    `iface` is the linux interface name for SO_BINDTODEVICE; ignored
-    when `use_loopback=True` (loopback doesn't accept BINDTODEVICE).
-
-    We always set SO_REUSEADDR so test runs don't trip over each other.
-    """
-    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, 0)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # On the receiver, four sockets bind to (::, SPRAY_PROBE_PORT) with
-    # different SO_BINDTODEVICE values — one per plane. Without
-    # SO_REUSEPORT, Linux rejects the 2nd-4th bind() with EADDRINUSE
-    # even when the binding device differs. The sender's per-plane
-    # sockets bind to ephemeral ports so the flag is benign there.
-    if hasattr(socket, "SO_REUSEPORT"):
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except OSError:
-            # SO_REUSEPORT is defined in the constants but not enabled
-            # in the kernel — extremely rare; fall through and hope
-            # the bind still succeeds (e.g. loopback path).
-            pass
-    if not use_loopback and iface is not None:
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
-                         iface.encode())
-        except PermissionError as e:
-            raise PermissionError(
-                f"SO_BINDTODEVICE on {iface} needs CAP_NET_RAW. "
-                "Run inside the host containers or as root."
-            ) from e
-    s.bind((bind_addr, bind_port))
-    s.settimeout(DEFAULT_SOCKET_TIMEOUT_S)
-    return s
-
 
 # --- sender agent ----------------------------------------------------------
-
-@dataclass
-class _PeerInfo:
-    """A single sender's per-plane peer addresses for probes."""
-    # Per-plane (peer_underlay_addr, probe_port). The peer's underlay
-    # address differs per plane because each host has a per-plane
-    # underlay v6. We store the address as a string and let socket
-    # resolve it at sendto time.
-    peer_addrs: Tuple[str, ...]
-    probe_port: int
-    report_port: int
 
 
 class SenderMrcAgent:
@@ -268,12 +232,20 @@ class SenderMrcAgent:
 
     One instance per --role send process. Owns:
       - the EVStateTable read by HealthAwareMrc.pick()
-      - a ProbeClock + per-plane probe sockets
+      - a ProbeClock + an MrcTransport for probe TX
       - a SentWindowRing + a window-rotate timer
       - a LossFusionStats counter
 
     Lifecycle: construct -> start() -> run for the duration of the
     spray flow -> stop(). stop() is best-effort: threads are daemons.
+
+    All on-the-wire I/O is delegated to `self.transport` (an
+    MrcTransport). In the lab the default Srv6RawTransport builds
+    SRv6-encapped probes via `srv6_fabric.encap.build_outer_packet`
+    and writes them to per-plane raw sockets bound via
+    SO_BINDTODEVICE. In tests a LoopbackUdpTransport is passed in
+    explicitly via the `transport=` kwarg so no encap or CAP_NET_RAW
+    is needed.
     """
 
     def __init__(
@@ -284,9 +256,7 @@ class SenderMrcAgent:
         dst_id: int,
         table: EVStateTable,
         config: AgentConfig,
-        # Optional injection points for tests:
-        sockets_factory: Optional[Callable[[int], socket.socket]] = None,
-        report_socket_factory: Optional[Callable[[], socket.socket]] = None,
+        transport: Optional[MrcTransport] = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
         if table.num_planes != NUM_PLANES:
@@ -321,41 +291,16 @@ class SenderMrcAgent:
             num_planes=NUM_PLANES, num_paths=NUM_SPINES,
         )
 
-        # Per-plane peer addresses for probes. For both tenants we use
-        # the inner (plane-independent) host address; plane selection is
-        # by SO_BINDTODEVICE on our side. The tuple still has one entry
-        # per plane (and they all alias the same inner addr) so that
-        # plane-indexed call sites don't need to change. See
-        # docs/architecture.md §2 for the addressing model:
-        #   - green: dst = anycast `bbbb:<NN>::2`, kernel routes via the
-        #     bound NIC directly (no SR encap).
-        #   - yellow (Phase 1a): dst = anycast `cccc:<NN>::2`, present
-        #     on the *peer's* eth1..eth4 + lo. The kernel `seg6 encap`
-        #     route for the peer's anycast still resolves correctly
-        #     because the peer's `<NN>` is not the local host's `<NN>`
-        #     (so the conflict between local-anycast and encap-route
-        #     does not apply here). Phase 1a step 2 replaces this kernel
-        #     encap with a sender-built raw-socket SRv6 encap path.
-        self._peer = _PeerInfo(
-            peer_addrs=tuple(
-                host_probe_peer_addr(tenant, p, dst_id)
-                for p in range(NUM_PLANES)
-            ),
-            probe_port=SPRAY_PROBE_PORT,
-            report_port=SPRAY_REPORT_PORT,
-        )
-
-        # Socket factories: tests inject their own to skip BINDTODEVICE
-        # and use ::1 with distinct ports per plane.
-        if sockets_factory is None:
-            sockets_factory = self._default_probe_socket
-        if report_socket_factory is None:
-            report_socket_factory = self._default_report_socket
-
-        self._probe_sockets: Dict[int, socket.socket] = {
-            p: sockets_factory(p) for p in range(NUM_PLANES)
-        }
-        self._report_socket: socket.socket = report_socket_factory()
+        # If the caller didn't supply a transport, build the default
+        # lab transport. Construction opens NUM_PLANES raw sockets,
+        # which requires CAP_NET_RAW — tests therefore must always
+        # pass an explicit transport=LoopbackUdpTransport(...) and
+        # never let this fallback run.
+        if transport is None:
+            transport = Srv6RawTransport(
+                tenant=tenant, my_id=src_id, is_sender=True,
+            )
+        self.transport = transport
 
         # Sender-side per-EV TX counter for the current emit-window,
         # indexed `[plane][path]`. Updated by record_sent() on the hot
@@ -379,23 +324,21 @@ class SenderMrcAgent:
         self._spawn(self._emit_loop, name="mrc-emit")
         self._spawn(self._sweep_loop, name="mrc-sweep")
         self._spawn(self._window_rotate_loop, name="mrc-window")
-        for p in range(NUM_PLANES):
-            self._spawn(self._reply_rx_loop, name=f"mrc-reply-p{p}", args=(p,))
-        self._spawn(self._report_rx_loop, name="mrc-report")
+        # Single rx thread: demultiplexes PROBE_REPLY vs LOSS_REPORT
+        # by magic byte. Replaces the per-plane reply-rx loops and
+        # the separate report-rx loop that the pre-Phase-1b/step-2
+        # design used.
+        self._spawn(self._reply_rx_loop, name="mrc-reply-rx")
 
     def stop(self, *, timeout_s: float = 1.0) -> None:
         """Signal threads to exit; close sockets. Threads are daemons so
         we don't require them to actually join in time."""
         self._stop.set()
-        # Closing the sockets unblocks any in-flight recvfrom.
-        for s in list(self._probe_sockets.values()):
-            try:
-                s.close()
-            except OSError:
-                pass
+        # Closing the transport's sockets unblocks any in-flight
+        # recvfrom. The transport owns close()-safety; we just call it.
         try:
-            self._report_socket.close()
-        except OSError:
+            self.transport.close()
+        except Exception:
             pass
         deadline = time.monotonic() + timeout_s
         for t in self._threads:
@@ -428,42 +371,58 @@ class SenderMrcAgent:
     # --- thread bodies -------------------------------------------------
 
     def _emit_loop(self) -> None:
-        """Send one PROBE per plane every probe_interval_ms."""
+        """Send one PROBE per `(plane, path)` EV every probe_interval_ms.
+
+        Iterates the full NUM_PLANES * NUM_SPINES grid each round so
+        every EV gets independent liveness and RTT signal. With the
+        default probe_interval_ms=200 and the 4*8 grid that's
+        160 probes/sec — trivial overhead next to the data rate.
+        Probes use the transport, which builds the SRv6 outer for the
+        EV in the lab path and addresses the matching per-plane
+        loopback socket in tests.
+        """
         interval_s = self.cfg.probe_interval_ms / 1000.0
         next_tick = time.monotonic()
         while not self._stop.is_set():
             now_ns = self.clock_ns()
             for plane in range(NUM_PLANES):
-                req_id, tx_ns = self.probe_clock.emit(
-                    plane, path=0, now_ns=now_ns,
-                )
-                try:
-                    payload = encode_probe(
-                        req_id=req_id,
-                        plane_id=plane,
-                        tx_ns=tx_ns,
-                        path_id=0,  # TODO(phase1b/step2): per-EV probes
-                        tenant_id=self.tenant_id,
-                        src_id=self.src_id,
-                        reply_port=self._peer.report_port,
+                for path in range(NUM_SPINES):
+                    req_id, tx_ns = self.probe_clock.emit(
+                        plane, path=path, now_ns=now_ns,
                     )
-                except ValueError:
-                    # tx_ns occasionally exceeds u64 on systems with
-                    # unusual clocks — treat as a soft error.
-                    log.warning("mrc.probe: encode_probe failed for plane %d",
-                                plane)
-                    continue
-                try:
-                    self._probe_sockets[plane].sendto(
-                        payload,
-                        (self._peer.peer_addrs[plane], self._peer.probe_port),
-                    )
-                except OSError as e:
-                    log.debug("mrc.probe: sendto p%d failed: %s", plane, e)
-                    # The probe is still considered "outstanding"; it
-                    # will time out naturally and trigger a probe-fail
-                    # signal. That's the right semantic for "I tried to
-                    # probe but the kernel refused."
+                    try:
+                        payload = encode_probe(
+                            req_id=req_id,
+                            plane_id=plane,
+                            tx_ns=tx_ns,
+                            path_id=path,
+                            tenant_id=self.tenant_id,
+                            src_id=self.src_id,
+                            reply_port=SPRAY_REPORT_PORT,
+                        )
+                    except ValueError:
+                        # tx_ns occasionally exceeds u64 on systems
+                        # with unusual clocks — treat as a soft error.
+                        log.warning(
+                            "mrc.probe: encode_probe failed "
+                            "for (plane=%d, path=%d)", plane, path,
+                        )
+                        continue
+                    try:
+                        self.transport.send_probe(
+                            plane=plane, path=path,
+                            dst_leaf=self.dst_id,
+                            payload=payload,
+                        )
+                    except OSError as e:
+                        log.debug(
+                            "mrc.probe: send (plane=%d, path=%d) "
+                            "failed: %s", plane, path, e,
+                        )
+                        # Probe is still considered "outstanding"; it
+                        # will time out naturally and trigger a
+                        # probe-fail signal. Right semantic for "I
+                        # tried to probe but the kernel refused."
             next_tick += interval_s
             sleep_s = next_tick - time.monotonic()
             if sleep_s < 0:
@@ -483,9 +442,21 @@ class SenderMrcAgent:
                 )
             self._stop.wait(interval_s)
 
-    def _reply_rx_loop(self, plane: int) -> None:
-        """Per-plane PROBE_REPLY listener; sets RTT on the EV table."""
-        sock = self._probe_sockets[plane]
+    def _reply_rx_loop(self) -> None:
+        """Unified RX loop: PROBE_REPLY + LOSS_REPORT on one socket.
+
+        The well-known port (SPRAY_REPORT_PORT) receives both reply
+        types after the kernel decaps the SRv6 carrier (lab) or after
+        the loopback transport delivers the raw payload (tests). We
+        dispatch by the first byte (the magic field that every wire
+        format defines uniquely — see srv6_fabric.mrc.probe).
+        """
+        try:
+            sock = self.transport.recv_reply_socket()
+        except RuntimeError as e:
+            # Mis-configured transport (e.g. receiver-only). Log + bail.
+            log.error("mrc.reply: %s", e)
+            return
         while not self._stop.is_set():
             try:
                 payload, _from = sock.recvfrom(DEFAULT_RECV_BUFSIZE)
@@ -493,54 +464,52 @@ class SenderMrcAgent:
                 continue
             except OSError:
                 return  # socket closed during stop()
-            try:
-                reply = decode_probe_reply(payload)
-            except ProbeDecodeError as e:
-                log.debug("mrc.probe: bad reply on plane %d: %s", plane, e)
+            if not payload:
                 continue
-            # The reply could be for any plane; trust the payload
-            # plane_id, not the socket. (If the reply lands on the
-            # wrong socket due to a network mishap, ProbeClock will
-            # treat it as stale via the plane mismatch.)
-            now_ns = self.clock_ns()
-            rtt_ns = self.probe_clock.match_reply(
-                req_id=reply.req_id,
-                plane=reply.plane_id,
-                path=reply.path_id,
-                reply_tx_ns=reply.tx_ns,
-                now_ns=now_ns,
-            )
-            if rtt_ns is None:
-                continue
-            self.table.record_probe_result(
-                self.tenant, reply.plane_id, reply.path_id,
-                success=True, rtt_ns=rtt_ns,
-            )
+            magic = payload[0]
+            if magic == 0xA6:
+                self._handle_probe_reply(payload)
+            elif magic == 0xA7:
+                self._handle_loss_report(payload)
+            else:
+                log.debug("mrc.reply: unknown magic 0x%02x", magic)
 
-    def _report_rx_loop(self) -> None:
-        """LOSS_REPORT listener; pushes into EVStateTable via fusion."""
-        sock = self._report_socket
-        while not self._stop.is_set():
-            try:
-                payload, _from = sock.recvfrom(DEFAULT_RECV_BUFSIZE)
-            except socket.timeout:
-                continue
-            except OSError:
-                return
-            try:
-                report = decode_loss_report(payload)
-            except ProbeDecodeError as e:
-                log.debug("mrc.probe: bad loss report: %s", e)
-                continue
-            apply_loss_report(
-                table=self.table,
-                tenant=self.tenant,
-                report=report,
-                sent_ring=self.sent_ring,
-                received_at_ns=self.clock_ns(),
-                max_window_skew_ns=self.cfg.max_window_skew_ms * 1_000_000,
-                stats=self.stats,
-            )
+    def _handle_probe_reply(self, payload: bytes) -> None:
+        try:
+            reply = decode_probe_reply(payload)
+        except ProbeDecodeError as e:
+            log.debug("mrc.probe: bad reply: %s", e)
+            return
+        now_ns = self.clock_ns()
+        rtt_ns = self.probe_clock.match_reply(
+            req_id=reply.req_id,
+            plane=reply.plane_id,
+            path=reply.path_id,
+            reply_tx_ns=reply.tx_ns,
+            now_ns=now_ns,
+        )
+        if rtt_ns is None:
+            return
+        self.table.record_probe_result(
+            self.tenant, reply.plane_id, reply.path_id,
+            success=True, rtt_ns=rtt_ns,
+        )
+
+    def _handle_loss_report(self, payload: bytes) -> None:
+        try:
+            report = decode_loss_report(payload)
+        except ProbeDecodeError as e:
+            log.debug("mrc.probe: bad loss report: %s", e)
+            return
+        apply_loss_report(
+            table=self.table,
+            tenant=self.tenant,
+            report=report,
+            sent_ring=self.sent_ring,
+            received_at_ns=self.clock_ns(),
+            max_window_skew_ns=self.cfg.max_window_skew_ms * 1_000_000,
+            stats=self.stats,
+        )
 
     def _window_rotate_loop(self) -> None:
         """Close + ring-push a SentWindow every loss_window_ms."""
@@ -575,45 +544,6 @@ class SenderMrcAgent:
                 sent=sent, window_id=wid,
             ))
 
-    # --- default socket factories --------------------------------------
-
-    def _default_probe_socket(self, plane: int) -> socket.socket:
-        """Open a UDP socket for emitting probes and receiving replies.
-
-        Bind to `::` (any address) rather than a specific per-plane
-        underlay; the green tenant doesn't assign a per-plane underlay
-        on the host side (only the anycast tenant addr lives on each
-        NIC, see generators/fabric.py L613-619). Plane selection comes
-        from SO_BINDTODEVICE in `_open_udp_socket`, not the bind
-        address. Yellow could bind to its per-plane underlay, but
-        binding to `::` works for both tenants and keeps the agent
-        tenant-agnostic.
-        """
-        bind_addr = (
-            "::1" if self.cfg.use_loopback
-            else "::"
-        )
-        bind_port = (
-            self._peer.probe_port + plane if self.cfg.use_loopback
-            else 0  # sender side doesn't need a fixed src port
-        )
-        iface = None if self.cfg.use_loopback else PLANE_NICS[plane]
-        return _open_udp_socket(
-            iface=iface, bind_addr=bind_addr, bind_port=bind_port,
-            use_loopback=self.cfg.use_loopback,
-        )
-
-    def _default_report_socket(self) -> socket.socket:
-        """Open the UDP socket the receivers send LOSS_REPORTs to."""
-        bind_addr = (
-            "::1" if self.cfg.use_loopback
-            else "::"  # any interface — kernel routes back to sender
-        )
-        return _open_udp_socket(
-            iface=None, bind_addr=bind_addr, bind_port=self._peer.report_port,
-            use_loopback=self.cfg.use_loopback,
-        )
-
     # --- internal helpers ----------------------------------------------
 
     def _spawn(self, fn, *, name: str, args: tuple = ()) -> None:
@@ -626,9 +556,27 @@ class SenderMrcAgent:
 
 @dataclass
 class _SenderAddr:
-    """Cached reply address for a sender we've seen probes from."""
-    underlay_addr: str   # source addr of the probe (per recvfrom)
-    report_port: int     # reply_port the sender asked us to use
+    """Cached reply EV for a sender we've seen probes from.
+
+    The receiver returns PROBE_REPLY + LOSS_REPORT to the sender by
+    SRv6-encap'ing a packet on the EV `(last_plane, last_path)` — the
+    same EV the most-recent PROBE arrived on. Because that PROBE
+    survived the round-trip from sender to us, the reverse EV is the
+    best-known-working candidate; if it later fails the next PROBE
+    from the same sender on a different EV updates the cache.
+
+    `src_id` is the sender's host_id (which equals its leaf id in
+    the 1-host-per-leaf topology); we use it as `dst_leaf` for the
+    outer uSID lookup via the transport.
+
+    `report_port` is preserved for forward-compat with future probe
+    payload versions that may steer replies to a non-default port;
+    today every sender uses SPRAY_REPORT_PORT.
+    """
+    src_id: int
+    last_plane: int
+    last_path: int
+    report_port: int
 
 
 class ReceiverMrcAgent:
@@ -636,13 +584,22 @@ class ReceiverMrcAgent:
 
     Started by spray.py --role recv when MRC is enabled. Owns:
       - the LossWindowTable into which the data-RX path feeds packets
-      - per-plane probe sockets that listen for PROBEs and emit
-        PROBE_REPLYs on the same socket
-      - a loss-emit timer that periodically encodes + unicasts
-        LOSS_REPORTs back to the cached sender addresses
+      - an MrcTransport whose recv_probe_socket() is the single
+        UDP listener for inbound PROBEs (the kernel decaps the
+        SRv6 carrier for us; the inner UDP arrives natively)
+      - a loss-emit timer that periodically encodes + transports
+        LOSS_REPORTs back to the cached sender addresses, using the
+        most-recent EV we received a PROBE from that sender on
 
-    The data RX path stays in spray.py / runner.py; this agent exposes
-    `record_data(flow_key, plane, path, seq)` for that path to call.
+    The data RX path stays in spray.py / runner.py; this agent
+    exposes `record_data(flow_key, plane, path, seq)` for that
+    path to call.
+
+    Reply egress symmetry — the PROBE_REPLY for a probe that
+    arrived on `(plane=P, path=S)` is sent SRv6-encapped on the
+    same `(P, S)` EV. This preserves the property that, in steady
+    state, each EV experiences round-trip traffic, so probe RTTs
+    measure end-to-end EV health (not just forward path).
     """
 
     def __init__(
@@ -651,7 +608,7 @@ class ReceiverMrcAgent:
         tenant: str,
         my_id: int,
         config: AgentConfig,
-        sockets_factory: Optional[Callable[[int], socket.socket]] = None,
+        transport: Optional[MrcTransport] = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
         self.tenant = tenant
@@ -660,9 +617,6 @@ class ReceiverMrcAgent:
         self.clock_ns = clock_ns
         self._stop = threading.Event()
         self._threads: List[threading.Thread] = []
-        # Cache slot used by `_default_probe_socket` to return the
-        # same socket object for every plane arg (Phase 1a step 3).
-        self._default_rx_socket: Optional[socket.socket] = None
 
         self.loss_table = LossWindowTable(
             num_planes=NUM_PLANES, num_paths=NUM_SPINES,
@@ -676,103 +630,25 @@ class ReceiverMrcAgent:
         self._senders: Dict[Tuple[int, int], _SenderAddr] = {}
         self._senders_lock = threading.Lock()
 
-        if sockets_factory is None:
-            sockets_factory = self._default_probe_socket
-        # Phase 1a step 3: collapse to a single receiver probe socket.
-        #
-        # Pre-Phase-1a, the receiver opened 4 per-plane probe sockets,
-        # each SO_BINDTODEVICE-bound to PLANE_NICS[p], with plane
-        # attribution coming from which socket recvfrom() returned. That
-        # works for green (probes arrive on eth(P+1) already inner-only,
-        # after leaf decap), but breaks for yellow under Phase 1a: the
-        # `seg6local End.DT6 table 0` action on eth(P+1) decaps the
-        # inner packet and the table-0 lookup routes it as if it came
-        # from `lo` (because the anycast cccc:<NN>::2 is now on lo,
-        # nodad). A socket SO_BINDTODEVICE-bound to eth(P+1) will not
-        # see the inner packet.
-        #
-        # The fix is to bind a single rx socket to `(::, SPRAY_PROBE_PORT)`
-        # without SO_BINDTODEVICE and derive plane attribution from the
-        # probe payload's `plane_id` field, which every probe already
-        # carries. This works for both tenants and removes the only
-        # plane-binding asymmetry between them.
-        #
-        # We still call `sockets_factory(plane=0)` to construct the
-        # socket so test fixtures that inject loopback-bound sockets
-        # continue to work; the per-plane parameter is informational
-        # only (existing test factories return distinct sockets per
-        # plane on loopback ports — under the collapsed model only the
-        # plane=0 socket is used as the rx socket, and the others are
-        # closed below to avoid leaking file descriptors).
-        rx_socket = sockets_factory(0)
-        # Enable IPV6_RECVPKTINFO so _probe_rx_loop can read the ingress
-        # ifindex per packet via recvmsg cmsg. We use it both to (a) tell
-        # the kernel which NIC to egress the PROBE_REPLY on (preserving
-        # plane symmetry on the wire) and (b) cross-check against the
-        # probe payload's plane_id for debug. Without this, the unbound
-        # rx socket's sendto picks egress by default route and ALL
-        # replies funnel to one plane, starving the sender's per-plane
-        # BTD-bound sockets on the other planes.
-        #
-        # Test fixtures that hand out loopback-bound sockets won't have
-        # IPV6_PKTINFO available in a meaningful way (lo is one ifindex);
-        # we still call setsockopt because it's a no-op on lo. The
-        # sendmsg path tolerates ipi6_ifindex=0 (kernel picks egress) if
-        # the cmsg is missing or zero.
-        try:
-            rx_socket.setsockopt(
-                socket.IPPROTO_IPV6, socket.IPV6_RECVPKTINFO, 1
+        if transport is None:
+            transport = Srv6RawTransport(
+                tenant=tenant, my_id=my_id, is_sender=False,
             )
-        except (OSError, AttributeError):
-            # AttributeError on platforms without IPV6_RECVPKTINFO; OSError
-            # on sockets that don't support it (e.g. some test mocks).
-            # Either way the rx loop's fallback (use sendto if cmsg missing)
-            # keeps it correct, just without per-plane reply pinning.
-            pass
-        self._rx_socket = rx_socket
-        # Drain plane=1..3 from any factory that hands out per-plane
-        # sockets (the legacy test fixtures): we don't need them, but
-        # closing them avoids leaked fds. Factories that return the
-        # same shared socket object for every plane arg are safe — the
-        # `is rx_socket` identity guard skips the close.
-        self._probe_sockets: Dict[int, socket.socket] = {0: rx_socket}
-        for p in range(1, NUM_PLANES):
-            try:
-                extra = sockets_factory(p)
-            except Exception:
-                continue
-            if extra is rx_socket:
-                self._probe_sockets[p] = rx_socket
-                continue
-            try:
-                extra.close()
-            except OSError:
-                pass
+        self.transport = transport
 
     # --- public API ----------------------------------------------------
 
     def start(self) -> None:
         self._stop.clear()
-        # Phase 1a step 3: one rx thread total (not per-plane). Plane
-        # attribution lives in the probe payload.
-        self._spawn(self._probe_rx_loop, name="mrc-probe-rx", args=())
+        self._spawn(self._probe_rx_loop, name="mrc-probe-rx")
         self._spawn(self._report_emit_loop, name="mrc-report-emit")
 
     def stop(self, *, timeout_s: float = 1.0) -> None:
         self._stop.set()
-        # Close the single rx socket; per-plane entries in
-        # `_probe_sockets` may alias the same socket object, so close
-        # each unique fd once.
-        seen: set[int] = set()
-        for s in list(self._probe_sockets.values()):
-            sid = id(s)
-            if sid in seen:
-                continue
-            seen.add(sid)
-            try:
-                s.close()
-            except OSError:
-                pass
+        try:
+            self.transport.close()
+        except Exception:
+            pass
         deadline = time.monotonic() + timeout_s
         for t in self._threads:
             remaining = deadline - time.monotonic()
@@ -791,220 +667,124 @@ class ReceiverMrcAgent:
     # --- thread bodies -------------------------------------------------
 
     def _probe_rx_loop(self) -> None:
-        """Single rx loop; on PROBE, send PROBE_REPLY pinned to ingress NIC.
+        """On PROBE rx, learn sender + send a PROBE_REPLY on the same EV.
 
-        Plane attribution for the agent's bookkeeping comes from
-        `probe.plane_id` (carried in the payload). The reply egress NIC,
-        however, is pinned via IPV6_PKTINFO cmsg to the ifindex the
-        probe arrived on, so that on the wire each plane's replies stay
-        on that plane. Without this pin, the unbound rx socket's
-        default-route egress funnels all replies to one plane and the
-        sender's per-plane BTD-bound sockets on other planes never see
-        any reply traffic (manifests as EV demotion of all but one plane
-        in baseline scenarios).
-
-        Falls back to plain sendto when no PKTINFO cmsg is available
-        (e.g. test fixtures, sockets that don't support recvmsg).
+        Plane / path attribution comes from the probe payload's
+        `plane_id` / `path_id` (every probe carries both). The reply
+        is sent SRv6-encapped on that same EV via the transport, so
+        the round-trip stays plane-symmetric on the wire.
         """
-        sock = self._rx_socket
-        # Buffer sized for one IPV6_PKTINFO cmsg (struct in6_pktinfo is
-        # 20 bytes; CMSG_SPACE rounds up). 128 bytes is comfortably more
-        # than enough for any single cmsg we might receive.
-        ancbufsize = socket.CMSG_SPACE(28) if hasattr(socket, "CMSG_SPACE") else 0
-        use_recvmsg = ancbufsize > 0 and hasattr(sock, "recvmsg")
+        try:
+            sock = self.transport.recv_probe_socket()
+        except RuntimeError as e:
+            log.error("mrc.recv: %s", e)
+            return
         while not self._stop.is_set():
-            ingress_ifindex = 0
             try:
-                if use_recvmsg:
-                    payload, ancdata, _flags, peer = sock.recvmsg(
-                        DEFAULT_RECV_BUFSIZE, ancbufsize
-                    )
-                    for cmsg_level, cmsg_type, cmsg_data in ancdata:
-                        if (
-                            cmsg_level == socket.IPPROTO_IPV6
-                            and cmsg_type == socket.IPV6_PKTINFO
-                        ):
-                            # struct in6_pktinfo { in6_addr ipi6_addr;
-                            #                      unsigned int ipi6_ifindex; }
-                            # Layout: 16-byte addr + 4-byte ifindex (native).
-                            if len(cmsg_data) >= 20:
-                                ingress_ifindex = int.from_bytes(
-                                    cmsg_data[16:20], sys.byteorder, signed=False
-                                )
-                            break
-                else:
-                    payload, peer = sock.recvfrom(DEFAULT_RECV_BUFSIZE)
+                payload, _peer = sock.recvfrom(DEFAULT_RECV_BUFSIZE)
             except socket.timeout:
                 continue
             except OSError:
                 return
             try:
-                probe: Probe = decode_probe(payload)
+                probe = decode_probe(payload)
             except ProbeDecodeError as e:
                 log.debug("mrc.recv: bad probe: %s", e)
                 continue
-            # peer[0] is the source IPv6; peer[1] is the source port.
-            # We use peer[0] for the report destination but the
-            # sender-specified probe_port for replies (which goes to
-            # SPRAY_PROBE_PORT on the sender, NOT peer[1]).
             self._learn_sender(
                 tenant_id=probe.tenant_id, src_id=probe.src_id,
-                underlay_addr=peer[0], report_port=probe.reply_port,
+                plane=probe.plane_id, path=probe.path_id,
+                report_port=probe.reply_port,
             )
-            # Build reply with the probe's identity echoed back.
             try:
                 reply_payload = encode_probe_reply(
                     req_id=probe.req_id,
                     plane_id=probe.plane_id,
                     tx_ns=probe.tx_ns,
                     svc_time_ns=0,  # we don't measure service time today
-                    path_id=probe.path_id,  # echo per-EV identity back
+                    path_id=probe.path_id,
                     tenant_id=probe.tenant_id,
                     src_id=probe.src_id,
                     reply_port=probe.reply_port,
                 )
             except ValueError:
                 continue
-            # Send the reply pinned to the same NIC the probe arrived
-            # on, via IPV6_PKTINFO cmsg. This preserves per-plane
-            # symmetry on the wire even though the rx socket is unbound.
-            # Falls back to plain sendto if we have no ingress_ifindex
-            # (e.g. PKTINFO not supported on this socket / kernel).
             try:
-                if ingress_ifindex > 0 and hasattr(sock, "sendmsg"):
-                    # in6_pktinfo: 16 zero bytes for ipi6_addr (let kernel
-                    # pick src per route on that ifindex) + 4-byte native
-                    # ifindex. Native uint to match struct in6_pktinfo.
-                    pktinfo = b"\x00" * 16 + ingress_ifindex.to_bytes(
-                        4, sys.byteorder, signed=False
-                    )
-                    sock.sendmsg(
-                        [reply_payload],
-                        [(
-                            socket.IPPROTO_IPV6,
-                            socket.IPV6_PKTINFO,
-                            pktinfo,
-                        )],
-                        0,
-                        (peer[0], peer[1]),
-                    )
-                else:
-                    sock.sendto(reply_payload, (peer[0], peer[1]))
+                self.transport.send_probe_reply(
+                    plane=probe.plane_id, path=probe.path_id,
+                    dst_leaf=probe.src_id, payload=reply_payload,
+                )
             except OSError as e:
-                log.debug("mrc.recv: probe reply send failed: %s", e)
+                log.debug("mrc.recv: reply send failed: %s", e)
 
     def _report_emit_loop(self) -> None:
         """Every loss_window_ms, emit a LOSS_REPORT per known flow."""
         interval_s = self.cfg.loss_window_ms / 1000.0
-        # One emit socket; UDP, kernel picks source IPv6 for routing.
-        emit_sock = self._open_emit_socket()
-        try:
-            while not self._stop.is_set():
-                self._stop.wait(interval_s)
-                if self._stop.is_set():
-                    return
-                self._emit_one_round(emit_sock)
-        finally:
-            try:
-                emit_sock.close()
-            except OSError:
-                pass
+        while not self._stop.is_set():
+            self._stop.wait(interval_s)
+            if self._stop.is_set():
+                return
+            self._emit_one_round()
 
-    def _emit_one_round(self, sock: socket.socket) -> None:
-        """For each known flow, snapshot + send a LOSS_REPORT."""
+    def _emit_one_round(self) -> None:
+        """For each known flow, snapshot + send a LOSS_REPORT.
+
+        The report is steered back to the sender via the transport on
+        the EV cached from the last PROBE we received from that
+        sender. This is the best-known-working reverse EV; no
+        receiver-side health table is required because the sender
+        will catch the missing-report case via its own probe-timeout
+        sweep on a different EV.
+        """
         for flow_key in self.loss_table.known_flows():
             report = self.loss_table.snapshot_and_reset(flow_key)
             if not report.planes:
                 continue
-            # Pick the destination from our sender cache. flow_key
-            # convention in this agent: (tenant_id, src_id, dst_id).
-            # Receiver code in spray.py is responsible for choosing
-            # this convention when calling record_data.
+            # flow_key convention: (tenant_id, src_id, dst_id). Receiver
+            # code in spray.py is responsible for choosing this shape
+            # when calling record_data.
             if not (isinstance(flow_key, tuple) and len(flow_key) >= 2):
-                log.debug("mrc.recv: flow_key %r not in (tid, sid, ...) "
-                          "shape; cannot route report", flow_key)
+                log.debug(
+                    "mrc.recv: flow_key %r not in (tid, sid, ...) "
+                    "shape; cannot route report", flow_key,
+                )
                 continue
             key = (flow_key[0], flow_key[1])
             with self._senders_lock:
                 sender = self._senders.get(key)
             if sender is None:
                 # Never received a probe from this sender; we have no
-                # reply address. Skip (the report will retry next
-                # window once a probe arrives).
+                # reply EV. Skip (the report will retry next window
+                # once a probe arrives).
                 continue
             try:
                 payload = encode_loss_report(
-                    window_id=report.window_id, planes=list(report.planes),
+                    window_id=report.window_id,
+                    planes=list(report.planes),
                 )
             except ValueError:
                 continue
             try:
-                sock.sendto(payload, (sender.underlay_addr,
-                                      sender.report_port))
+                self.transport.send_loss_report(
+                    plane=sender.last_plane, path=sender.last_path,
+                    dst_leaf=sender.src_id, payload=payload,
+                )
             except OSError as e:
-                log.debug("mrc.recv: loss report sendto failed: %s", e)
+                log.debug("mrc.recv: loss report send failed: %s", e)
 
     # --- helpers -------------------------------------------------------
 
     def _learn_sender(
         self, *, tenant_id: int, src_id: int,
-        underlay_addr: str, report_port: int,
+        plane: int, path: int, report_port: int,
     ) -> None:
         with self._senders_lock:
             self._senders[(tenant_id, src_id)] = _SenderAddr(
-                underlay_addr=underlay_addr,
+                src_id=src_id,
+                last_plane=plane,
+                last_path=path,
                 report_port=report_port,
             )
-
-    def _default_probe_socket(self, plane: int) -> socket.socket:
-        """Open the (single) receiver-side probe rx socket.
-
-        Phase 1a step 3: there is only ONE receiver probe socket; the
-        `plane` parameter is preserved in the signature so test
-        fixtures that inject per-plane factories continue to work
-        without changes. The first call (plane=0) returns the rx
-        socket; subsequent calls return the same object so the agent
-        constructor's "drain extras" loop is a no-op.
-
-        The socket is bound to `(::, SPRAY_PROBE_PORT)` with no
-        SO_BINDTODEVICE: plane attribution comes from the probe
-        payload's `plane_id` (every probe carries this), not from
-        which socket / device received the datagram. Under yellow's
-        host-side seg6local decap the inner packet is delivered as if
-        it came from `lo`, so a NIC-bound rx socket would miss it;
-        the unbound socket works for both tenants.
-        """
-        if self.cfg.use_loopback:
-            bind_addr = "::1"
-            # Tests with use_loopback typically run sender+receiver in
-            # one process; the test fixture may inject its own factory,
-            # but if it falls through to us, keep the legacy per-plane
-            # port-offset shape so the existing in-process patterns
-            # (sender's `peer.probe_port + plane` source-port encoding)
-            # remain valid for whichever plane=0 call we serve.
-            bind_port = SPRAY_PROBE_PORT + 100 + plane
-        else:
-            bind_addr = "::"
-            bind_port = SPRAY_PROBE_PORT
-        # If we've already opened the rx socket on a previous call,
-        # return the same instance — the constructor's drain-loop
-        # relies on identity to skip closing it.
-        if self._default_rx_socket is not None:
-            return self._default_rx_socket
-        sock = _open_udp_socket(
-            iface=None, bind_addr=bind_addr, bind_port=bind_port,
-            use_loopback=self.cfg.use_loopback,
-        )
-        self._default_rx_socket = sock
-        return sock
-
-    def _open_emit_socket(self) -> socket.socket:
-        bind_addr = "::1" if self.cfg.use_loopback else "::"
-        # Use ephemeral port; kernel routing picks the egress NIC.
-        return _open_udp_socket(
-            iface=None, bind_addr=bind_addr, bind_port=0,
-            use_loopback=self.cfg.use_loopback,
-        )
 
     def _spawn(self, fn, *, name: str, args: tuple = ()) -> None:
         t = threading.Thread(target=fn, name=name, args=args, daemon=True)
