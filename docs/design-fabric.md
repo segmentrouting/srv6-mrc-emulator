@@ -75,7 +75,7 @@ fc00:0002:f003:e00a:d000::
 └──┬───┘ └┬──┘ └┬─┘ └┬─┘
    │      │     │    └─ d000  : tenant-ID green → Vrf-green at egress leaf
    │      │     └────── e00a  : spine03 uA toward leaf10 (in plane 2)
-   │      └──────────── f003  : leafXY uA toward spine02 
+   │      └──────────── f003  : leaf uA toward spine03 
    └─────────────────── 0002  : plane 2 block
 ```
 
@@ -103,7 +103,7 @@ fc00:0002:f003:e00a:d000::
 ```
 green-host00 NICs eth1..eth4   (anycast 2001:db8:bbbb:00::2 on all four)
    │ (encap by host or upstream controller; one of 4 NICs picked per packet)
-   │  outer dst: fc00:000<P>:2<L>:f<S>:d000::         <P> = chosen plane
+   │  outer dst: fc00:000<P>:f00<S>:e00<L>:d000::      <P> = chosen plane
    ▼
    ─►  fabric (uA hops)  ─►  egress p<P>-leaf<L>.Ethernet32 (Vrf-green)
                               uDT6 d000 → decap → connected /64 → host
@@ -121,7 +121,7 @@ sees one socket regardless of which plane delivered it.
 ```
 yellow-host00 NICs eth1..eth4    (inner anycast 2001:db8:cccc:00::2 on
                                   all 4 NICs + lo nodad — Phase 1a)
-   │  encap; outer dst: fc00:000<P>:f<S>:e<L>:e009:d001::    <P> = chosen plane
+   │  encap; outer dst: fc00:000<P>:f00<S>:e00<L>:e009:d001::  <P> = chosen plane
    ▼
    ─►  fabric (uA hops)  ─►  egress p<P>-leaf<NN>.Ethernet36 (default VRF)
                                ─►  yellow-host<NN>.eth(P+1) [anycast cccc:<NN>::2]
@@ -166,7 +166,7 @@ If your host can't accommodate 96 SONiC nodes, edit
 `topologies/<smaller>/topo.yaml` to keep both):
 
 ```yaml
-planes: 2                # 48 SONiC + 32 hosts, 320 veth pairs
+planes: 2                # 24 SONiC + 16 hosts, 96 veth pairs
 spines_per_plane: 4      # halve again per plane
 leaves_per_plane: 8
 ```
@@ -199,7 +199,8 @@ Hosts will reduce to the new `leaves_per_plane` count. Re-run
   spray, and scenario-driven runs end-to-end.
 - `./results-format.md` — how to read the per-flow ASCII summary
   and JSON reports `run-scenario` (`srv6_mrc/mrc/run.py`) produces.
-- `./design-appendix.md` — rationale for the major design decisions, including
-  §10 on the plane-independent inner addressing that makes spray work.
+- `./design-appendix.md` — rationale for the major design decisions.
+- `./architecture.md` §2 — the plane-independent inner addressing
+  invariant that makes spray work.
 
 

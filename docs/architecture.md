@@ -8,10 +8,10 @@ one describes **why the layers are structured the way they are** and how
 that structure maps to the production system in the OpenAI/Microsoft MRC +
 SRv6 paper (`resilient-ai-supercomputer-networking-using-mrc-and-srv6.md`).
 
-## Roles
+## 1. Roles
 
 In a production MRC deployment there are three clearly separated systems or roles,
-which the MRC emulator tries to capture or model:
+which the MRC emulator captures or models:
 
 | Role            | Production analog                          | Emulator analog                                   |
 |-----------------|--------------------------------------------|---------------------------------------------------|
@@ -33,9 +33,10 @@ These roles have very different addressing concerns:
   forwarding tables are static and do not change in response to failures.
 
 In our current code these three roles are interleaved across `runner.py`,
-`mrc/agent.py`, `cli/spray.py` and `cli/routes.py`. Module restructure to
-match the three-role boundary is **Phase 1** work tracked in
-`design-mrc.md`.
+`mrc/agent.py`, `cli/spray.py` and `cli/routes.py`. The MRC layer is a
+faithful per-`(plane, path)` EV state machine; the boundary between
+"NIC" and "fabric" code is logical rather than enforced by process
+isolation.
 
 ## 2. Addressing model 
 
@@ -165,14 +166,14 @@ remarks in `design-mrc.md` and `design-multi-tenant.md`.
 | Routing                          | Static SRv6 uN                         | Static SRv6 uA                        | Operator preference                              |
 | PFC                              | Disabled                               | N/A (no RDMA)                         | Match in spirit                                  |
 | Transport                        | RoCEv2 + MRC extensions                | Plain UDP spray                       | Verbs unavailable in emulator                    |
-| EV granularity                   | 100–256 EVs per QP                     | 32 EVs per QP (8 per plane)            | Plane/Path fidelity is enough for the scenarios |
-| Spray policy                     | EV[k] rotated per packet               | Round-robin / hash / health-aware     | Match in spirit at plane/path granularity             |
+| EV granularity                   | 100–256 EVs per QP                     | Up to NUM_PLANES × paths_per_plane EVs per QP (default 32 on 4p-8x16) | Plane/Path fidelity is enough for the scenarios |
+| Spray policy                     | EV[k] rotated per packet               | round_robin / hash5tuple / weighted / ev_spray / health_aware_mrc | Match in spirit at plane/path granularity             |
 | Loss signal — congestion         | Packet trimming → NACK → fast retx     | **Not available**                     | docker-sonic-vs cannot trim                      |
 | Loss signal — failure            | Untrimmed loss → demote EV             | Receiver loss-fusion → demote path   | The only loss signal we have                     |
 | Load-balance signal              | ECN → migrate EV within plane          | **Not implemented**                   | ECN not available in docker-sonic-vs |
-| Probes                           | Background EV resurrection probes      | Emulator probes all available EVs                  | Match in spirit                                  |
+| Probes                           | Background EV resurrection probes      | Emulator probes all EVs every interval | Stronger than paper (we have CPU budget for it) |
 | Fabric health mapping            | Clustermapper (1 ms/link)              | **Not implemented**                   | Out of scope for current phases                  |
-| Reverse-path EV management       | Small reverse EV set + EV probes       | Matching plane/path replies replies                     | EVs exist in both directions |
+| Reverse-path EV management       | Small reverse EV set + EV probes       | Receiver replies on the same (plane, path) as inbound PROBE | EVs exist symmetrically in both directions |
 | EV state machine                 | active / backup / inactive             | UNKNOWN / GOOD / ASSUMED_BAD          | Equivalent at plane/path granularity                  |
 | EV demotion threshold            | Binary (first untrimmed loss)          | Configurable per scenario             | We need knobs because we have one signal         |
 

@@ -6,17 +6,17 @@ Example: *`green-host00`* has 4 uplinks, one to *`leaf00`* in each of the 4 plan
 
 The **docker-sonic-vs** is pretty lightweight and takes up only 160MB of memory. That said, the lab has been tested on Ubuntu 22.04 and 24.04 virtual machines with 32 vCPU and 96GB of memory, which appears to be more than sufficient.
 
-1. Download a **docker-sonic-vs** image that supports SRv6 uSID shift-and-forward
+1. Download a **docker-sonic-vs** image that supports SRv6 uSID shift-and-forward. The `Branch Master` version on the public sonic downloads page works well: [docker-sonic-vs.gz](https://artprodcus3.artifacts.visualstudio.com/Af91412a5-a906-4990-9d7c-f697b81fc04d/be1b070f-be15-4154-aade-b1d3bfb17054/_apis/artifact/cGlwZWxpbmVhcnRpZmFjdDovL21zc29uaWMvcHJvamVjdElkL2JlMWIwNzBmLWJlMTUtNDE1NC1hYWRlLWIxZDNiZmIxNzA1NC9idWlsZElkLzExMTc1MDIvYXJ0aWZhY3ROYW1lL3NvbmljLWJ1aWxkaW1hZ2UudnM1/content?format=file&subpath=/target/docker-sonic-vs.gz)
 
 2. Install Containerlab: https://containerlab.dev/install/
 
 3. Clone this repo
 ```bash
-git clone https://github.com/segmentrouting/srv6-ai-fabric.git
+git clone https://github.com/segmentrouting/srv6-mrc-emulator.git
 ```
 
 ```bash
-cd ./srv6-ai-fabric
+cd ./srv6-mrc-emulator
 ```
 
 4. Build the Alpine-srv6-scapy docker image for our simulated hosts
@@ -35,14 +35,7 @@ make deploy
 sudo clab deploy -t topologies/4p-8x16/topology.clab.yaml
 ```
 
-The topology will take a couple minutes to fully deploy. Once the containers have been up for 2+ minutes its safe to run the configuration script.
-
-5. Check containers/nodes' status
-```bash
-docker ps
-```
-
-6. Run the **config** target to apply sonic *`config_db.json`* and *`frr.conf`* configs to each device (under `topologies/4p-8x16/config/`)
+6. Run `make config` to apply sonic *`config_db.json`* and *`frr.conf`* configs to each device (under `topologies/4p-8x16/config/`)
 ```bash
 make config
 # equivalent to:
@@ -66,23 +59,21 @@ Once it has completed you should see output something like this:
 Deploy complete!
 ```
 
-### Quick test - Tenant Green - Host SRv6 Encap, Egress Leaf SRv6 uDT
-
-1. Add a test route from *`green-host00`* to *`green-host15`* thru *`fabric plane-0`*
-
-`Path: green-host00 -> p0-leaf00 -> p0-spine00 -> p0-leaf15 -> green-host15`
-
+7. Install Green and Yellow Tenant Host Routes (useful for verifying paths, etc.)
 ```bash
-docker exec -it green-host00 ip -6 route add 2001:db8:bbbb:f::/64 encap seg6 mode encap.red segs fc00:0:f000:e00f:d000:: dev eth1
-docker exec -it green-host15 ip -6 route add 2001:db8:bbbb::/64 encap seg6 mode encap.red segs fc00:0:f000:e000:d000:: dev eth1
+make host-routes
+# equivalent to:
+routes apply -f topologies/4p-8x16/routes/full-mesh.yaml
 ```
 
-2. Run a ping from *`green-host00`* to *`green-host15`*
+### Quick test - Tenant Green - Host SRv6 Encap, Egress Leaf SRv6 uDT
+
+1. Run a ping from *`green-host00`* to *`green-host15`*
 ```bash
 docker exec -it green-host00 ping 2001:db8:bbbb:f::2 -i .3
 ```
 
-3. In another terminal session run tcpdump on the sonic nodes' interfaces along the path:
+1. In another terminal session run tcpdump on the sonic nodes' interfaces along the path:
 
 tcpdump Plane-0 Leaf00 (*`p0-leaf00`*) ingress from *`green-host00`*
 ```bash
@@ -138,22 +129,13 @@ docker exec -it p0-leaf15 tcpdump -ni Ethernet32
 
 `Path: yellow-host01 -> p1-leaf01 -> p1-spine01 -> p1-leaf14 -> yellow-host14`
 
-Phase 1a: yellow's inner DA is now anycast `2001:db8:cccc:<NN>::2` (on
-`eth1..eth4` + `lo`, `nodad`) instead of the historical `cccd:<NN>::1`
-on `lo`. The kernel `seg6 encap` route below targets the *peer*'s
-anycast, which is not locally assigned, so the encap path works. The
-spray / MRC data and control paths bypass kernel `seg6 encap` routes
-entirely as of Phase 1b — they build the outer in user space via
-`srv6_mrc/encap.py` (`build_outer_packet`). The manual route below
-is kept as a debugging fallback so simple `ping`/`tcpdump` flows still
-exercise SRv6 encap.
 
 ```bash
 docker exec -it yellow-host01 ip -6 route add 2001:db8:cccc:e::2/128 encap seg6 mode encap.red segs fc00:1:f001:e00e:e009:d001:: dev eth1
 docker exec -it yellow-host14 ip -6 route add 2001:db8:cccc:1::2/128 encap seg6 mode encap.red segs fc00:1:f001:e001:e009:d001:: dev eth1
 ```
 
-2. Run a ping from *`yellow-host01`* to *`yellow-host14`*
+1. Run a ping from *`yellow-host01`* to *`yellow-host14`*
 
 
 The ping should be sourced from *`yellow-host01's`* anycast address: **-I 2001:db8:cccc:1::2**
@@ -184,28 +166,6 @@ docker exec -it p1-leaf14 tcpdump -ni Ethernet36
 docker exec -it yellow-host14 tcpdump -ni eth2
 ```
 
-### Install Green and Yellow Tenant Test Routes
-
-1. Run *`host-routes`* to install the full-mesh route set on hosts (every host can reach every other host of the same tenant; 1920 routes total):
-```bash
-make host-routes
-# equivalent to:
-routes apply -f topologies/4p-8x16/routes/full-mesh.yaml
-
-# alternative: smaller 8-pair-per-tenant set for ad-hoc testing:
-#   make host-routes ROUTES=reference-pairs
-```
-
-2. List the added routes:
-```bash
-routes list
-```
-
-Other ready-made specs in *`topologies/4p-8x16/routes/`*:
-- *`full-mesh.yaml`* — every host talks to every other host across 4-planes (1920 routes)
-- *`host00-fanout.yaml`* — host00 reaches all 15 peers across 4-planes (120 routes)
-
-See *`routes --help`* for `delete -f`, `delete --all`, and `list` subcommands.
 
 ### Spray a flow across all 4 planes (MRC demo)
 
@@ -257,4 +217,86 @@ for p in 0 1 2 3; do
   done
   echo
 done
+```
+
+
+>[!Note]
+> the `make` commands in the following section default to the 4-plane 8x16 spine-leaf topology. If you wish to work with another topology use `make TOPO=<topology-directory-name> deploy/config/etc.`
+> Example `make TOPO=2p-4x8 deploy` will deploy the smaller 2-plane 4x8 spine-leaf topology
+
+```bash
+# 0. install Python deps for the controller side
+pip install -e '.[dev]'
+
+# 1. build the host image (alpine + scapy + srv6_mrc)
+#    One image (alpine-srv6-scapy:1.0) serves every topology;
+#    topo.yaml is bind-mounted into containers at runtime.
+make image
+
+# 2. Optional: (re)generate topology.clab.yaml + per-node SONiC/FRR configs - do this only if you want to change the topology
+# make regen
+
+# 3. deploy the lab (containerlab)
+make deploy
+
+# 4. push SONiC + FRR configs into the running containers.
+#    Self-healing: any leaf whose SIDs failed to install gets re-pushed.
+make config
+
+# 5. install per-tenant SRv6 routes on hosts (full-mesh by default;
+#    override with ROUTES=reference-pairs etc.). This is what gives
+#    each host its `ip -6 route ... encap seg6 ...` entries per plane,
+#    and (for yellow) the per-NIC seg6local End.DT6 decap policies.
+make host-routes
+
+# 6. run a traffic scenario (spray + per-plane stats + reorder histograms)
+make scenario SCEN=green-mrc-baseline      # green tenant, MRC enabled, no faults
+make scenario SCEN=yellow-baseline         # yellow tenant, round_robin, no faults
+
+# MRC scenarios
+make scenario SCEN=green-mrc-plane-loss        # 1% loss on plane 2 (green, MRC)
+make scenario SCEN=green-mrc-plane-latency     # plane 2 +5ms (green, MRC)
+make scenario SCEN=green-mrc-ev-spray          # per-EV sender control (green, MRC)
+make scenario SCEN=yellow-mrc-ev-spray         # per-EV sender control (yellow, MRC)
+```
+
+Ad-hoc diagnostics:
+
+```bash
+make verify-config                    # re-check + repair leaf SIDs without re-pushing config_db
+make TOPO=2p-4x8 deploy config host-routes scenario   # smaller variant (8 spines + 16 leaves + 16 hosts)
+```
+
+The CLIs (`spray`, `routes`, `run-scenario`) work both on the lab host
+(after `pip install -e .`) and inside the host containers (baked into
+the image at build time).
+
+## Run a different topology
+
+Each variant lives under `topologies/<name>/` with its own `topo.yaml`
+declaring planes / spines / leaves / images / clab name. To run the
+existing 2-plane variant:
+
+```bash
+make TOPO=2p-4x8 regen deploy config host-routes
+make TOPO=2p-4x8 scenario SCEN=yellow-baseline
+```
+
+`make image` only needs to run once -- the same host image
+(`alpine-srv6-scapy:1.0`) serves every topology, because each variant's
+`topo.yaml` is bind-mounted into its host containers at runtime (via
+the generated `topology.clab.yaml`). Inside a container, the runtime
+reads `SRV6_TOPO=/etc/srv6_mrc/topo.yaml`. Outside containers (lab
+host, dev box), it reads `topologies/<name>/topo.yaml` relative to the
+repo root, picking the active variant from `TOPO=`.
+
+To add a new variant, copy an existing `topologies/<name>/topo.yaml`,
+adjust the dimensions, and run `make TOPO=<new> regen`. The generator
+emits a fresh `topology.clab.yaml` plus per-node `config/` from
+scratch.
+
+## Testing
+
+```bash
+make test     # ~1.5s, no external deps
 ```

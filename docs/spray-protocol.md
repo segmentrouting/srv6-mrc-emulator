@@ -203,11 +203,21 @@ The sender infers its own tenant + id from the container hostname (`green-host00
 ### Picking a policy
 
 - `round_robin` (default) — packet N goes to plane `N % 4`. Best for
-  surfacing reorder behavior and for the MRC headline demo.
+  surfacing reorder behavior.
 - `hash5tuple` — hash of `(src, dst, sport, dport, proto)` picks one
   plane per flow. With a single flow this pins all packets to one
   plane (per-plane sent counts will be unbalanced, `reord` will be 0).
 - `weighted:30,30,20,20` — biased random; sum need not be 100.
+- `ev_spray[:N]` — rotates BOTH plane and spine per packet, so a
+  single flow walks `4 × N` distinct `(plane, path)` EVs. `N` defaults
+  to `NUM_SPINES` (8 on 4p-8x16); set lower to constrain the spine
+  subset per (src, dst) pair.
+- `health_aware_mrc` — same per-packet rotation as `ev_spray`, but
+  weights are driven by the EV state machine. Reads `EVStateTable`
+  and drops broken `(plane, path)` EVs to weight 0 while survivors
+  absorb the slack. Requires the scenario YAML to declare an
+  `mrc:` block (even an empty one) so the orchestrator pushes
+  config to the senders. See `design-mrc.md` for the full table.
 
 For more sophisticated workflows (multi-flow runs, fault injection,
 result aggregation), use `run-scenario` and YAML scenarios. See

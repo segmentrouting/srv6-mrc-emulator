@@ -8,7 +8,7 @@ plane-health signaling back to the senders.
 Read this in the context of:
 
 - `../README.md` — the 4-plane Clos and uSID address scheme
-- `../design-appendix.md` §10 — the plane-independent inner addressing
+- `../architecture.md` §2 — the plane-independent inner addressing
   invariant MRC relies on
 - `./spray-protocol.md` — the round-robin sprayer this layer extends
 - The OpenAI MRC + SRv6 paper:
@@ -59,11 +59,12 @@ srv6_mrc/
     └── loss_compute.py  # per-EV SentWindowRing on the sender
 
 topologies/<name>/scenarios/
-├── baseline.yaml        # 16 flows, round-robin, no failure
-├── hash5tuple.yaml      # 16 flows, 5-tuple hash policy, no failure
-├── plane-loss.yaml      # 16 flows + 5% loss on plane 2
-├── plane-blackhole.yaml # 16 flows + plane 2 blackhole
-└── plane-latency.yaml   # 16 flows + 50ms added latency on plane 2
+├── yellow-baseline.yaml         # smoke check (also lives in 2p-4x8)
+├── {green,yellow}-ev-spray.yaml         # data-plane fan-out, no MRC
+├── {green,yellow}-mrc-baseline.yaml     # MRC on, clean fabric
+├── {green,yellow}-mrc-plane-loss.yaml   # netem 5% loss on one plane
+├── {green,yellow}-mrc-plane-latency.yaml # netem +10ms on one plane
+└── {green,yellow}-mrc-ev-spray.yaml     # per-EV granularity + manual link-shut
 ```
 
 ## Data model
@@ -439,17 +440,16 @@ It does **not** speak to SONiC at all. Everything MRC-level is host-side.
 | `srv6_mrc/netem.py` | done |
 | `srv6_mrc/mrc/run.py` orchestrator (CLI: `run-scenario`) | done |
 | `topologies/4p-8x16/scenarios/green-mrc-baseline.yaml` (smoke test) | done |
-| `topologies/4p-8x16/scenarios/yellow-baseline.yaml` | done |
-| `topologies/4p-8x16/scenarios/green-mrc-plane-{loss,latency}.yaml` | done |
-| Yellow fault scenarios: `yellow-plane-{loss,blackhole,latency}.yaml` | TODO |
+| `topologies/4p-8x16/scenarios/yellow-baseline.yaml` (smoke; also in 2p-4x8) | done |
+| `topologies/4p-8x16/scenarios/green-mrc-plane-{loss,latency}.yaml` | done, **lab-validated** |
+| `topologies/4p-8x16/scenarios/yellow-mrc-plane-{loss,latency}.yaml` | done, lab-validated |
+| `topologies/4p-8x16/scenarios/{green,yellow}-mrc-ev-spray.yaml` (Phase 1b step 2) | done, lab-validated |
 | `srv6_mrc/mrc/ev_state.py` EVStateTable + state machine | done |
 | `srv6_mrc/mrc/probe.py` PROBE / PROBE_REPLY / LOSS_REPORT wire format | done |
 | `srv6_mrc/policy.py` `health_aware_mrc` wired to EVStateTable | done |
 | Sender agent: probe emit + RX demux + state mutation (`mrc/agent.py` `SenderMrcAgent`) | done |
 | Receiver agent: probe-reply emit + LOSS_REPORT emit (`mrc/agent.py` `ReceiverMrcAgent`) | done |
 | Scenario YAML schema: `mrc:` block (enabled + tunables) | done |
-| `green-mrc-{baseline,plane-loss,plane-latency}.yaml` | done, **lab-validated** |
-| Yellow MRC scenarios (`yellow-mrc-*.yaml`) | done, lab-validated through Phase 1b step 1; step 2 (per-EV probes) lab redeploy pending |
 | Single-process loopback integration test (sender ↔ receiver ↔ EVStateTable) | done |
 | Per-host MRC agent w/ IPC (deduplicate probes across N flows on one host) | future |
 | Compare round-robin vs hash5tuple vs health_aware_mrc under fault | TODO |

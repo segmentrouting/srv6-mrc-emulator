@@ -1,4 +1,4 @@
-# srv6-ai-fabric
+# srv6-mrc-emulator
 
 A research-grade simulator for Multipath Reliable Connection
 (MRC) layered on top of a static SRv6 uSID dataplane. The simulator uses 
@@ -16,13 +16,6 @@ generator tool so additional topologies can be added under `topologies/<name>/`.
   own SRv6 locator + transit SIDs as `static-sids` in FRR
 - **config.sh shell script**: containerlab deploys the topology,  
   `scripts/config.sh` pushes the sonic nodes' config_db.json and FRR configs.
-- **Self-healing config push**: `make config` runs `scripts/config.sh`
-  which pushes FRR config to every switch in parallel, then verifies
-  that the kernel FIB on each leaf contains the expected number of
-  `seg6local` entries (the count is derived per-node from the
-  generated `frr.conf` so it works for any topology and any tenant
-  mix). Any leaf whose SIDs were silently dropped during the FRR
-  staticd startup race gets re-pushed automatically.
 - **Userspace MRC sender.** `spray` builds per-plane uSID-encapsulated
   UDP frames in scapy, varies the spine per packet under the
   `ev_spray` / `health_aware_mrc` policies so each packet traces a
@@ -33,23 +26,17 @@ generator tool so additional topologies can be added under `topologies/<name>/`.
   packets, with per-`(plane, path)` granularity.
 - **Fault injection.** Scenarios under `topologies/<name>/scenarios/`
   drive `tc netem` against host veths via `nsenter`, exercising
-  plane-loss, plane-latency, and plane-blackhole failure modes.
+  plane-loss, plane-latency, and plane-blackhole failure modes. 
+  Alternatively the user can simply shutdown fabric interfaces with 
+  `docker exec -it <nodename> config interface shutdown <interface>`
 - **Multi-tenancy with two SRv6 patterns.** Both tenants perform
   host-encap. Green is *leaf-decapped* (uDT6 into `Vrf-green` on
   every leaf; the destination is an anycast `2001:db8:bbbb:<NN>::2`
   configured on all 4 of the host's NICs). Yellow is *host-decapped*
   via per-NIC `seg6local End.DT6 table 0` policies on the destination
-  host. Phase 1a: yellow now mirrors green's anycast plan exactly
-  with `bbbb`→`cccc` — anycast `2001:db8:cccc:<NN>::2` on all 4 NICs
-  and on `lo` (`nodad`); the leaf-side gateway `2001:db8:cccc:<NN>::1`
-  is also anycast across all 4 planes. Both paths run end-to-end at
-  0% loss; yellow shows slightly higher reorder due to the extra
-  software decap stage.
+  host. 
 
-For the why behind each design choice, see [`docs/design-fabric.md`](./docs/design-fabric.md),
-[`docs/design-mrc.md`](./docs/design-mrc.md), and [`docs/design-appendix.md`](./docs/design-appendix.md).
-
-For detail on multi-tenant design for SRv6 AI factories see [`docs/design-multi-tenant.md](./docs/design-multi-tenant.md)
+For more detail see design docs under [docs/](./docs/)
 
 ## Layout
 
@@ -112,90 +99,6 @@ results/               scenario JSON output (gitignored)
 
 ## Quickstart
 
->[!Note]
-> the `make` commands in the following section default to the 4-plane 8x16 spine-leaf topology. If you wish to work with another topology use `make TOPO=<topology-directory-name> deploy/config/etc.`
-> Example `make TOPO=2p-4x8 deploy` will deploy the smaller 2-plane 4x8 spine-leaf topology
-
-```bash
-# 0. install Python deps for the controller side
-pip install -e '.[dev]'
-
-# 1. build the host image (alpine + scapy + srv6_mrc)
-#    One image (alpine-srv6-scapy:1.0) serves every topology;
-#    topo.yaml is bind-mounted into containers at runtime.
-make image
-
-# 2. Optional: (re)generate topology.clab.yaml + per-node SONiC/FRR configs - do this only if you want to change the topology
-# make regen
-
-# 3. deploy the lab (containerlab)
-make deploy
-
-# 4. push SONiC + FRR configs into the running containers.
-#    Self-healing: any leaf whose SIDs failed to install gets re-pushed.
-make config
-
-# 5. install per-tenant SRv6 routes on hosts (full-mesh by default;
-#    override with ROUTES=reference-pairs etc.). This is what gives
-#    each host its `ip -6 route ... encap seg6 ...` entries per plane,
-#    and (for yellow) the per-NIC seg6local End.DT6 decap policies.
-make host-routes
-
-# 6. run a traffic scenario (spray + per-plane stats + reorder histograms)
-make scenario SCEN=green-mrc-baseline      # green tenant, MRC enabled, no faults
-make scenario SCEN=yellow-baseline         # yellow tenant, round_robin, no faults
-
-# MRC scenarios
-make scenario SCEN=green-mrc-plane-loss        # 1% loss on plane 2 (green, MRC)
-make scenario SCEN=green-mrc-plane-latency     # plane 2 +5ms (green, MRC)
-make scenario SCEN=green-mrc-ev-spray          # per-EV sender control (green, MRC)
-make scenario SCEN=yellow-mrc-ev-spray         # per-EV sender control (yellow, MRC)
-```
-
-Ad-hoc diagnostics:
-
-```bash
-make verify-config                    # re-check + repair leaf SIDs without re-pushing config_db
-make TOPO=2p-4x8 deploy config host-routes scenario   # smaller variant (8 spines + 16 leaves + 16 hosts)
-```
-
-The CLIs (`spray`, `routes`, `run-scenario`) work both on the lab host
-(after `pip install -e .`) and inside the host containers (baked into
-the image at build time).
-
-## Run a different topology
-
-Each variant lives under `topologies/<name>/` with its own `topo.yaml`
-declaring planes / spines / leaves / images / clab name. To run the
-existing 2-plane variant:
-
-```bash
-make TOPO=2p-4x8 regen deploy config host-routes
-make TOPO=2p-4x8 scenario SCEN=yellow-baseline
-```
-
-`make image` only needs to run once -- the same host image
-(`alpine-srv6-scapy:1.0`) serves every topology, because each variant's
-`topo.yaml` is bind-mounted into its host containers at runtime (via
-the generated `topology.clab.yaml`). Inside a container, the runtime
-reads `SRV6_TOPO=/etc/srv6_mrc/topo.yaml`. Outside containers (lab
-host, dev box), it reads `topologies/<name>/topo.yaml` relative to the
-repo root, picking the active variant from `TOPO=`.
-
-To add a new variant, copy an existing `topologies/<name>/topo.yaml`,
-adjust the dimensions, and run `make TOPO=<new> regen`. The generator
-emits a fresh `topology.clab.yaml` plus per-node `config/` from
-scratch.
-
-## Testing
-
-```bash
-make test     # ~1.5s, no external deps
-```
-
-Tests cover address derivation, SID-list construction, the spray wire
-format, reorder-distance computation, scenario YAML parsing, route-spec
-patch generation, and the MRC orchestrator's argv plumbing.
 
 
 ## License

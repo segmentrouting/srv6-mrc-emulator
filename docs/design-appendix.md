@@ -133,47 +133,35 @@ hyperscale GPU backend, per-plane wins.
 
 ## 3. Tenant SIDs: flat vs per-plane
 
-Closely related to §2, but worth calling out separately.
+Closely related to §2, but worth calling out separately. For *what*
+each tenant's decap looks like end-to-end, see `architecture.md` §2
+(addressing model) and `design-fabric.md` "Tenant models in this lab"
+— this appendix entry only records *why* the tenant SIDs are
+per-plane rather than reserved in a flat space.
 
-### Green (hybrid: leaf decap)
-
-In the per-plane scheme, each leaf in plane `<P>` advertises
-`fc00:000<P>:d000::/48 uDT6 vrf Vrf-green`. Because the leaf is plane-specific
-*and* the SID is plane-specific, this is unambiguous: the controller picks an
-egress leaf, the path's last uSID is `d000`, decap happens there.
-
-### Yellow (host-based: host decap)
-
-Yellow hosts are multi-homed across all four planes. A packet's outer
-destination is determined by which plane the controller chose to deliver
-through, so the destination's plane block could be any of the four. The host
-must recognize all of them. We install four `seg6local` entries:
-
-```
-fc00:0000:d001::/48 dev eth1 encap seg6local action End.DT6 table 0
-fc00:0001:d001::/48 dev eth2 encap seg6local action End.DT6 table 0
-fc00:0002:d001::/48 dev eth3 encap seg6local action End.DT6 table 0
-fc00:0003:d001::/48 dev eth4 encap seg6local action End.DT6 table 0
-```
-
-Each is bound to the plane's NIC. Linux matches on destination prefix; the
-`dev` binding is a sanity guard (ensures the packet arrived on the plane it
-claimed to come from).
+In the per-plane scheme each leaf advertises a plane-specific tenant
+uDT SID (`fc00:000<P>:d000::/48` for green's leaf decap;
+`fc00:000<P>:d001::/48` matched by `seg6local End.DT6` on the yellow
+host). The yellow host installs **four `seg6local` entries** — one
+per plane — because the `d001` SID lives inside a different plane
+block on each plane.
 
 ### Considered alternative: reserve a flat tenant SID space
 
 We briefly considered placing tenant SIDs in their own /32 (e.g.
-`fc00:f::/32` reserved for "tenant-flat"). That would make `d000` truly
-plane-independent again. We didn't take this path because:
+`fc00:f::/32` reserved for "tenant-flat"). That would make `d000`
+truly plane-independent again. We didn't take this path because:
 
 1. It re-introduces the tier-leak problem in reverse: a SID list now
    straddles two address blocks, and "decap into green" is no longer
    colocated with the leaf locator that owns the decap.
-2. Per-plane tenant SIDs reinforce the plane-isolation model: when plane 2
-   is withdrawn at the WAN, *its* tenant SIDs go with it. With a flat tenant
-   space the controller has to reason about partial reachability.
+2. Per-plane tenant SIDs reinforce the plane-isolation model: when
+   plane 2 is withdrawn at the WAN, *its* tenant SIDs go with it.
+   With a flat tenant space the controller has to reason about
+   partial reachability.
 
-The price (4 seg6local entries per yellow host) is small and bounded.
+The price (4 seg6local entries per yellow host) is small and
+bounded.
 
 ---
 
