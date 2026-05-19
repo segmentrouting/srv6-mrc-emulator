@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "srv6_fabric"
 version = "0.1.0"
-description = "Static SRv6 4-plane fabric simulator with MRC behavior layer for AI cluster research"
+description = "SRv6 fabric emulator + per-EV MRC behavior layer (probes, EV state, loss fusion, EV-aware spray) for AI-cluster networking research"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }

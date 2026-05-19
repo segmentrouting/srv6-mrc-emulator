@@ -13,7 +13,7 @@
 #   make destroy   containerlab destroy
 #
 # Day-to-day:
-#   make test       unit tests (165 tests, ~0.3s)
+#   make test       unit tests (~370 tests, ~1.5s)
 #   make scenario SCEN=green-mrc-baseline   run an MRC scenario from topologies/<TOPO>/scenarios/
 #   make help       this message
 
@@ -85,10 +85,10 @@ host-routes: ## install host kernel routes (override ROUTES=<name>, default full
 
 # --- mrc scenarios ---------------------------------------------------------
 
-SCEN ?= baseline
+SCEN ?= green-mrc-baseline
 
 .PHONY: scenario
-scenario: ## run an MRC scenario (override SCEN=<name>, default baseline)
+scenario: ## run an MRC scenario (override SCEN=<name>, default green-mrc-baseline)
 	$(PYTHON) -m srv6_fabric.mrc.run $(TOPO_DIR)/scenarios/$(SCEN).yaml --verbose
 
 # --- housekeeping ----------------------------------------------------------
