@@ -36,10 +36,11 @@ Read this in the context of:
 ```
 srv6_fabric/
 ├── topo.py              # fabric constants + addressing (reads topo.yaml)
-├── policy.py            # SprayPolicy: round_robin | hash5tuple | weighted | health_aware
+├── policy.py            # SprayPolicy: round_robin | hash5tuple | weighted
+│                        # | ev_spray | health_aware_mrc
 ├── runner.py            # multi-flow send/recv core (engine behind `spray`)
+├── encap.py             # shared raw-socket SRv6 outer-packet builder
 ├── reorder.py           # per-flow reorder distance histograms
-├── health.py            # legacy: per-plane ICMPv6 probe (superseded by mrc/ev_state.py)
 ├── netem.py             # tc/netem injection helpers (runs on the docker host)
 ├── report.py            # write JSON + ascii summary
 ├── cli/
@@ -48,9 +49,14 @@ srv6_fabric/
 └── mrc/
     ├── run.py           # orchestrator: parse scenario, drive senders, merge
     ├── scenario.py      # YAML schema + executor
-    ├── ev_state.py      # per-(tenant,plane) EV state machine (GOOD/ASSUMED_BAD/UNKNOWN)
-    ├── probe.py         # PROBE / PROBE_REPLY / LOSS_REPORT packet build/parse
-    └── policy.py        # health_aware policy wired to EVStateTable
+    ├── agent.py         # SenderMrcAgent + ReceiverMrcAgent
+    ├── transport.py     # MrcTransport ABC + Srv6RawTransport + LoopbackUdpTransport
+    ├── ev_state.py      # per-(tenant, plane, path) EV state machine
+    │                    #   (GOOD / ASSUMED_BAD / UNKNOWN)
+    ├── probe.py         # PROBE / PROBE_REPLY / LOSS_REPORT wire format
+    ├── probe_clock.py   # per-EV in-flight probe bookkeeping + timeout sweep
+    ├── loss_window.py   # per-EV receiver-side loss accounting
+    └── loss_compute.py  # per-EV SentWindowRing on the sender
 
 topologies/<name>/scenarios/
 ├── baseline.yaml        # 16 flows, round-robin, no failure
@@ -194,9 +200,13 @@ over plain UDP/SRv6.
 ### Signal sources
 
 **1. EV Probes (active, OCP-faithful).** Every `probe_interval_ms` the
-sender emits one `PROBE` packet per (tenant, plane) along that plane's
-SID-list. The receiver echoes a `PROBE_REPLY` immediately. Sender
-measures RTT.
+sender emits one `PROBE` packet per `(tenant, plane, path)` EV — i.e.
+`NUM_PLANES × NUM_SPINES` probes per round on the 4p-8x16 lab (32
+probes/round). Each probe is built via `srv6_fabric.encap.build_outer_packet`
+and emitted on a plane-bound raw socket — the same code path the
+EV-spray data plane uses. The receiver echoes a `PROBE_REPLY`
+immediately, on the same `(plane, path)` the inbound PROBE arrived on.
+Sender measures RTT.
 
 - `probe_fail_threshold` consecutive timeouts (no reply within
   `probe_timeout_ms`) → plane transitions to `ASSUMED_BAD`.
@@ -211,10 +221,12 @@ spray on docker-sonic-vs the receiver scapy loop is already CPU-bound;
 (e.g. `250` or `500`) on slower hosts.
 
 **2. Receiver loss feedback (passive, in-band).** The receiver already
-tracks per-(flow, plane) sequence-number gaps for the reorder histogram.
-Every `loss_report_interval_ms` the receiver emits one `LOSS_REPORT`
-packet back to each active sender, summarizing `(seen, expected, max_gap)`
-per plane over the window. The sender:
+tracks per-EV `(plane, path)` sequence-number gaps for the reorder
+histogram (the data payload carries `path` as well as `plane` — see
+*Probe wire format* below). Every `loss_report_interval_ms` the
+receiver emits one `LOSS_REPORT` packet back to each active sender,
+summarizing `(seen, expected, max_gap)` per `(plane, path)` EV over
+the window. The sender:
 
 - Computes `loss_ratio = (expected - seen) / expected` per plane.
 - `loss_ratio > loss_threshold` for two consecutive windows →
@@ -257,25 +269,34 @@ telemetry) with out-of-band (EV Probe) signals.
 
 ### Probe wire format
 
-All three new packet types ride in UDP/IPv6 with the **same outer SRH
-encap** as user spray for the targeted plane, so they exercise the
-exact same forwarding path. Distinct UDP destination ports let the
-receiver demux without disturbing the existing spray RX filter.
+All three new packet types ride in raw-socket IPv6-in-IPv6 with the
+**same outer uSID encap** (`encap.red` semantics; no SRH on the wire
+per the project's hard invariant) as user spray for the targeted
+`(plane, path)` EV, so they exercise the exact same forwarding path
+as data packets. PROBE_REPLY and LOSS_REPORT both land on
+`SPRAY_REPORT_PORT` on the sender and are demuxed by the leading
+magic byte (`0xA6` vs `0xA7`); the agent owns a single rx socket
+rather than one per port.
 
-| Type | UDP dport | Direction | Payload (after UDP header) |
-|---|---|---|---|
-| `PROBE` | `SPRAY_PROBE_PORT = 9998` | sender → receiver | `!HBQQ`: `req_id` (u16), `plane_id` (u8), `tx_ns` (u64), `pad` (u64) |
-| `PROBE_REPLY` | `SPRAY_PROBE_PORT = 9998` | receiver → sender | `!HBQQ`: same layout; `tx_ns` echoed from request, `pad` carries receiver-side service-time in ns |
-| `LOSS_REPORT` | `SPRAY_REPORT_PORT = 9997` | receiver → sender | `!HH` header (`window_id` (u16), `num_planes` (u16)) then `num_planes ×` `!BIII`: `plane_id` (u8), `seen` (u32), `expected` (u32), `max_gap` (u32) |
+Note: the MRC layer uses the term **`path`** (formerly `spine_id`) for
+the spine index inside an EV. The topology layer keeps `spine`.
+Numerically `path == spine` on this fabric.
 
-`PROBE_REPLY` is sent into the **inbound** SID-list for the responding
-plane (i.e. the sender's plane-N SID-list rewritten to point at the
-sender), so the path is symmetric and the measured RTT covers both
-legs. `LOSS_REPORT` is sent via kernel routing (no SRH) — the sender
-just needs to receive it; we don't care which path it took.
+| Type          | UDP dport               | Magic   | Direction          | Payload (after UDP header) |
+|---------------|-------------------------|---------|--------------------|----------------------------|
+| `PROBE`       | `SPRAY_PROBE_PORT = 9998` | `0xA5` | sender → receiver  | `!BBHBBQQHHH`: magic (u8), version (u8), `req_id` (u16), `plane_id` (u8), `path_id` (u8), `tx_ns` (u64), `svc_time_ns` (u64), `tenant_id` (u16), `src_id` (u16), `reply_port` (u16) — 28 bytes |
+| `PROBE_REPLY` | `SPRAY_REPORT_PORT = 9997` | `0xA6` | receiver → sender  | Same layout as `PROBE`; `tx_ns` echoed from request, `svc_time_ns` carries receiver-side service time |
+| `LOSS_REPORT` | `SPRAY_REPORT_PORT = 9997` | `0xA7` | receiver → sender  | Header `!BBHHH`: magic (u8), version (u8), `window_id` (u16), `num_records` (u16), reserved (u16); then `num_records ×` `!BBHIII`: `plane_id` (u8), `path_id` (u8), reserved (u16), `seen` (u32), `expected` (u32), `max_gap` (u32) |
 
-Sequence numbers in `PROBE`/`PROBE_REPLY` are per-(sender, plane) and
-independent from the spray `seq` field; that prevents probe traffic
+`PROBE_REPLY` is sent on the same `(plane, path)` EV the inbound PROBE
+arrived on, so the path is symmetric (modulo any asymmetric fault) and
+the measured RTT covers both legs. `LOSS_REPORT` is sent on the
+last-seen-PROBE EV for the destination sender — also through the
+`MrcTransport` (SRv6-encapped raw-socket in lab), not unencapsulated
+kernel routing.
+
+Sequence numbers in `PROBE`/`PROBE_REPLY` are per-(sender, plane, path)
+and independent from the spray `seq` field; that prevents probe traffic
 from polluting the reorder histogram.
 
 ### Tunables
@@ -337,29 +358,43 @@ code default", never "fell back silently from a typo upstream".
 The existing `runner.py` sender hot-loop is single-threaded (build →
 sendto). MRC adds:
 
-- A **probe timer** (timerfd or simple monotonic-clock check inside the
-  hot loop) that emits probe batches every `probe_interval_ms`.
-- A **second RX socket** on `SPRAY_PROBE_PORT` to consume
-  `PROBE_REPLY`s. Drained by the same scapy receive loop the spray RX
-  already uses, with a port-based demux.
-- A **third RX socket** on `SPRAY_REPORT_PORT` for `LOSS_REPORT`s.
-- A shared `EVStateTable` mutated from RX callbacks and consulted by
-  the `health_aware` policy on every `pick()`.
+- A **probe timer** thread (`mrc-emit`) that emits per-`(plane, path)`
+  probes every `probe_interval_ms` via `MrcTransport.send_probe`.
+- A **single RX socket** on `SPRAY_REPORT_PORT` (`mrc-reply-rx`) that
+  demuxes PROBE_REPLY (`0xA6`) vs LOSS_REPORT (`0xA7`) by magic byte
+  and feeds the appropriate signal source.
+- A **timeout sweep** thread (`mrc-sweep`) that ages in-flight probes
+  out of `probe_clock.py` and records them as losses.
+- A **window-advance** thread (`mrc-window`) that rolls the per-EV
+  `SentWindowRing` forward so receiver-side LOSS_REPORTs always have
+  a matching sent count to compare against.
+- A shared `EVStateTable` mutated from the rx + sweep threads and
+  consulted by the `health_aware_mrc` policy on every `pick()`.
 
-Threading: the EVStateTable is mutated by the RX thread and read by
-the TX hot loop. We use a single `threading.Lock` around state
+All probe / reply / loss-report I/O goes through `MrcTransport`
+(`srv6_fabric/mrc/transport.py`). There is no socket creation in the
+agent itself; constructing a different transport is how the unit
+tests run agents end-to-end on loopback without root or SRv6.
+
+Threading: the EVStateTable is mutated by the rx + sweep threads and
+read by the TX hot loop. We use a single `threading.Lock` around state
 transitions; reads are lock-free (slightly stale state is fine, we're
 voting on plane health over hundreds of ms).
 
 ### Receiver architecture
 
-- Existing reorder bookkeeping already tracks per-plane gaps; we just
-  expose them to a new `LossReporter` that emits `LOSS_REPORT` every
-  `loss_report_interval_ms` to each sender it has heard from.
-- `PROBE` RX handler echoes a `PROBE_REPLY` immediately, with the
-  responder-service-time field set from a monotonic clock delta.
-- Both new responsibilities are in the same scapy receive loop as
-  spray RX; we add port-based dispatch.
+- Existing reorder bookkeeping already tracks per-`(plane, path)` gaps;
+  we expose them to a `LossReporter` thread (`mrc-report-emit`) that
+  emits `LOSS_REPORT` every `loss_report_interval_ms` to each sender
+  it has heard from, via `MrcTransport.send_loss_report` on the
+  last-seen-PROBE EV.
+- A dedicated `mrc-probe-rx` thread drains the receiver's probe rx
+  socket and echoes a `PROBE_REPLY` on the same `(plane, path)` EV
+  the inbound PROBE arrived on. Service time is set from a monotonic
+  clock delta.
+- Both new responsibilities run on dedicated sockets owned by the
+  `MrcTransport`. The data-record hook for per-EV stats is still
+  called from the existing receiver hot loop via `on_packet=`.
 
 ## Orchestration
 
@@ -400,8 +435,8 @@ It does **not** speak to SONiC at all. Everything MRC-level is host-side.
 | Design doc (this file) | done |
 | `srv6_fabric/topo.py`, `policy.py`, `reorder.py` | done |
 | `srv6_fabric/runner.py` (send/recv core; `spray` is a thin CLI shim) | done |
+| `srv6_fabric/encap.py` (shared raw-socket outer-packet builder) | done |
 | `srv6_fabric/netem.py` | done |
-| `srv6_fabric/health.py` (legacy ICMPv6 probe; superseded) | done, deprecated |
 | `srv6_fabric/mrc/run.py` orchestrator (CLI: `run-scenario`) | done |
 | `topologies/4p-8x16/scenarios/baseline.yaml` (smoke test) | done |
 | `topologies/4p-8x16/scenarios/yellow-baseline.yaml` | done |
@@ -414,7 +449,7 @@ It does **not** speak to SONiC at all. Everything MRC-level is host-side.
 | Receiver agent: probe-reply emit + LOSS_REPORT emit (`mrc/agent.py` `ReceiverMrcAgent`) | done |
 | Scenario YAML schema: `mrc:` block (enabled + tunables) | done |
 | `green-mrc-{baseline,plane-loss,plane-latency}.yaml` | done, **lab-validated** |
-| Yellow MRC scenarios (`yellow-mrc-*.yaml`) | done, **blocked** (see "Yellow MRC: known-blocked" below) |
+| Yellow MRC scenarios (`yellow-mrc-*.yaml`) | done, lab-validated through Phase 1b step 1; step 2 (per-EV probes) lab redeploy pending |
 | Single-process loopback integration test (sender ↔ receiver ↔ EVStateTable) | done |
 | Per-host MRC agent w/ IPC (deduplicate probes across N flows on one host) | future |
 | Compare round-robin vs hash5tuple vs health_aware_mrc under fault | TODO |
@@ -446,44 +481,31 @@ to inspect per-plane state, consecutive-demote/recover counters,
 last-loss-ratio, RTT percentiles, and the LossFusionStats counters
 (`paired_with_sent_window` vs `fell_back_to_receiver_expected`).
 
-### Yellow MRC: known-blocked
+### Yellow MRC: resolved blockers (historical)
 
-Yellow MRC scenarios were committed (`2e10f56`) and the addressing
-half of the regression has been fixed in `topo.py` —
-`host_probe_peer_addr` now returns the inner (plane-independent) host
-address for both tenants, and plane selection is purely a
-`SO_BINDTODEVICE` concern on the sender. See `docs/architecture.md` §2
-for the addressing rule this enforces.
+Earlier in Phase 1a the yellow MRC scenarios were blocked on two
+socket-layout bugs. Both have since been fixed and are noted here for
+the design-history trail:
 
-Two further socket-layout issues remain before yellow MRC scenarios can
-be lab-validated end to end:
+1. **Receiver probe RX bind.** Receiver probe sockets were originally
+   bound with `SO_BINDTODEVICE` on `eth(P+1)`. After yellow's
+   `seg6local End.DT6 table 0` action decaps the inner packet, the
+   inner DA (anycast `cccc:<NN>::2`) resolves on `lo` for the
+   table-0 lookup, which never delivers to a socket bound to
+   `eth(P+1)`. **Fix:** the receiver now uses a single rx socket
+   bound to `(::, SPRAY_PROBE_PORT)` without `SO_BINDTODEVICE`, and
+   plane / path attribution comes from the probe payload
+   (`plane_id`, `path_id`) — not the kernel.
+2. **Receiver → sender reply destination.** The receiver used to
+   reply to `peer[0]` (the source address from `recvfrom`), which
+   for yellow was the per-plane underlay (`cccc:<P><A>::2`) — not a
+   valid workload-layer destination. **Fix:** the probe payload now
+   carries `(tenant_id, src_id)` (probe v3), and the receiver
+   derives the reply destination via `inner_addr(tenant, src_id)`,
+   which has valid SRv6 routes back to the sender. Replies and
+   loss reports both go out via `MrcTransport.send_probe_reply` /
+   `send_loss_report`, which build the outer SRv6 in user space.
 
-1. **Receiver probe RX**: receiver probe sockets are bound with
-   `SO_BINDTODEVICE` on `eth(P+1)`. After yellow's
-   `seg6local End.DT6 table 0` action decaps the inner packet,
-   the inner DA (anycast `cccc:<NN>::2`, Phase 1a) resolves on `lo`
-   for the table-0 lookup. The kernel will not deliver that packet
-   to a socket bound to `eth(P+1)`. Plane attribution at the
-   receiver does not actually require the socket binding — the
-   probe payload carries `plane_id` — so the fix is to bind the
-   yellow receiver's probe socket to `::` without
-   `SO_BINDTODEVICE`. Green is unaffected.
-2. **Receiver → sender reply destination**: the receiver currently
-   replies to `peer[0]`, which is the source address from
-   `recvfrom`. For yellow that is the per-plane underlay
-   (`cccc:<P><A>::2`) which is not a valid workload-layer
-   destination. The fix is to derive the reply destination from
-   `(tenant_id, src_id)` in the probe payload via
-   `inner_addr(tenant, src_id)`, which produces an address with valid
-   `seg6 encap` routes. The sender's reply-RX socket layout will also
-   need to change for yellow (post-decap replies land on `lo`, not
-   `eth(P+1)`).
-
-These changes deliberately scope-creep beyond Phase 0. They are
-tracked as Phase 1 NIC-layer work in `docs/architecture.md` §5 and
-are best done as part of the `nic/` module extraction so the
-tenant-specific socket-layout logic lands in one place. See also
-the discussion of where the workload/NIC boundary really sits — in
-production, the NIC builds *every* header from a raw payload + a QP
-context, which argues for an even thinner emulator-workload analog
-than the current code presents.
+Both fixes landed as part of Phase 1a step 3 (collapsed-rx socket) and
+Phase 1b step 2 (per-EV SRv6-encapped probes via shared `encap`
+helper).

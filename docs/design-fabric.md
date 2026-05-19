@@ -274,7 +274,8 @@ sees one socket regardless of which plane delivered it.
 ### Yellow (host-based SRv6)
 
 ```
-yellow-host00 NICs eth1..eth4    (per-plane underlay 2001:db8:cccc:<P>00::2/64)
+yellow-host00 NICs eth1..eth4    (inner anycast 2001:db8:cccc:00::2 on
+                                  all 4 NICs + lo nodad — Phase 1a)
    │  encap; outer dst: fc00:000<P>:f<S>:e<L>:e009:d001::    <P> = chosen plane
    ▼
    ─►  fabric (uA hops)  ─►  egress p<P>-leaf<NN>.Ethernet36 (default VRF)

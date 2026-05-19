@@ -25,7 +25,6 @@ from pathlib import Path
 # scope. We MUST NOT `from srv6_fabric.cli import routes` at module scope
 # because that would also import srv6_fabric.topo and freeze its constants
 # for the rest of the test process.
-import importlib.util
 
 _HERE = Path(__file__).resolve().parent
 _ROUTES_PY = _HERE.parent / "srv6_fabric" / "cli" / "routes.py"

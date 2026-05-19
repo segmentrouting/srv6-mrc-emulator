@@ -49,8 +49,8 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Deque, Optional, Tuple
 
 from .ev_state import EVStateTable
 from .probe import LossReport

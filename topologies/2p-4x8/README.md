@@ -23,9 +23,11 @@ This directory contains:
 
 ```bash
 make TOPO=2p-4x8 regen                # generate clab + SONiC configs
-make TOPO=2p-4x8 image                # builds alpine-srv6-scapy:2p-4x8
+make image                            # one image (alpine-srv6-scapy:1.0)
+                                      # serves every topology; topo.yaml is
+                                      # bind-mounted at runtime
 make TOPO=2p-4x8 deploy
 make TOPO=2p-4x8 config
-make TOPO=2p-4x8 routes
+make TOPO=2p-4x8 host-routes
 make TOPO=2p-4x8 scenario SCEN=baseline
 ```

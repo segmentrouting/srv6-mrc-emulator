@@ -84,8 +84,13 @@ Files that must stay in sync because they share addressing/SID-list shape:
   `srv6_fabric.runner`)
 - `srv6_fabric/topo.py` (fabric constants + `usid_outer_dst()` — the
   SID-list builder the runner uses)
-- `srv6_fabric/runner.py` (wire format: `!QB` seq+plane, 32B pad,
+- `srv6_fabric/runner.py` (wire format: `!QBB` seq+plane+path, 32B pad,
   sport=dport=SPRAY_PORT)
+- `srv6_fabric/encap.py` (shared `build_outer_packet()` +
+  `open_raw_send_socket()` helpers — used by both `runner.py` for data
+  packets and `mrc/transport.py` for SRv6-encapped probes)
+- `srv6_fabric/mrc/transport.py` (`MrcTransport` ABC + `Srv6RawTransport`
+  + `LoopbackUdpTransport`; the agent does all I/O through this)
 
 If you change the SID-list shape, the per-plane block layout, or any
 tenant naming/addressing, all of these must be updated. The
@@ -150,32 +155,37 @@ the `srv6_fabric.topo` ↔ `spray` reference-pairs map in sync.
   tenants (green + yellow). Plane-level loss detection via receiver
   MRC agent; sender demotes lossy planes in `health_aware_mrc`
   policy.
-- **Phase 1b step 1 (EV-spray data-path):** done for green; yellow
-  TODO. `EvSpray` policy varies BOTH plane and spine per packet via
-  per-packet outer-DA rotation. Reports include `per_ev_sent` keyed
-  `"P<p>:S<s>"`. No health awareness — every EV is always active.
-  Scenarios shipped: `green-ev-spray.yaml` (full fan-out) and
-  `green-ev-spray-n2.yaml` (narrow). **Yellow parity outstanding:**
-  add `yellow-ev-spray.yaml` and `yellow-ev-spray-n2.yaml` (pure
-  YAML; runner/policy are tenant-agnostic), then lab-validate that
-  yellow's extra `e009` leaf→host hop survives per-packet spine
-  rotation. Invariant 7 means yellow uses a 2-uSID list per packet
-  while green uses 1 — the spine hextet position is the same, but
-  the underlying SID list length isn't.
-- **Phase 1b step 2 (probes on scapy raw-socket):** not started.
-  Today's MRC probes use a UDP socket + per-plane `encap.red` route,
-  which only has plane granularity (4 routes), not EV granularity
-  (4 * NUM_SPINES routes). Step 2 moves the probe TX path to scapy
-  raw-socket using the same `usid_outer_dst()` helper as the data
-  path. Must work for both tenants from the start. Prerequisite for
-  step 3.
+- **Phase 1b step 1 (EV-spray data-path):** done + lab-validated for
+  BOTH tenants. `EvSpray` policy varies BOTH plane and spine per packet
+  via per-packet outer-DA rotation. Reports include `per_ev_sent` keyed
+  `"P<p>:S<s>"`. No health awareness on its own — every EV is always
+  active. Scenarios shipped: `green-ev-spray.yaml`,
+  `green-ev-spray-n2.yaml`, `yellow-ev-spray.yaml`,
+  `yellow-ev-spray-n2.yaml`. The data wire format carries `path` (the
+  MRC-layer name for `spine`) in the payload so the receiver can
+  attribute per-EV stats.
+- **Phase 1b step 2 (per-EV scapy raw-socket probes):** done. Probe TX
+  moved off the per-plane UDP+`encap.red`-route path onto a shared
+  `srv6_fabric/encap.build_outer_packet()` raw-socket builder — the
+  same helper the data path uses for EV-spray. Probes are now per
+  `(plane, path)` EV, so probe granularity matches data-path EV
+  granularity (NUM_PLANES × NUM_SPINES probes per round). All I/O for
+  both `SenderMrcAgent` and `ReceiverMrcAgent` flows through an
+  `MrcTransport` (`Srv6RawTransport` in lab, `LoopbackUdpTransport`
+  in tests). The sender collapses to one rx socket on
+  `SPRAY_REPORT_PORT` that demuxes PROBE_REPLY (magic `0xA6`) vs
+  LOSS_REPORT (magic `0xA7`); per-plane reply-rx loops are gone.
+  Receiver replies on the same `(plane, path)` the inbound PROBE
+  arrived on; loss reports ride the last-seen-PROBE EV per sender.
+  Scenarios shipped: `green-mrc-ev-spray.yaml`, `yellow-mrc-ev-spray.yaml`.
 - **Phase 1b step 3 (per-EV health):** not started. New policy that
   extends `EvSpray` with an "active EV mask" read from a per-EV
-  health table (analogous to `EVStateTable` for planes). On loss
-  detection at an EV granularity, the sender skips that EV on its
-  round-robin turn. Tenant-agnostic from day one — when this lands,
-  ship both `green-mrc-ev-spray-*` and `yellow-mrc-ev-spray-*`
-  scenario sets together; don't repeat the step-1 yellow-lag pattern.
+  health table (the `EVStateTable` is already per-EV in step 2 — it
+  keys on `(tenant, plane, path)`). On loss detection at an EV
+  granularity, the sender skips that EV on its round-robin turn.
+  Ship both `green-mrc-ev-spray-*` and `yellow-mrc-ev-spray-*`
+  scenario sets together — yellow parity is now the steady-state
+  expectation, not a follow-up.
 
 ## Yellow parity — do not forget
 
@@ -295,25 +305,45 @@ without touching the lab.
 
 `health_aware_mrc` is the live MRC policy. It reads weights from an
 `EVStateTable` shared with a `SenderMrcAgent` running in the same
-process. The agent drives four background threads:
+process. All probe / reply / loss-report I/O is delegated to an
+`MrcTransport` (`srv6_fabric/mrc/transport.py`): `Srv6RawTransport`
+in the lab (raw-socket SRv6 encap via `srv6_fabric.encap`),
+`LoopbackUdpTransport` in unit tests. There is one code path; the
+agent never branches on transport.
 
-- emit-probes (one PROBE per plane every `probe_interval_ms`)
-- probe-replies-RX (one socket per plane; feeds `EVStateTable.record_probe_result`)
-- timeout-sweep (declares in-flight probes lost after `probe_timeout_ms`)
-- loss-report-RX (consumes per-plane loss reports from the receiver and feeds the same table)
+The sender drives four background threads:
 
-The receiver-side counterpart (`ReceiverMrcAgent`) runs three threads:
-probe-RX-per-plane (replies in-band on the same plane), loss-emit (one
-round per `loss_window_ms` per known sender), and the data-record hook
-called from the existing receiver hot loop via `on_packet=`.
+- `mrc-emit` — emits one PROBE per `(plane, path)` EV every
+  `probe_interval_ms`. With 4 planes × 8 spines that's 32 probes
+  per round.
+- `mrc-reply-rx` — single rx socket on `SPRAY_REPORT_PORT`, demuxes
+  by magic byte: `0xA6` → PROBE_REPLY (feeds
+  `EVStateTable.record_probe_result(tenant, plane, path, ...)`);
+  `0xA7` → LOSS_REPORT (feeds `record_loss_window`). Replaces the
+  pre-step-2 design's per-plane reply sockets and the separate
+  loss-report-rx loop.
+- `mrc-sweep` — declares in-flight probes lost after
+  `probe_timeout_ms`.
+- `mrc-window` — advances the per-EV `SentWindowRing` so the
+  receiver-side loss-fusion has matching `(plane, path)` sent
+  counts to compare against.
+
+The receiver-side counterpart (`ReceiverMrcAgent`) runs two threads:
+`mrc-probe-rx` (replies on the same `(plane, path)` EV the inbound
+PROBE arrived on) and `mrc-report-emit` (one LOSS_REPORT round per
+`loss_window_ms` per known sender, sent on the last-seen-PROBE EV
+for that sender). The data-record hook is called from the existing
+receiver hot loop via `on_packet=`.
 
 Detection signals fused into `EVStateTable`:
 
-1. **EV Probes** — out-of-band UDP per plane, RTT-stamped. Demotes
-   after `probe_fail_threshold` consecutive timeouts.
-2. **Receiver-side loss reports** — receiver computes per-plane
-   `(seen, expected_local, max_gap)` and unicasts to the sender; sender
-   compares against its own per-plane sent windows. Demotes after
+1. **EV Probes** — per `(plane, path)` SRv6-encapped raw-socket
+   probes, RTT-stamped. Demotes after `probe_fail_threshold`
+   consecutive timeouts.
+2. **Receiver-side loss reports** — receiver computes per-EV
+   `(plane, path)` `(seen, expected_local, max_gap)` and unicasts
+   to the sender; sender compares against its own per-EV sent
+   windows (`SentWindowRing` is 2-D `[plane][path]`). Demotes after
    `loss_demote_consecutive` windows over `loss_threshold`.
 
 Demotions are subject to an `min_active_evs` floor (OCP's
@@ -363,8 +393,10 @@ ScenarioReport JSON passes it through as `flows[].mrc`. Inspect with:
 jq '.flows[].mrc' results/green-mrc-plane-loss.json
 ```
 
-Yellow MRC scenarios (`yellow-mrc-*.yaml`) are not yet written and are
-the next milestone.
+Yellow MRC scenarios (`yellow-mrc-ev-spray.yaml` etc.) ship in the
+same commit set as their green counterparts as of Phase 1b step 2.
+Per-host MRC agent w/ IPC (deduplicate probes across N flows on
+one host) is the next milestone.
 
 ### Gotcha: rebuild the image whenever `srv6_fabric/` changes
 

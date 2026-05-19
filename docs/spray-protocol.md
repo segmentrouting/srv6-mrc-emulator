@@ -25,22 +25,28 @@ The `spray` CLI is pip-installed inside the host image (see `host-image/Dockerfi
 For each packet `i` the sender picks plane `P = i mod 4` and emits:
 
 ```
-+----------------------------------------------------------------+
-| IPv6  src = host-underlay[P]  dst = uSID[P]   nh = 41          |   outer
-|   +------------------------------------------------------------+
-|   | IPv6  src = inner          dst = inner-anycast   nh = 17   |   inner
-|   |   +--------------------------------------------------------+
-|   |   | UDP  sport = dport = 9999                              |
-|   |   |   +-----------+----------+--------------+              |
-|   |   |   | seq (8B)  | plane(1B)| pad ('X' x32)|              |
-+---+---+---+-----------+----------+--------------+--------------+
++--------------------------------------------------------------------+
+| IPv6  src = host-underlay[P]  dst = uSID[P,S]   nh = 41            |   outer
+|   +----------------------------------------------------------------+
+|   | IPv6  src = inner          dst = inner-anycast   nh = 17       |   inner
+|   |   +------------------------------------------------------------+
+|   |   | UDP  sport = dport = 9999                                  |
+|   |   |   +-----------+----------+----------+--------------+       |
+|   |   |   | seq (8B)  | plane(1B)| path(1B) | pad ('X' x32)|       |
++---+---+---+-----------+----------+----------+--------------+-------+
 ```
+
+The 10-byte payload header is `!QBB` (seq u64, plane u8, path u8); the
+`path` byte carries the per-packet spine index when `ev_spray` /
+`health_aware_mrc` rotates the spine, and the receiver uses it for
+per-EV stats. Under plain `round_robin` the `path` byte is 0.
 
 Key MRC invariants this enforces:
 
 - **Inner dst is identical for all 4 planes** — `2001:db8:bbbb:<dst-id>::2` for green. The plane lives ONLY in the outer SID list.
 - **Outer is an SRv6 uSID carrier** (IPv6-in-IPv6); the SID list is encoded in the destination address itself and shifts left at each hop. encap.red semantics, no extension headers.
 - **Egress NIC = plane.** The sender opens one raw socket per plane and pins it with `SO_BINDTODEVICE` to `eth1..eth4`. Without this, the kernel would route all 4 planes out the same NIC (the inner anycast dst is the same on all of them).
+- **Spine entropy via outer-DA rotation, not kernel ECMP.** Under `ev_spray`, the `f<S>` hextet of the outer DA varies per packet so each `(plane, path)` EV traces a distinct leaf→spine path. The runner builds the outer in user space (scapy) on a plane-bound socket; the kernel never gets to choose the spine.
 
 Example outer destination per plane - transit spine=0 (f000), egress leaf=15 (e00f), tenant green ID (d000):
 
@@ -170,10 +176,16 @@ The receiver itself prints a one-shot diagnostic on the first encapped frame so 
 --dst-id N                    (send) destination host id 0..15
 --rate Npps | N               (send) packets/sec, default 1000pps
 --duration Ns | Nms | 0       (send) default 5s; 0 = run until ^C
---policy SPEC                 (send) plane selection policy; default
-                              round_robin. Other built-ins:
+--policy SPEC                 (send) plane / EV selection policy;
+                              default round_robin. Built-ins:
+                                  round_robin
                                   hash5tuple
                                   weighted:w0,w1,w2,w3
+                                  ev_spray[:N]            (varies BOTH
+                                       plane and spine per packet;
+                                       N = paths-per-plane)
+                                  health_aware_mrc        (MRC-aware
+                                       weighted RR; reads EVStateTable)
                               See srv6_fabric/policy.py for the full list.
 --idle-timeout Ns | Nms | 0   (recv) auto-exit after this much silence
                               following the first packet; default 6s,

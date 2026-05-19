@@ -42,7 +42,6 @@ import json
 import os
 import re
 import sys
-import time
 from dataclasses import asdict, is_dataclass
 
 from srv6_fabric.runner import (

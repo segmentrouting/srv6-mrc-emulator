@@ -54,7 +54,6 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 try:
     import yaml
@@ -493,7 +492,6 @@ def _delete_all() -> int:
 
     # Step 1: discover routes per host (parallel reads).
     discovered: list[tuple[str, str, str, int]] = []
-    lock_print = []  # placeholder if we wanted to serialize prints
 
     def scan(host: str) -> tuple[int, str]:
         lines = list_srv6_routes_on_host(host)

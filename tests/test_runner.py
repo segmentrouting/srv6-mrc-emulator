@@ -47,7 +47,7 @@ class TestPayloadCodec(unittest.TestCase):
 
     def test_wire_format_stability(self):
         # Lock byte-for-byte format so we don't accidentally break
-        # interop with the existing tools/spray.py senders/receivers.
+        # interop between the `spray` CLI sender and receiver.
         # !QBB encodes seq=1 as 8 big-endian bytes, plane=3 as 1 byte,
         # path=5 as 1 byte.
         buf = encode_payload(1, 3, 5)

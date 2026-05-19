@@ -12,8 +12,9 @@ class TestTopoConstants(unittest.TestCase):
         self.assertEqual(topo.SPRAY_PORT, 9999)
 
     def test_reference_pairs_match_spray(self):
-        # Must match tools/spray.py:PAIRS and routes.py:REFERENCE_PAIRS_SPINES
-        # exactly. If you change one, change them all.
+        # Must match the `spray` reference-pairs map (srv6_fabric.cli.spray)
+        # and routes.py:REFERENCE_PAIRS_SPINES exactly. If you change one,
+        # change them all.
         expected = {
             (0, 15): 0, (1, 14): 2, (2, 13): 4, (3, 12): 6,
             (4, 11): 1, (5, 10): 3, (6, 9): 5,  (7, 8):  7,

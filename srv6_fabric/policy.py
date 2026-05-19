@@ -1,25 +1,18 @@
-"""Spray policies — given (seq, flow), pick a plane.
+"""Spray policies — given (seq, flow), pick a plane (or EV).
 
 Implementations all behind a single `pick()` method so the runner is
-oblivious to which policy it's using. Health-awareness comes in two
-flavors:
+oblivious to which policy it's using.
 
-  - `HealthAware`: a static wrapper that filters out planes in a
-    mutable `down: set[int]` set, owned by the legacy ICMPv6-based
-    health monitor (see srv6_fabric/health.py). Picks of a down plane
-    walk forward to the next healthy plane.
-
-  - `HealthAwareMrc`: an MRC-aware policy that reads per-pick from an
-    EVStateTable's per-EV (plane, path) weight grid. Demoted EVs
-    (state ASSUMED_BAD) get weight 0; degraded/unknown EVs (state
-    UNKNOWN) get reduced weight. The weighted CDF is rebuilt each
-    pick from the live atomic snapshot of the table, so updates from
-    probe/loss-report threads take effect immediately, without
-    coordination with the sender hot loop. Like `EvSpray`, it
-    respects a per-flow spine subset so different flows visit
-    different fabric slices; unlike `EvSpray` the within-flow
-    distribution is health-weighted instead of round-robin.
-    Deterministic per (seq, flow) given a fixed weights snapshot.
+`HealthAwareMrc` is the live MRC-aware policy: it reads per-pick from
+an `EVStateTable`'s per-EV (plane, path) weight grid. Demoted EVs
+(state ASSUMED_BAD) get weight 0; degraded/unknown EVs (state UNKNOWN)
+get reduced weight. The weighted CDF is rebuilt each pick from the
+live atomic snapshot of the table, so updates from probe/loss-report
+threads take effect immediately, without coordination with the sender
+hot loop. Like `EvSpray`, it respects a per-flow spine subset so
+different flows visit different fabric slices; unlike `EvSpray` the
+within-flow distribution is health-weighted instead of round-robin.
+Deterministic per (seq, flow) given a fixed weights snapshot.
 """
 
 from __future__ import annotations
@@ -27,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, TYPE_CHECKING
 
-from .topo import (NUM_PLANES, NUM_SPINES, FlowKey, select_spines,
+from .topo import (NUM_PLANES, NUM_SPINES, FlowKey,
                    select_spines_for_addrs)
 
 if TYPE_CHECKING:
@@ -59,7 +52,7 @@ class EvSpray:
     """Round-robin across the full EV set = NUM_PLANES * paths_per_plane.
 
     Each EV is a (plane, spine) tuple. The spine subset for a given
-    (src, dst) pair is computed once via `select_spines()` and stays
+    (src, dst) pair is computed once via `select_spines_for_addrs()` and stays
     constant for the lifetime of the policy; the round-robin walks
     plane-major (plane 0 spines, then plane 1 spines, ...) so successive
     packets visit different planes (giving the same anti-clustering
@@ -226,35 +219,6 @@ def _weighted_pick(seq: int, flow: FlowKey, cdf: tuple[float, ...]) -> int:
 
 
 @dataclass
-class HealthAware:
-    """Wrap any policy with plane-health filtering.
-
-    `down` is a mutable set of plane indices; the runner's health probe owns
-    it. `pick` calls the inner policy, and if it returns a down plane, walks
-    forward (mod NUM_PLANES) to the next healthy one. If *all* planes are
-    down, returns the inner choice unchanged (degrades to "send and hope").
-    """
-    inner: SprayPolicy
-    down: set[int] = field(default_factory=set)
-    name: str = field(init=False)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "name", f"health_aware({self.inner.name})")
-
-    def pick(self, seq: int, flow: FlowKey) -> int:
-        choice = self.inner.pick(seq, flow)
-        if not self.down or choice not in self.down:
-            return choice
-        if len(self.down) >= NUM_PLANES:
-            return choice  # nothing healthy — emit anyway
-        for step in range(1, NUM_PLANES):
-            cand = (choice + step) % NUM_PLANES
-            if cand not in self.down:
-                return cand
-        return choice
-
-
-@dataclass
 class HealthAwareMrc:
     """MRC-aware weighted per-EV spray driven by an EVStateTable.
 
@@ -273,12 +237,10 @@ class HealthAwareMrc:
     the policy spreads across `NUM_PLANES * paths_per_plane` EVs
     weighted by the table's per-EV health.
 
-    Compared to `HealthAware(inner=...)`:
-      - HealthAware is binary (down or up) and walks forward to find the
-        next up plane on a "down hit"; it operates per plane.
-      - HealthAwareMrc is graded (GOOD/UNKNOWN/ASSUMED_BAD map to
-        configurable weights) and operates per EV, so a partial-path
-        failure on one plane doesn't kill the plane.
+    Compared to a binary up/down policy, `HealthAwareMrc` is graded
+    (GOOD/UNKNOWN/ASSUMED_BAD map to configurable weights) and operates
+    per EV, so a partial-path failure on one plane doesn't kill the
+    whole plane.
 
     Cold-start: when no probes have replied yet, every EV is UNKNOWN
     and `weights_ev()` returns a uniform distribution. Pick distributes
@@ -466,7 +428,5 @@ def policy_from_spec(spec) -> SprayPolicy:
             return EvSpray(paths_per_plane=int(value))
         if kind == "health_aware_mrc":
             return HealthAwareMrcFactory(paths_per_plane=int(value))
-        if kind == "health_aware":
-            return HealthAware(inner=policy_from_spec(value))
         raise ValueError(f"unknown policy kind: {kind!r}")
     raise ValueError(f"bad policy spec: {spec!r}")

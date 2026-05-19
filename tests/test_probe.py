@@ -5,7 +5,7 @@ its matching decode; verify magic/version checking; verify truncation
 and range checks reject malformed input cleanly.
 """
 
-import struct
+
 import unittest
 
 from srv6_fabric.mrc import probe

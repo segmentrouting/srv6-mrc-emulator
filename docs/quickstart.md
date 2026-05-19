@@ -141,10 +141,12 @@ docker exec -it p0-leaf15 tcpdump -ni Ethernet32
 Phase 1a: yellow's inner DA is now anycast `2001:db8:cccc:<NN>::2` (on
 `eth1..eth4` + `lo`, `nodad`) instead of the historical `cccd:<NN>::1`
 on `lo`. The kernel `seg6 encap` route below targets the *peer*'s
-anycast, which is not locally assigned, so the encap path works. A
-follow-up Phase 1a step replaces this kernel-encap path with a
-sender-built raw-socket SRv6 sender (`srv6_fabric/nic/encap.py`); the
-manual route below is kept as a debugging fallback only.
+anycast, which is not locally assigned, so the encap path works. The
+spray / MRC data and control paths bypass kernel `seg6 encap` routes
+entirely as of Phase 1b — they build the outer in user space via
+`srv6_fabric/encap.py` (`build_outer_packet`). The manual route below
+is kept as a debugging fallback so simple `ping`/`tcpdump` flows still
+exercise SRv6 encap.
 
 ```bash
 docker exec -it yellow-host01 ip -6 route add 2001:db8:cccc:e::2/128 encap seg6 mode encap.red segs fc00:1:f001:e00e:e009:d001:: dev eth1

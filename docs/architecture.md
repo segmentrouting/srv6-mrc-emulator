@@ -159,13 +159,18 @@ template") describes a two-step specialization:
                                          outer dst IPv6
 ```
 
-Our emulator does the analog of this in `srv6_fabric/cli/routes.py`
-(`build_segs`, `inner_addr`). The per-EV / per-plane uSID list is
-pre-built and installed as kernel `seg6 encap` routes keyed by inner
-address with one route per plane (metrics 100..103). The "template" in
-the paper is what is captured collectively by those four routes; the
-"EV[k] picks plane" step in the paper is what we do by binding the
-sending socket to `eth(P+1)` via `SO_BINDTODEVICE`.
+Our emulator does the analog of this in two places. `srv6_fabric/cli/routes.py`
+(`build_segs`, `inner_addr`) installs kernel `seg6 encap` routes
+keyed by inner address with one route per plane (metrics 100..103) —
+this is the *kernel-encap* data path, used by simple connectivity
+tests (ping, etc.) and as a debugging fallback. The MRC data and
+control paths (EV-spray, probes, loss reports) bypass these routes
+and build the outer packet in user space via
+`srv6_fabric.encap.build_outer_packet`, so the "EV[k] picks plane"
+step happens in the sender process — not in the FIB. Plane selection
+on the wire is still NIC-bound via `SO_BINDTODEVICE` on `eth(P+1)`
+(invariant 8); spine entropy comes from per-packet outer-DA rotation
+(invariant 10), not kernel ECMP.
 
 Differences worth flagging:
 
@@ -173,14 +178,19 @@ Differences worth flagging:
   use uA (segments encode adjacencies, End.X behavior). This is a
   customer preference; it changes the *encoding* of the uSID list but
   not the *control loop*.
-- **Per-plane route vs per-path route.** The paper has hundreds of EVs
-  per QP, each a distinct path. We have one EV per plane, so we install
-  one route per plane and rely on the leaf to ECMP across spines
-  internally. This is a deliberate scale reduction, not a fidelity goal.
-- **NIC-firmware vs kernel-encap.** The paper does the EV→template
-  specialization in NIC firmware on every packet. We pre-install the
-  specialization as static kernel routes. Both produce the same bits on
-  the wire.
+- **Per-EV path granularity.** The paper has hundreds of EVs per QP,
+  each a distinct path. Until Phase 1b we had one EV per plane and
+  relied on the leaf to ECMP across spines internally; as of Phase 1b
+  step 1 the EV-spray data path varies the spine per packet, and as
+  of step 2 the MRC control plane (probes + loss reports) tracks the
+  same per-`(plane, path)` EV. Per-EV state attribution is the
+  prerequisite for Phase 1b step 3 (per-EV health-aware policy).
+- **NIC-firmware vs user-space encap.** The paper does the EV→template
+  specialization in NIC firmware on every packet. Our emulator does
+  the equivalent specialization in user space (scapy / raw socket)
+  inside the sender process. The simple-ping path still uses
+  pre-installed kernel `seg6 encap` routes as a fallback. Both
+  produce the same bits on the wire.
 
 ## 4. What we faithfully reproduce vs what we approximate
 

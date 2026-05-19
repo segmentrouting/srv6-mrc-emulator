@@ -90,7 +90,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 from ..topo import (
     NUM_PLANES,
     NUM_SPINES,
-    SPRAY_PROBE_PORT,
     SPRAY_REPORT_PORT,
     tenant_id as topo_tenant_id,
 )
@@ -114,8 +113,6 @@ from .probe import (
 from .probe_clock import ProbeClock
 from .transport import (
     DEFAULT_RECV_BUFSIZE,
-    DEFAULT_SOCKET_TIMEOUT_S,
-    LoopbackUdpTransport,
     MrcTransport,
     Srv6RawTransport,
 )

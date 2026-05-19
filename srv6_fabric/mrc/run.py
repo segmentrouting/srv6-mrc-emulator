@@ -34,7 +34,6 @@ import shlex
 import subprocess
 import sys
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,7 +48,7 @@ if __package__ in (None, ""):
 
 from srv6_fabric.netem import Fault, Netem
 from srv6_fabric.report import ScenarioReport
-from srv6_fabric.mrc.scenario import FlowSpec, MrcSpec, Scenario, from_yaml_file
+from srv6_fabric.mrc.scenario import MrcSpec, Scenario, from_yaml_file
 from srv6_fabric.topo import (NUM_PLANES, NUM_SPINES, inner_addr,
                               select_spines_for_addrs, usid_outer_dst)
 
@@ -67,7 +66,7 @@ FAULT_SETTLE_S = 1.0
 # Per-receiver `--idle-timeout` (seconds). Receivers self-exit this many
 # seconds after their last packet. Must be larger than any tolerable
 # pause in the send stream; reasonable default = 2× the longest interval
-# between bursts. Default of 6s matches tools/spray.py.
+# between bursts. Default of 6s matches the `spray` CLI default.
 RECV_IDLE_TIMEOUT_S = 6.0
 
 
@@ -152,18 +151,6 @@ def policy_to_cli(spec: Any) -> str:
             return "weighted:" + ",".join(str(w) for w in value)
         if key == "ev_spray":
             return f"ev_spray:{int(value)}"
-        if key == "health_aware":
-            # The shim doesn't yet wrap policies in the legacy health-aware
-            # mode (ICMPv6-driven down set). Surface this as a known
-            # limitation rather than silently dropping the wrapper — the
-            # orchestrator can run health probes itself in a future
-            # iteration. The new MRC path is `health_aware_mrc` and is
-            # handled above as a bare string.
-            raise NotImplementedError(
-                "health_aware policy: orchestrator-driven health probing "
-                "not yet wired into the spray.py CLI; use a plain policy "
-                "or `health_aware_mrc` for MRC-style health-aware spray."
-            )
     raise ValueError(f"unsupported policy spec for CLI: {spec!r}")
 
 

@@ -132,12 +132,14 @@ class TestPolicy(unittest.TestCase):
         s = scenario.validate(doc)
         self.assertTrue(s.flows[0].policy_label.startswith("weighted"))
 
-    def test_health_aware(self):
+    def test_health_aware_rejected(self):
+        # Legacy `health_aware` wrapper was removed; scenarios using it
+        # should fail validation rather than silently fall back.
         doc = {**MINIMAL,
                "flows": [{**MINIMAL["flows"][0],
                           "policy": {"health_aware": "round_robin"}}]}
-        s = scenario.validate(doc)
-        self.assertIn("health_aware", s.flows[0].policy_label)
+        with self.assertRaises(scenario.ScenarioError):
+            scenario.validate(doc)
 
     def test_unknown_policy(self):
         doc = {**MINIMAL,

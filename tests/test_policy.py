@@ -76,49 +76,6 @@ class TestWeighted(unittest.TestCase):
             policy.Weighted(weights=(0, 0, 0, 0))        # zero sum
 
 
-class TestHealthAware(unittest.TestCase):
-    def test_passthrough_when_no_downs(self):
-        inner = policy.RoundRobin()
-        wrapped = policy.HealthAware(inner=inner)
-        for i in range(16):
-            self.assertEqual(wrapped.pick(i, F), inner.pick(i, F))
-
-    def test_skips_down_plane(self):
-        wrapped = policy.HealthAware(inner=policy.RoundRobin(), down={2})
-        # seq 2 would normally hit plane 2 -> should walk forward to 3.
-        self.assertEqual(wrapped.pick(2, F), 3)
-        # seq 0..3, plane 2 banned:
-        seen = [wrapped.pick(i, F) for i in range(4)]
-        self.assertNotIn(2, seen)
-
-    def test_all_down_returns_inner_choice(self):
-        wrapped = policy.HealthAware(
-            inner=policy.RoundRobin(),
-            down=set(range(NUM_PLANES)),
-        )
-        # Everything down: degrade to inner; don't infinite-loop.
-        for i in range(NUM_PLANES):
-            self.assertEqual(wrapped.pick(i, F), i % NUM_PLANES)
-
-    def test_three_down_distributes_to_one(self):
-        wrapped = policy.HealthAware(
-            inner=policy.RoundRobin(),
-            down={0, 1, 3},
-        )
-        seen = {wrapped.pick(i, F) for i in range(16)}
-        self.assertEqual(seen, {2})
-
-    def test_mutable_down_updates_live(self):
-        wrapped = policy.HealthAware(inner=policy.RoundRobin())
-        self.assertEqual(wrapped.pick(2, F), 2)
-        wrapped.down.add(2)
-        self.assertNotEqual(wrapped.pick(2, F), 2)
-
-    def test_name(self):
-        w = policy.HealthAware(inner=policy.RoundRobin())
-        self.assertEqual(w.name, "health_aware(round_robin)")
-
-
 class TestPolicyFromSpec(unittest.TestCase):
     def test_string_forms(self):
         self.assertIsInstance(policy.policy_from_spec("round_robin"),
@@ -130,17 +87,12 @@ class TestPolicyFromSpec(unittest.TestCase):
         p = policy.policy_from_spec({"weighted": [1, 1, 1, 1]})
         self.assertIsInstance(p, policy.Weighted)
 
-    def test_health_aware_wraps_inner(self):
-        p = policy.policy_from_spec({"health_aware": "round_robin"})
-        self.assertIsInstance(p, policy.HealthAware)
-        self.assertIsInstance(p.inner, policy.RoundRobin)
-
-    def test_health_aware_around_weighted(self):
-        p = policy.policy_from_spec(
-            {"health_aware": {"weighted": [1, 2, 3, 4]}}
-        )
-        self.assertIsInstance(p, policy.HealthAware)
-        self.assertIsInstance(p.inner, policy.Weighted)
+    def test_health_aware_removed(self):
+        # `health_aware` (legacy ICMPv6-driven wrapper) was removed; the
+        # MRC path is `health_aware_mrc`. Confirm the old key is now an
+        # unknown-policy error rather than silently constructing something.
+        with self.assertRaises(ValueError):
+            policy.policy_from_spec({"health_aware": "round_robin"})
 
     def test_bad_specs(self):
         with self.assertRaises(ValueError):

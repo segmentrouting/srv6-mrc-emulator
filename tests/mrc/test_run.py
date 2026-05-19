@@ -5,7 +5,6 @@ tests run anywhere. The live-lab integration is exercised by actually
 running scenarios.
 """
 import json
-import subprocess
 import unittest
 from unittest import mock
 
@@ -47,8 +46,10 @@ class TestPolicyToCli(unittest.TestCase):
         )
 
     def test_health_aware_unsupported(self):
-        # Documented limitation: orchestrator can't yet do health-aware.
-        with self.assertRaises(NotImplementedError):
+        # Legacy `health_aware` wrapper was removed. policy_to_cli now
+        # raises ValueError on the unknown shape instead of the previous
+        # NotImplementedError.
+        with self.assertRaises(ValueError):
             policy_to_cli({"health_aware": "round_robin"})
 
     def test_unknown_shape_rejected(self):

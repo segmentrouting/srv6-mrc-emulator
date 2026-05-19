@@ -26,9 +26,13 @@ straightforward to add under `topologies/<name>/`.
   mix). Any leaf whose SIDs were silently dropped during the FRR
   staticd startup race gets re-pushed automatically.
 - **Userspace MRC sender.** `spray` builds per-plane uSID-encapsulated
-  UDP probes in scapy, sends one packet per plane in a round, and the
-  receiver computes per-flow reorder-distance histograms (the
-  MRC / SRv6 paper's reorder metric) plus loss, latency, and PPS.
+  UDP frames in scapy, varies the spine per packet under the
+  `ev_spray` / `health_aware_mrc` policies so each packet traces a
+  distinct `(plane, path)` EV, and the receiver computes per-flow
+  reorder-distance histograms (the MRC / SRv6 paper's reorder metric)
+  plus loss, latency, and PPS. The MRC control plane (probes + loss
+  feedback) rides the same SRv6-encapped raw-socket path as the data
+  packets, with per-`(plane, path)` granularity.
 - **Fault injection.** Scenarios under `topologies/<name>/scenarios/`
   drive `tc netem` against host veths via `nsenter`, exercising
   plane-loss, plane-latency, and plane-blackhole failure modes.
@@ -55,23 +59,36 @@ For detail on multi-tenant design for SRv6 AI factories see [`docs/design-multi-
 srv6_fabric/           Python package: topology constants, runtime libs
   topo.py              fabric dimensions + addressing helpers (reads topo.yaml)
   runner.py            spray sender/receiver core
-  policy.py            per-plane scheduling policies (round-robin, hash, etc.)
+  encap.py             shared raw-socket SRv6 outer-packet builder
+                       (used by runner.py and mrc/transport.py)
+  policy.py            per-plane / per-EV scheduling policies
+                       (round_robin, hash5tuple, weighted, ev_spray,
+                        health_aware_mrc)
   reorder.py           reorder-distance histogram + FlowStats schema
   netem.py             tc netem helpers (run via nsenter)
+  report.py            JSON + ascii summary writer
   cli/
     spray.py           userspace SRv6 packet generator (CLI: `spray`)
     routes.py          static SRv6 route management   (CLI: `routes`)
   mrc/
     run.py             scenario orchestrator           (CLI: `run-scenario`)
     scenario.py        scenario YAML schema + executor
-    health.py          plane health-aware policy (not yet CLI-wired)
+    agent.py           SenderMrcAgent + ReceiverMrcAgent
+    transport.py       MrcTransport ABC + Srv6RawTransport +
+                       LoopbackUdpTransport
+    ev_state.py        per-(tenant, plane, path) EV state machine
+    probe.py           PROBE / PROBE_REPLY / LOSS_REPORT wire format
+    probe_clock.py     per-EV in-flight probe bookkeeping
+    loss_window.py     per-EV receiver-side loss accounting
+    loss_compute.py    per-EV SentWindowRing on the sender
 
 generators/
   fabric.py            parameterized generator: reads topo.yaml,
                        writes topology.clab.yaml + config/
 
 topologies/
-  4p-8x16/
+  4p-8x16/             4 planes × 8 spines × 16 leaves (default)
+  2p-4x8/              2 planes × 4 spines × 8 leaves  (smaller variant)
     topo.yaml          single source of truth for this variant
     topology.clab.yaml containerlab topology (generated)
     config/            per-node SONiC + FRR configs   (generated)
@@ -85,7 +102,7 @@ host-image/
 scripts/
   config.sh            push config_db.json + frr.conf into containers
 
-tests/                 unittest mirror of srv6_fabric/ layout (165 tests)
+tests/                 unittest mirror of srv6_fabric/ layout
 docs/                  consolidated design + runbook documentation
 results/               scenario JSON output (gitignored)
 ```
@@ -175,7 +192,7 @@ scratch.
 ## Testing
 
 ```bash
-make test     # 165 unit tests, ~0.3s, no external deps
+make test     # ~1.5s, no external deps
 ```
 
 Tests cover address derivation, SID-list construction, the spray wire

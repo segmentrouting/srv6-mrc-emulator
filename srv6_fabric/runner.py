@@ -1,20 +1,26 @@
-"""Send/recv library — the engine behind `tools/spray.py` and the orchestrator.
+"""Send/recv library — the engine behind the `spray` CLI and the orchestrator.
 
-This module replaces the ad-hoc send loop + RecvState class in
-`tools/spray.py` with two library functions that take a `SprayPolicy` and
-emit machine-readable per-flow records.
+This module is the send/recv core. The CLI (`srv6_fabric/cli/spray.py`)
+is a thin argparse shim around it, and the MRC orchestrator
+(`srv6_fabric/mrc/run.py`) drives it via `docker exec`.
 
 Layering rules:
   - Top-level imports are stdlib-only. Anything that needs scapy or
     raw sockets is imported lazily inside the function that uses it.
     This lets the orchestrator (running on the docker host, no scapy)
     import this module to access result types and `parse_payload`.
-  - Wire format matches tools/spray.py exactly:
+  - Wire format (data payload v2):
         outer IPv6 (nh=41)
           inner IPv6
             UDP(sport=dport=SPRAY_PORT)
-              !QB : seq (8B) + plane (1B) + 32B pad
-    Don't change this without coordinating with spray.py.
+              !QBB : seq (8B) + plane (1B) + path (1B) + 32B pad
+    `path` carries the per-packet spine index (== MRC `path_id`) the
+    sender chose for this packet's plane; non-EV-aware policies write
+    path=0. The outer SRv6 packet is built via
+    `srv6_fabric.encap.build_outer_packet` on a plane-bound raw
+    socket (`SO_BINDTODEVICE` per Invariant 8). Don't change this
+    without coordinating with `srv6_fabric/mrc/transport.py` — MRC
+    probes use the same encap helper.
 
 Public API:
   - run_sender(flow, policy, rate_pps, duration_s) -> SenderResult
@@ -30,7 +36,6 @@ import re
 import signal
 import socket
 import struct
-import sys
 import threading
 import time
 from collections import Counter
@@ -442,7 +447,7 @@ def run_receiver(self_host: str,
     }
 
 
-# --- host identity helper (for tools/spray.py shim) -------------------------
+# --- host identity helper (for the `spray` CLI shim) ------------------------
 
 _HOSTNAME_RE = re.compile(r"(green|yellow)-host(\d{2})$")
 

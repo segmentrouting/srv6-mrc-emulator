@@ -35,7 +35,7 @@ import time
 import unittest
 
 from srv6_fabric.mrc.agent import (
-    AgentConfig, ReceiverMrcAgent, SenderMrcAgent,
+    ReceiverMrcAgent, SenderMrcAgent,
 )
 from srv6_fabric.mrc.ev_state import EVStateConfig, EVStateTable
 from srv6_fabric.policy import HealthAwareMrc
