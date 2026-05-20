@@ -38,7 +38,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 
 # --- enums -----------------------------------------------------------------
@@ -363,6 +363,34 @@ class EVStateTable:
         # Reading a single attribute of a dataclass is atomic in CPython
         # under the GIL; no lock required for the staleness we accept.
         return self._evs[tenant][plane][path].state
+
+    def inspect(self, tenant: str, plane: int, path: int) -> dict[str, Any]:
+        """Diagnostic snapshot of one EV's counters.
+
+        Returns a dict with the demote/recover counters and last
+        observed loss ratio for this EV. Intended for transition
+        loggers and tests that want to fingerprint *why* a state
+        change happened — the `on_transition` callback runs under the
+        table lock and can call this to read coherent values for the
+        EV that just transitioned.
+
+        Not a hot-path method: callers should not poll this from spray
+        loops. The returned dict is a fresh copy so the caller may
+        retain it across lock release.
+        """
+        self._check_tenant(tenant)
+        self._check_ev(plane, path)
+        rec = self._evs[tenant][plane][path]
+        return {
+            "state": rec.state.value,
+            "consecutive_probe_timeouts": rec.consecutive_probe_timeouts,
+            "consecutive_probe_successes": rec.consecutive_probe_successes,
+            "consecutive_loss_demote_windows":
+                rec.consecutive_loss_demote_windows,
+            "last_loss_ratio": rec.last_loss_ratio,
+            "transitions": rec.transitions,
+            "demotes_suppressed_by_floor": rec.demotes_suppressed_by_floor,
+        }
 
     def weights_ev(self, tenant: str) -> tuple[tuple[float, ...], ...]:
         """Normalized spray weights per EV for `tenant`.

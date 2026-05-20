@@ -42,6 +42,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import asdict, is_dataclass
 
 from srv6_mrc.runner import (
@@ -80,7 +81,8 @@ def parse_duration(s: str) -> float:
 
 
 def parse_policy(s: str, *, tenant: str, ev_config=None,
-                 paths_per_plane: int | None = None):
+                 paths_per_plane: int | None = None,
+                 src_host_id: int | None = None):
     """Convert CLI string into a SprayPolicy via policy_from_spec.
 
     Accepted forms:
@@ -131,13 +133,59 @@ def parse_policy(s: str, *, tenant: str, ev_config=None,
     if isinstance(policy, HealthAwareMrcFactory):
         # Lazy import: keeps stdlib-only imports at top of file and
         # mirrors the laziness around scapy elsewhere in the runner.
-        from srv6_mrc.mrc.ev_state import EVStateTable
+        from srv6_mrc.mrc.ev_state import EVStateTable, EVState
+
+        # Diagnostic transition logger. Off by default; opt in via
+        # `SRV6_MRC_LOG_TRANSITIONS=1` in the host env to capture each
+        # GOOD -> ASSUMED_BAD demote (and the reverse) on stderr with
+        # the demote-trigger counters that would let us fingerprint
+        # *why* the demote fired (probe-timeout-driven vs.
+        # loss-window-driven, current ratio, consecutive count).
+        # Disabled by default because at 56-sender all-to-all scale
+        # the volume can swamp container stderr ring buffers.
+        on_transition = None
+        if os.environ.get("SRV6_MRC_LOG_TRANSITIONS") == "1":
+            host_tag = (
+                f"{tenant}-host{src_host_id:02d}"
+                if src_host_id is not None else tenant
+            )
+            # Captured locally so the lambda doesn't need a real table
+            # reference up front -- assigned right after construction.
+            _table_holder: list = []
+
+            def _log_transition(t: str, plane: int, path: int,
+                                old: "EVState", new: "EVState") -> None:
+                if not _table_holder:
+                    return
+                tbl = _table_holder[0]
+                snap = tbl.inspect(t, plane, path)
+                ts_ns = time.monotonic_ns()
+                # Single-line key=value so it's grep-friendly across
+                # the 56-sender concatenated log stream.
+                sys.stderr.write(
+                    f"mrc-transition ts_ns={ts_ns} host={host_tag} "
+                    f"tenant={t} plane={plane} path={path} "
+                    f"{old.value}->{new.value} "
+                    f"probe_timeouts={snap['consecutive_probe_timeouts']} "
+                    f"loss_windows={snap['consecutive_loss_demote_windows']} "
+                    f"last_loss_ratio={snap['last_loss_ratio']:.4f} "
+                    f"transitions={snap['transitions']} "
+                    f"floor_suppressed={snap['demotes_suppressed_by_floor']}\n"
+                )
+                sys.stderr.flush()
+            on_transition = _log_transition
+        else:
+            _table_holder = None
+
         # One tenant per sender process today. If we ever multiplex
         # tenants in a single sender, this becomes a per-host singleton.
         table = EVStateTable(
             tenants=(tenant,), num_planes=topology.planes,
             num_paths=topology.spines_per_plane, cfg=ev_config,
+            on_transition=on_transition,
         )
+        if _table_holder is not None:
+            _table_holder.append(table)
         return policy.bind(table=table, tenant=tenant)
     return policy
 
@@ -203,6 +251,7 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
 
     policy = parse_policy(
         args.policy, tenant=tenant, ev_config=ev_cfg, paths_per_plane=ppp,
+        src_host_id=my_id,
     )
 
     # When the policy is health_aware_mrc, we own a live EVStateTable

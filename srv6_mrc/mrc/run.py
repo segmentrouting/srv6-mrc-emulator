@@ -267,6 +267,13 @@ def _scenario_env(mrc: MrcSpec | None,
         env["SRV6_MRC_CONFIG_JSON"] = mrc.to_env_json()
     if paths_per_plane is not None:
         env["SRV6_PATHS_PER_PLANE"] = str(paths_per_plane)
+    # Passthrough diagnostic flags from the orchestrator's env into the
+    # sender/receiver containers. Used today only for transition
+    # logging; opt-in (only forwarded when set on the host).
+    for diag_var in ("SRV6_MRC_LOG_TRANSITIONS",):
+        v = os.environ.get(diag_var)
+        if v is not None:
+            env[diag_var] = v
     return env or None
 
 
@@ -327,8 +334,28 @@ def run_flows(flows: list[FlowRun], *,
 
     if verbose:
         print(f"  spawning {len(flows)} sender(s)")
+    # When transition logging is on (SRV6_MRC_LOG_TRANSITIONS=1), each
+    # sender's stderr will contain `mrc-transition ...` lines we want
+    # to keep across the whole run for offline analysis. Collect them
+    # into one file under results/ so the operator can correlate
+    # demote events across hosts.
+    transitions_log_path: str | None = None
+    if os.environ.get("SRV6_MRC_LOG_TRANSITIONS") == "1":
+        os.makedirs("results", exist_ok=True)
+        transitions_log_path = "results/mrc-transitions.log"
+        # Truncate at run start so each scenario run replaces the
+        # previous trace; keep history in named result JSONs separately.
+        open(transitions_log_path, "w").close()
     with cf.ThreadPoolExecutor(max_workers=max(1, len(flows))) as pool:
         for flow, res in pool.map(_do_send, flows):
+            if transitions_log_path and res.stderr:
+                # Filter to just the transition lines; other stderr
+                # noise (e.g. CAP_NET_RAW warnings from the lazy
+                # transport import path) would obscure the trace.
+                with open(transitions_log_path, "a") as f:
+                    for line in res.stderr.splitlines():
+                        if line.startswith("mrc-transition "):
+                            f.write(line + "\n")
             if res.rc != 0:
                 send_failures.append(
                     f"sender {flow.src_host}->{flow.dst_host} rc={res.rc} "
@@ -582,6 +609,8 @@ def main(argv: list[str] | None = None) -> int:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(report.to_json())
         print(f"  json report: {out_path}")
+    if os.environ.get("SRV6_MRC_LOG_TRANSITIONS") == "1":
+        print("  mrc transition log: results/mrc-transitions.log")
 
     return 0
 
