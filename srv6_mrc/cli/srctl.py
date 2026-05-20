@@ -126,6 +126,7 @@ def _select_topo_by_host_sentinel(topos_dir: Path) -> None:
     # leaves) is disambiguated by axis (b); sharing num_planes alone
     # by axis (a).
     live: list[Path] = []
+    skip_reasons: list[str] = []
     for cand in topos_dir.glob("*/topo.yaml"):
         try:
             with open(cand) as f:
@@ -141,10 +142,23 @@ def _select_topo_by_host_sentinel(topos_dir: Path) -> None:
                 and plane_in in running and plane_out not in running
             ):
                 live.append(cand)
-        except Exception:
+        except Exception as e:  # noqa: BLE001 - sentinel must never crash CLI
+            skip_reasons.append(f"{cand}: {type(e).__name__}: {e}")
             continue
     if len(live) == 1:
         os.environ["SRV6_TOPO"] = str(live[0])
+        return
+    # Diagnostic: if we got here without setting SRV6_TOPO and any
+    # candidate raised, surface the reasons. Schema drift in topo.yaml
+    # otherwise gets silently swallowed (this exact scenario hid a
+    # KeyError on 'num_planes' through two commits). One-line warning
+    # to stderr is loud enough to notice without breaking scripts.
+    if skip_reasons and not os.environ.get("SRV6_TOPO"):
+        sys.stderr.write(
+            "srctl: topology auto-detect skipped candidates ("
+            + "; ".join(skip_reasons)
+            + "); falling back to default. Set SRV6_TOPO to override.\n"
+        )
 
 
 _infer_srv6_topo_from_argv()
