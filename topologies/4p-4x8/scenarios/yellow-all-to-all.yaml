@@ -41,7 +41,7 @@ paths_per_plane: 4
 
 flows:
   - pairs: yellow-all-to-all
-    policy: health_aware_mrc
+    policy: ev_spray #health_aware_mrc
     rate: 20pps
     duration: 60s
 

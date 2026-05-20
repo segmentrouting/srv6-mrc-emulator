@@ -216,6 +216,18 @@ srctl get topology
 srctl run --list
 ```
 
+>[!Note]
+> When running any traffic scenario the MRC emulator sprays SRv6 encapsulated traffic across all available EVs (paths).
+> You should be able to run tcpdump on any spine interface in fabric and see some encapsulated traffic
+
+```bash
+docker exec -it p0-spine02 tcpdump -ni Ethernet8
+
+docker exec -it p2-spine01 tcpdump -ni Ethernet20
+
+# etc
+```
+
 ### MRC traffic generation scenarios using 'make'
 
 1. Basic EV spray, no MRC state or failure detection
