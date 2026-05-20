@@ -117,15 +117,29 @@ def _select_topo_by_host_sentinel(topos_dir: Path) -> None:
         import yaml  # type: ignore[import-not-found]
     except ImportError:
         return
+    # Two-axis sentinel: a candidate matches iff
+     #   (a) yellow-host<L-1> exists and yellow-host<L> does NOT
+     #       (uniquely identifies leaves_per_plane), AND
+     #   (b) p<P-1>-spine0 exists and p<P>-spine0 does NOT
+     #       (uniquely identifies num_planes).
+    # Sharing leaves_per_plane (e.g. 2p-4x8 vs 4p-4x8 both have 8
+    # leaves) is disambiguated by axis (b); sharing num_planes alone
+    # by axis (a).
     live: list[Path] = []
     for cand in topos_dir.glob("*/topo.yaml"):
         try:
             with open(cand) as f:
                 t = yaml.safe_load(f)
             n = int(t["leaves_per_plane"])
-            sentinel_in = f"yellow-host{n - 1:02d}"
-            sentinel_out = f"yellow-host{n:02d}"
-            if sentinel_in in running and sentinel_out not in running:
+            p = int(t["num_planes"])
+            host_in = f"yellow-host{n - 1:02d}"
+            host_out = f"yellow-host{n:02d}"
+            plane_in = f"p{p - 1}-spine00"
+            plane_out = f"p{p}-spine00"
+            if (
+                host_in in running and host_out not in running
+                and plane_in in running and plane_out not in running
+            ):
                 live.append(cand)
         except Exception:
             continue
