@@ -144,46 +144,29 @@ REFERENCE_PAIRS_SPINES = _topo.REFERENCE_PAIRS_SPINES
 
 
 # ----------------------------------------------------------------------------
-# address / SID helpers (must match generate_fabric.py + spray.py)
+# address / SID helpers
+#
+# These re-export topo.py so existing call sites in this module
+# (Pair.routes, the validators, the CLI commands) keep working without
+# qualification. The local definitions used to be parallel
+# implementations with hardcoded `2001:db8:bbbb:` / uSID format
+# strings; they have been deleted in favour of the topo.py originals.
+# A `build_segs` shim keeps the historical name around since this is
+# the only caller of `usid_outer_dst` outside topo.py itself.
 # ----------------------------------------------------------------------------
 
-def inner_addr(tenant: str, host_id: int) -> str:
-    """Plane-independent inner tenant address.
-
-    Phase 1a: yellow flipped from `cccd:<NN>::1` (on lo) to anycast
-    `cccc:<NN>::2` (mirroring green's `bbbb:<NN>::2`). Inner-DA semantics
-    are now uniform across tenants; only the tenant-tag hextet differs.
-    """
-    if tenant == "green":
-        return f"2001:db8:bbbb:{host_id:02x}::2"
-    return f"2001:db8:cccc:{host_id:02x}::2"
+from srv6_mrc.topo import (
+    inner_addr,
+    spine_for,
+    host_name,
+    usid_outer_dst as build_segs,
+)
 
 
 def inner_route_dst(tenant: str, host_id: int) -> str:
     """The /128 we install on the sender. The same /128 is replicated across
     all 4 planes; entries are distinguished by `dev ethN metric 100+P`."""
     return f"{inner_addr(tenant, host_id)}/128"
-
-
-def build_segs(tenant: str, plane: int, spine: int, dst_leaf: int) -> str:
-    """Outer uSID list. encap.red — kernel will place this in the outer dst."""
-    seg = f"fc00:000{plane:x}:f00{spine:x}:e00{dst_leaf:x}"
-    return f"{seg}:d000::" if tenant == "green" else f"{seg}:e009:d001::"
-
-
-def spine_for(lo: int, hi: int) -> int:
-    """Spine selection. Reference pairs use the table for reproducibility;
-    everything else falls through to a deterministic hash."""
-    a, b = (lo, hi) if lo < hi else (hi, lo)
-    if (a, b) in REFERENCE_PAIRS_SPINES:
-        return REFERENCE_PAIRS_SPINES[(a, b)]
-    # Hash: must be deterministic, must spread across 0..7. (a + b * 16) % 8
-    # gives uneven distribution for small samples but is fine for full mesh.
-    return (a * NUM_LEAVES + b) % NUM_SPINES
-
-
-def host_name(tenant: str, host_id: int) -> str:
-    return f"{tenant}-host{host_id:02d}"
 
 
 def container(node: str) -> str:
