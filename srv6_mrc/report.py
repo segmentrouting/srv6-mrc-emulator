@@ -102,18 +102,42 @@ class FlowRow:
 # --- top-level report -------------------------------------------------------
 
 
-def _missing_evs(
-    per_ev_sent: dict[str, int],
-    topology_dims: tuple[int, int],
-) -> list[tuple[int, int]]:
-    """Enumerate EVs in the topology that received zero packets.
+def _active_evs_from_mrc(
+    mrc: dict | None,
+    tenant: str,
+) -> set[tuple[int, int]] | None:
+    """Return (plane, path) EVs the MRC state machine considers active.
 
-    Keys in `per_ev_sent` are in the canonical form "P<plane>:S<spine>"
-    (see SenderResult.to_dict). topology_dims is (num_planes, paths_per_plane).
-    Returns a sorted list of (plane, path) tuples for any EV in the
-    full grid that does NOT appear (with count > 0) in per_ev_sent.
+    "Active" = final weight > 0, i.e. state is GOOD or UNKNOWN. EVs in
+    ASSUMED_BAD have weight 0 and are excluded, even if a handful of
+    packets leaked through before the state machine demoted them.
+
+    Returns None when there is no usable MRC snapshot for `tenant` —
+    caller should fall back to `per_ev_sent`-based counting.
     """
-    num_planes, paths_per_plane = topology_dims
+    if not mrc:
+        return None
+    ev_state = mrc.get("ev_state")
+    if not isinstance(ev_state, dict):
+        return None
+    tenants = ev_state.get("tenants")
+    if not isinstance(tenants, dict):
+        return None
+    records = tenants.get(tenant)
+    if not isinstance(records, list):
+        return None
+    active: set[tuple[int, int]] = set()
+    for rec in records:
+        try:
+            if float(rec.get("weight", 0.0)) > 0.0:
+                active.add((int(rec["plane"]), int(rec["path"])))
+        except (TypeError, ValueError, KeyError):
+            continue
+    return active
+
+
+def _used_evs_from_counts(per_ev_sent: dict[str, int]) -> set[tuple[int, int]]:
+    """Parse "P<plane>:S<spine>" keys with count > 0 into (plane, path) tuples."""
     used: set[tuple[int, int]] = set()
     for k, n in per_ev_sent.items():
         if n <= 0:
@@ -126,13 +150,21 @@ def _missing_evs(
         except (ValueError, AttributeError):
             continue
         used.add((p, s))
-    missing = [
+    return used
+
+
+def _missing_evs(
+    used: set[tuple[int, int]],
+    topology_dims: tuple[int, int],
+) -> list[tuple[int, int]]:
+    """Enumerate EVs in the topology grid that are NOT in `used`."""
+    num_planes, paths_per_plane = topology_dims
+    return [
         (p, s)
         for p in range(num_planes)
         for s in range(paths_per_plane)
         if (p, s) not in used
     ]
-    return missing
 
 
 @dataclass
@@ -347,8 +379,18 @@ class ScenarioReport:
             # EV column: "used/expected" when this flow is EV-aware AND
             # we know the topology denominator; "used" when EV-aware but
             # denominator unknown; "-" for non-EV policies.
-            used = len(f.per_ev_sent)
-            if used == 0:
+            #
+            # For MRC flows we count by final EV state (weight > 0), not
+            # by `per_ev_sent` keys: a freshly-demoted EV may have leaked
+            # a packet or two before the state machine transitioned it
+            # to ASSUMED_BAD, and we don't want those phantom keys
+            # inflating the "active" count. For non-MRC flows we fall
+            # back to per_ev_sent (best signal available).
+            active = _active_evs_from_mrc(f.mrc, f.tenant)
+            if active is None:
+                active = _used_evs_from_counts(f.per_ev_sent)
+            used = len(active)
+            if used == 0 and not f.per_ev_sent:
                 evs_str = "-"
             elif self.expected_evs is None:
                 evs_str = str(used)
@@ -360,13 +402,13 @@ class ScenarioReport:
                 f"{reord_str:>6} {max_str:>4} {evs_str:>7}"
             )
             # When EV-aware and we know the denominator, list any EVs
-            # the sender never selected. Common cause: the EV was
-            # demoted to assumed_bad by the MRC agent.
-            if (used > 0
+            # the sender never selected (or that MRC demoted). Common
+            # cause: link / port shutdown on the (plane, path) cell.
+            if (f.per_ev_sent
                     and self.expected_evs is not None
                     and used < self.expected_evs):
                 assert self.topology_dims is not None
-                missing = _missing_evs(f.per_ev_sent, self.topology_dims)
+                missing = _missing_evs(active, self.topology_dims)
                 if missing:
                     lines.append(f"      ! unused EVs: {missing}")
             for note in f.notes:

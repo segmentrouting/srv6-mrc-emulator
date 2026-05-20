@@ -171,7 +171,19 @@ docker exec -it p1-spine00 config interface shutdown Ethernet0
 make scenario SCEN=yellow-mrc-ev-spray 
 ```
 
-4. Built in failure/degradation scenarios:
+ - Run tcpdumps anywhere in the fabric to see SRv6 encapsulated MRC (UDP port 9999) or probe (UDP port 9998) traffic:
+```bash
+docker exec -it p1-leaf00 tcpdump -ni Ethernet0
+docker exec -it p1-leaf00 tcpdump -ni Ethernet4
+docker exec -it p1-leaf00 tcpdump -ni Ethernet8
+docker exec -it p1-leaf00 tcpdump -ni Ethernet12
+
+docker exec -it p1-spine00 tcpdump -ni Ethernet60
+
+# etc.
+```
+
+1. Built in failure/degradation scenarios:
 
 ```bash
 make scenario SCEN=green-mrc-plane-loss      # 1% loss on plane 2 (netem fault)

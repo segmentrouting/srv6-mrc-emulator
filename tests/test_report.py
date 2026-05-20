@@ -295,6 +295,87 @@ class TestEvColumnAscii(unittest.TestCase):
         self.assertIn("32/32", out)
         self.assertNotIn("unused EVs", out)
 
+    def test_mrc_demoted_ev_excluded_even_when_leaked_packets(self):
+        # Reproduces the lab artifact: a port is shut mid-run; the MRC
+        # state machine demotes the EV to assumed_bad after the third
+        # probe timeout, but a packet or two leaked through before then.
+        # `per_ev_sent` still has the EV as a non-zero key, so the old
+        # `len(per_ev_sent)` logic would report 32/32 — wrong. The new
+        # logic prefers the MRC snapshot's weight==0 signal.
+        per_ev = {f"P{p}:S{s}": 50 for p in range(4) for s in range(8)}
+        per_ev["P1:S0"] = 1  # one packet leaked before demotion
+        # Mock MRC snapshot: P1:S0 demoted to assumed_bad (weight 0.0),
+        # everything else has positive weight.
+        tenants = {
+            "green": [
+                {
+                    "plane": p, "path": s,
+                    "state": "assumed_bad" if (p, s) == (1, 0) else "good",
+                    "weight": 0.0 if (p, s) == (1, 0) else 1.0 / 31,
+                }
+                for p in range(4) for s in range(8)
+            ],
+        }
+        sender = _sender(
+            policy="health_aware_mrc",
+            per_ev_sent=per_ev,
+            mrc={"ev_state": {"tenants": tenants}},
+        )
+        rep = ScenarioReport.from_records(
+            "ev-scen", [sender], [],
+            topology_dims=(4, 8),
+        )
+        out = rep.render_ascii()
+        self.assertIn("31/32", out)
+        self.assertIn("unused EVs: [(1, 0)]", out)
+
+    def test_mrc_snapshot_overrides_per_ev_sent_for_active_count(self):
+        # Even if `per_ev_sent` has all 32 keys with healthy counts,
+        # an MRC snapshot saying one EV is demoted (weight=0) wins.
+        per_ev = {f"P{p}:S{s}": 50 for p in range(4) for s in range(8)}
+        tenants = {
+            "green": [
+                {
+                    "plane": p, "path": s,
+                    "state": "assumed_bad" if (p, s) == (2, 5) else "good",
+                    "weight": 0.0 if (p, s) == (2, 5) else 1.0 / 31,
+                }
+                for p in range(4) for s in range(8)
+            ],
+        }
+        sender = _sender(
+            policy="health_aware_mrc",
+            per_ev_sent=per_ev,
+            mrc={"ev_state": {"tenants": tenants}},
+        )
+        rep = ScenarioReport.from_records(
+            "ev-scen", [sender], [],
+            topology_dims=(4, 8),
+        )
+        out = rep.render_ascii()
+        self.assertIn("31/32", out)
+        self.assertIn("unused EVs: [(2, 5)]", out)
+
+    def test_malformed_mrc_snapshot_falls_back_to_counts(self):
+        # If the mrc dict is missing or malformed, we must not crash and
+        # we must fall back to per_ev_sent-based counting.
+        per_ev = {f"P{p}:S{s}": 50 for p in range(4) for s in range(8)}
+        per_ev.pop("P1:S6")  # 31 EVs in counts
+        for bad_mrc in ({}, {"ev_state": "garbage"},
+                        {"ev_state": {"tenants": None}},
+                        {"ev_state": {"tenants": {"yellow": []}}}):  # wrong tenant
+            sender = _sender(
+                policy="health_aware_mrc",
+                per_ev_sent=per_ev,
+                mrc=bad_mrc,
+            )
+            rep = ScenarioReport.from_records(
+                "ev-scen", [sender], [],
+                topology_dims=(4, 8),
+            )
+            out = rep.render_ascii()
+            self.assertIn("31/32", out, f"bad_mrc={bad_mrc!r}")
+
 
 if __name__ == "__main__":
     unittest.main()
