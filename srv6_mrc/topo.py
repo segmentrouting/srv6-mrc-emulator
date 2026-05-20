@@ -31,6 +31,11 @@ def _find_default_topo_yaml() -> Path:
 
     srv6_mrc/topo.py is at <root>/srv6_mrc/topo.py, so the default
     topology is two levels up + topologies/4p-8x16/topo.yaml.
+
+    NOTE: This is a static fallback for dev/test environments without
+    a live lab. CLI entrypoints (`srv6_mrc.mrc.run`, `srv6_mrc.cli.srctl`)
+    set SRV6_TOPO before any srv6_mrc import so the live topology
+    drives module-level constants like NUM_LEAVES.
     """
     here = Path(__file__).resolve()
     return here.parent.parent / "topologies" / "4p-8x16" / "topo.yaml"

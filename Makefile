@@ -89,7 +89,7 @@ SCEN ?= green-mrc-baseline
 
 .PHONY: scenario
 scenario: ## run an MRC scenario (override SCEN=<name>, default green-mrc-baseline)
-	$(PYTHON) -m srv6_mrc.mrc.run $(TOPO_DIR)/scenarios/$(SCEN).yaml --verbose
+	SRV6_TOPO=$(TOPO_YAML) $(PYTHON) -m srv6_mrc.mrc.run $(TOPO_DIR)/scenarios/$(SCEN).yaml --verbose
 
 # --- housekeeping ----------------------------------------------------------
 

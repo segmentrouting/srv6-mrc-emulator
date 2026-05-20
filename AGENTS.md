@@ -504,6 +504,19 @@ make test
   when all MRC weights are equal. all-to-all (N=240) gets way more
   entropy and is expected to self-balance. Not a bug per se — just
   a property to be aware of when reading ring-scenario reports.
+- **`SRV6_TOPO` must be set before any srv6_mrc import**: module-level
+  constants `NUM_LEAVES`, `NUM_PLANES`, `NUM_SPINES` (in `srv6_mrc.topo`)
+  bind once at import time from whatever topology the env var points
+  at. Auto-sized scenario aliases (`<tenant>-pairs`, `-ring`,
+  `-all-to-all`) use those constants directly, so a stale or missing
+  `SRV6_TOPO` produces silently-wrong host IDs (e.g. expanding
+  `yellow-pairs` to 8 mirror pairs touching host15 on a topology
+  that only has 8 hosts). The CLI entrypoints `srv6_mrc.mrc.run`
+  and `srv6_mrc.cli.srctl` set `SRV6_TOPO` themselves before any
+  srv6_mrc import by inspecting argv for the scenario path/name —
+  see `_infer_srv6_topo_from_argv()` in each. The Makefile sets it
+  inline on every target that runs srv6_mrc Python (`host-routes`,
+  `scenario`). If you add a new entrypoint, do the same.
 
 ## Open investigations (not yet root-caused)
 

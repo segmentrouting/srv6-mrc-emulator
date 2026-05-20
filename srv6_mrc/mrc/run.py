@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -45,6 +46,39 @@ if __package__ in (None, ""):
     _ROOT = Path(__file__).resolve().parent.parent
     if str(_ROOT) not in sys.path:
         sys.path.insert(0, str(_ROOT))
+
+
+def _infer_srv6_topo_from_argv() -> None:
+    """Set SRV6_TOPO from the scenario path on argv, before any srv6_mrc
+    import. Idempotent: does nothing if SRV6_TOPO is already set.
+
+    Scenario paths look like topologies/<name>/scenarios/<scen>.yaml,
+    so the grandparent is the topology directory and its `topo.yaml`
+    drives the run. Setting SRV6_TOPO here ensures srv6_mrc.topo
+    binds NUM_LEAVES (and friends) to the correct topology before the
+    scenario module evaluates auto-sized pair-sets at import time.
+    """
+    if os.environ.get("SRV6_TOPO"):
+        return
+    # Walk argv for the first arg that exists and looks like a scenario
+    # YAML under a topologies/<name>/ tree.
+    for arg in sys.argv[1:]:
+        if not arg or arg.startswith("-"):
+            continue
+        p = Path(arg)
+        if not p.is_file():
+            continue
+        # topologies/<name>/scenarios/<scen>.yaml -> topo at p.parents[1]/topo.yaml
+        try:
+            topo_yaml = p.resolve().parents[1] / "topo.yaml"
+        except IndexError:
+            continue
+        if topo_yaml.is_file():
+            os.environ["SRV6_TOPO"] = str(topo_yaml)
+            return
+
+
+_infer_srv6_topo_from_argv()
 
 from srv6_mrc.netem import Fault, Netem
 from srv6_mrc.report import ScenarioReport

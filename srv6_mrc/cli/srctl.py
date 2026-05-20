@@ -32,6 +32,100 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
+
+def _infer_srv6_topo_from_argv() -> None:
+    """Set SRV6_TOPO from a scenario reference on argv, before importing
+    srv6_mrc.topo. Idempotent: does nothing if SRV6_TOPO is already set.
+
+    Recognized argv shapes for `srctl run`:
+      - bare scenario name: `srctl run <name>` — search topologies/*/scenarios/<name>.yaml
+      - explicit path:      `srctl run path/to/foo.yaml`
+    For both forms, once a unique topology is identified, SRV6_TOPO is
+    set to that topology's topo.yaml so module-level constants in
+    srv6_mrc.topo bind to the right NUM_LEAVES/NUM_PLANES at import.
+    """
+    if os.environ.get("SRV6_TOPO"):
+        return
+    argv = sys.argv[1:]
+    if not argv or argv[0] != "run":
+        return
+    # Find the first non-flag positional after "run".
+    scen_arg: str | None = None
+    for a in argv[1:]:
+        if a.startswith("-"):
+            continue
+        scen_arg = a
+        break
+    if not scen_arg:
+        return
+
+    here = Path(__file__).resolve()
+    repo_root = here.parent.parent.parent
+    topos_dir = repo_root / "topologies"
+
+    # Explicit path: derive topo from <topo>/scenarios/<scen>.yaml.
+    p = Path(scen_arg)
+    if p.is_file():
+        try:
+            topo_yaml = p.resolve().parents[1] / "topo.yaml"
+            if topo_yaml.is_file():
+                os.environ["SRV6_TOPO"] = str(topo_yaml)
+                return
+        except IndexError:
+            pass
+
+    # Bare name: scan topologies/*/scenarios/<scen>.yaml. If exactly
+    # one topology has it, use that. If multiple do, narrow down by
+    # checking which topology is currently deployed (clab topology_name
+    # appears in `docker ps`). Last resort: leave SRV6_TOPO unset and
+    # let the user disambiguate.
+    if not topos_dir.is_dir():
+        return
+    hits = list(topos_dir.glob(f"*/scenarios/{scen_arg}.yaml"))
+    if not hits:
+        return
+    if len(hits) == 1:
+        os.environ["SRV6_TOPO"] = str(hits[0].resolve().parents[1] / "topo.yaml")
+        return
+
+    # Multiple topologies have this scenario name. Use docker ps to
+    # find the deployed one. Best-effort: any failure leaves SRV6_TOPO
+    # unset (preserves the previous behaviour for users without docker).
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        running = out.stdout.split()
+    except Exception:
+        return
+    if not running:
+        return
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except ImportError:
+        return
+    live_hits: list[Path] = []
+    for h in hits:
+        topo_yaml = h.resolve().parents[1] / "topo.yaml"
+        try:
+            with open(topo_yaml) as f:
+                t = yaml.safe_load(f)
+            clab_name = t.get("clab", {}).get("topology_name")
+            if not clab_name:
+                continue
+            prefix = f"clab-{clab_name}-"
+            if any(n.startswith(prefix) for n in running):
+                live_hits.append(topo_yaml)
+        except Exception:
+            continue
+    if len(live_hits) == 1:
+        os.environ["SRV6_TOPO"] = str(live_hits[0])
+
+
+_infer_srv6_topo_from_argv()
+
 from srv6_mrc import topo as _topo
 
 
