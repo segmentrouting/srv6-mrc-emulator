@@ -69,8 +69,26 @@ class EVStateConfig:
     """
     probe_fail_threshold: int = 3
     probe_recover_threshold: int = 5
-    loss_threshold: float = 0.05
-    loss_demote_consecutive: int = 2
+    # loss_threshold: minimum loss ratio that counts as a "bad window"
+    # for the consecutive-bad-window demote counter. Set above the
+    # window-edge straggle noise floor: with packet-level EV spray over
+    # 16 EVs at typical lab rates, each EV sees ~5 packets per 200ms
+    # loss window; a single packet straddling the window boundary
+    # (sent in window N but received in window N+1, or vice versa)
+    # produces an apparent 20% loss on a healthy EV. 5% is below that
+    # floor; 25% is well above it. Real EV failures from interface
+    # shutdown produce 100% loss on affected EVs and demote in the
+    # same number of windows regardless.
+    loss_threshold: float = 0.25
+    # loss_demote_consecutive: how many consecutive >loss_threshold
+    # windows are required to demote. With threshold=0.25 the chance
+    # of two healthy windows in a row showing >25% loss from random
+    # straggle is small; three in a row is statistically negligible.
+    # At loss_window_ms=200ms this gives 600ms demote latency, which
+    # matches the probe path (probe_fail_threshold=3 *
+    # probe_interval_ms=200 = 600ms), so neither path is the long
+    # pole on a hard EV failure.
+    loss_demote_consecutive: int = 3
     # `mrc_min_active_evs`: floor below which the state machine refuses
     # to demote further. None = `max(1, (num_planes * num_paths) // 2)`.
     # Counts (plane, path) EVs, not planes — a partial-spine failure on

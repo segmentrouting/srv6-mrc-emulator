@@ -141,7 +141,11 @@ class TestProbePath(unittest.TestCase):
         self.assertIs(t.state("green", 3, 0), EVState.GOOD)
 
     def test_recovery_blocked_by_recent_loss_demote(self):
-        t = _table()
+        # Use explicit threshold/consecutive so this test stays valid
+        # if defaults change. 5% threshold + 2 consecutive matches the
+        # historical demote behavior tested below.
+        cfg = EVStateConfig(loss_threshold=0.05, loss_demote_consecutive=2)
+        t = _table(cfg=cfg)
         _seed_good(t, "green", [(0, 0), (1, 0), (2, 0)])
         # Loss-feedback path demotes plane 3 path 0.
         t.record_loss_window("green", 3, 0, seen=900, expected=1000)
@@ -176,7 +180,10 @@ class TestProbePath(unittest.TestCase):
 
 class TestLossPath(unittest.TestCase):
     def test_demote_on_two_consecutive_bad_windows(self):
-        t = _table()
+        # Pin threshold=0.05 + consecutive=2 so the test is independent
+        # of default tuning.
+        cfg = EVStateConfig(loss_threshold=0.05, loss_demote_consecutive=2)
+        t = _table(cfg=cfg)
         _seed_good(t, "green", [(0, 0), (1, 0), (2, 0)])
         # 10% loss > 5% threshold; one window not enough.
         t.record_loss_window("green", 3, 0, seen=900, expected=1000)
@@ -197,7 +204,9 @@ class TestLossPath(unittest.TestCase):
     def test_mild_loss_neither_demotes_nor_clears(self):
         # ratio in (loss_threshold/2, loss_threshold] = (2.5%, 5%]:
         # ambiguous — neither demote evidence nor recovery evidence.
-        t = _table()
+        # Pin threshold=0.05 + consecutive=2 for default-independence.
+        cfg = EVStateConfig(loss_threshold=0.05, loss_demote_consecutive=2)
+        t = _table(cfg=cfg)
         _seed_good(t, "green", [(0, 0), (1, 0), (2, 0)])
         # Prime one bad window:
         t.record_loss_window("green", 3, 0, seen=900, expected=1000)
