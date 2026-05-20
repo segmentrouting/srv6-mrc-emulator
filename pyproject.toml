@@ -24,6 +24,7 @@ dev = ["scapy>=2.5", "PyYAML>=6.0"]
 spray = "srv6_mrc.cli.spray:main"
 routes = "srv6_mrc.cli.routes:main"
 run-scenario = "srv6_mrc.mrc.run:main"
+srctl = "srv6_mrc.cli.srctl:main"
 
 [tool.setuptools.packages.find]
 include = ["srv6_mrc*"]
