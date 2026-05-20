@@ -131,7 +131,7 @@ def _select_topo_by_host_sentinel(topos_dir: Path) -> None:
             with open(cand) as f:
                 t = yaml.safe_load(f)
             n = int(t["leaves_per_plane"])
-            p = int(t["num_planes"])
+            p = int(t["planes"])
             host_in = f"yellow-host{n - 1:02d}"
             host_out = f"yellow-host{n:02d}"
             plane_in = f"p{p - 1}-spine00"
