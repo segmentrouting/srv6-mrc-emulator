@@ -1,0 +1,13 @@
+name: 4p-4x8
+description: 4-plane Clos, 4 spines per plane, 8 leaves per plane (mid-size dev variant)
+planes: 4
+spines_per_plane: 4
+leaves_per_plane: 8
+tenants:
+  - green
+  - yellow
+images:
+  sonic: docker-sonic-vs:latest
+  host: alpine-srv6-scapy:1.0
+clab:
+  topology_name: sonic-docker-4p-4x8

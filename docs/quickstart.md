@@ -132,6 +132,47 @@ docker exec -it p1-spine01 tcpdump -ni Ethernet56
 For other quick tests see the [spray-tool.md](./spray-tool.md)
 
 
+### srctl command line utility
+*`srctl`* is a simple CLI modeled about K8s `kubectl` an can be used to interact with the MRC emulator
+
+1. Install `srctl` python packages
+```bash
+pip install -e . --user
+```
+
+2. Test `srctl` was installed
+```bash
+which srctl
+```
+
+If ~/.local/bin isn't in your PATH:
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
+
+```bash
+srctl get hosts
+```
+
+3. `srctl` help
+```bash
+srctl --help
+```
+
+4. `srctl get evs` <src-host> <dst-host>
+```bash
+srctl get evs green-host00 green-host07
+```
+
+```bash
+$ srctl get evs green-host00 green-host07
+PLANE  PATH  EV     SID                       
+0      0     P0:S0  fc00:0000:f000:e007:d000::
+0      1     P0:S1  fc00:0000:f001:e007:d000::
+0      2     P0:S2  fc00:0000:f002:e007:d000::
+<snip>
+```
+
 ### MRC traffic generation scenarios
 
 1. Basic EV spray, no MRC state or failure detection
@@ -141,7 +182,7 @@ make scenario SCEN=green-ev-spray
 make scenario SCEN=yellow-ev-spray
 ```
 
-2. Basic MRC scenarios
+1. Basic MRC scenarios
 ```bash
 # Green MRC scenarios (all use health_aware_mrc)
 make scenario SCEN=green-mrc-baseline        # 4 EVs/pair, 5s clean — sanity: MRC is no-op
