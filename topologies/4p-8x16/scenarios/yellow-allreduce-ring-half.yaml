@@ -1,0 +1,43 @@
+# yellow-allreduce-ring-half.yaml — diagnostic variant of yellow-allreduce-ring.
+#
+# Same 16-host NCCL-style ring pattern as yellow-allreduce-ring, but
+# with paths_per_plane=4 instead of 8. This halves the per-sender probe
+# burst (16 EVs instead of 32 per emit round) and is used to confirm
+# the "thundering herd probe emit" hypothesis: if probes succeed at
+# paths_per_plane=4 but fail at =8 with otherwise-identical config,
+# the bug is in the synchronous batch-emit loop in SenderMrcAgent._emit_loop.
+#
+# Expected outcome if hypothesis is correct:
+#   - All 16 EVs per flow active (16/16, no unused)
+#   - Per-plane traffic roughly balanced (no 3-4x skew)
+#   - MRC state distribution mostly GOOD instead of split bad/unknown
+#   - RTT p50 well under 100ms (the probe_timeout_ms default)
+#
+# Once the underlying probe-pacing bug is fixed, this scenario can be
+# deleted — yellow-allreduce-ring at paths_per_plane=8 will be the real
+# workload.
+#
+# Run:
+#   make scenario SCEN=yellow-allreduce-ring-half
+
+name: yellow-allreduce-ring-half
+description: |
+  Diagnostic half-fan-out variant of yellow-allreduce-ring. Same 16-flow
+  ring pattern but paths_per_plane=4, used to localize the probe-emit
+  thundering-herd bug observed when running all 16 hosts as both sender
+  and receiver simultaneously at paths_per_plane=8.
+
+paths_per_plane: 4
+
+flows:
+  - pairs: yellow-ring
+    policy: health_aware_mrc
+    rate: 100pps
+    duration: 60s
+
+faults: []
+
+mrc: {}
+
+report:
+  out: results/yellow-allreduce-ring-half.json
