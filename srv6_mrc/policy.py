@@ -13,6 +13,25 @@ hot loop. Like `EvSpray`, it respects a per-flow spine subset so
 different flows visit different fabric slices; unlike `EvSpray` the
 within-flow distribution is health-weighted instead of round-robin.
 Deterministic per (seq, flow) given a fixed weights snapshot.
+
+Dual-mode topology binding (Refactor 1 Step 2)
+==============================================
+
+Every policy class accepts an optional `topology: Topology | None`. When
+None (the historical default), the policy reads fabric dimensions from
+the `srv6_mrc.topo` module-level globals (`NUM_PLANES`, `NUM_SPINES`,
+`select_spines_for_addrs`). When provided, dimensions and spine
+selection come from the supplied `Topology` instance instead.
+
+Dual-mode is a staging step. New call sites should pass an explicit
+`topology=...`; existing call sites flip over one at a time without
+breaking. Once every call site is migrated the None branch will be
+removed and `topology` will become a required parameter (Phase C of
+the refactor).
+
+The two modes are observably identical when the supplied Topology
+matches the module globals — that's what `tests/test_policy.py`'s
+dual-mode parity sweep enforces.
 """
 
 from __future__ import annotations
@@ -22,11 +41,20 @@ from typing import Protocol, TYPE_CHECKING
 
 from .topo import (NUM_PLANES, NUM_SPINES, FlowKey,
                    select_spines_for_addrs)
+from .topology import Topology
 
 if TYPE_CHECKING:
     # Imported lazily inside HealthAwareMrc to avoid a circular import
     # between srv6_mrc.policy and srv6_mrc.mrc.ev_state.
     from .mrc.ev_state import EVStateTable
+
+
+# Sentinel for "user didn't pass paths_per_plane; derive from topology
+# at __post_init__ time". We can't use a literal int default like
+# NUM_SPINES because in dual-mode we want a Topology with different
+# spines_per_plane to override the historical default. None is taken;
+# a private object() is unambiguous.
+_DEFAULT_PATHS = -1  # int so `paths_per_plane: int` stays typed
 
 
 class SprayPolicy(Protocol):
@@ -42,9 +70,13 @@ class SprayPolicy(Protocol):
 @dataclass
 class RoundRobin:
     name: str = "round_robin"
+    topology: Topology | None = None
+
+    def _num_planes(self) -> int:
+        return self.topology.planes if self.topology else NUM_PLANES
 
     def pick(self, seq: int, flow: FlowKey) -> int:
-        return seq % NUM_PLANES
+        return seq % self._num_planes()
 
 
 @dataclass
@@ -76,8 +108,9 @@ class EvSpray:
     "active EV mask" read from an EVStateTable, so a degraded EV gets
     skipped on its turn. For step 1 every EV is always active.
     """
-    paths_per_plane: int = NUM_SPINES
+    paths_per_plane: int = _DEFAULT_PATHS
     name: str = "ev_spray"
+    topology: Topology | None = None
 
     # Per-flow cache: FlowKey -> tuple of spine indices. EvSpray.pick is
     # called once per packet so the dict lookup is the hot path; we
@@ -86,9 +119,13 @@ class EvSpray:
     _spine_subsets: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
-        if not (1 <= self.paths_per_plane <= NUM_SPINES):
+        n_spines = (self.topology.spines_per_plane
+                    if self.topology else NUM_SPINES)
+        if self.paths_per_plane == _DEFAULT_PATHS:
+            self.paths_per_plane = n_spines
+        if not (1 <= self.paths_per_plane <= n_spines):
             raise ValueError(
-                f"paths_per_plane must be 1..{NUM_SPINES}, "
+                f"paths_per_plane must be 1..{n_spines}, "
                 f"got {self.paths_per_plane}"
             )
 
@@ -107,16 +144,22 @@ class EvSpray:
         cached = self._spine_subsets.get(flow)
         if cached is not None:
             return cached
-        subset = select_spines_for_addrs(
-            flow.src_addr, flow.dst_addr, self.paths_per_plane,
-        )
+        if self.topology is not None:
+            subset = self.topology.select_spines_for_addrs(
+                flow.src_addr, flow.dst_addr, self.paths_per_plane,
+            )
+        else:
+            subset = select_spines_for_addrs(
+                flow.src_addr, flow.dst_addr, self.paths_per_plane,
+            )
         self._spine_subsets[flow] = subset
         return subset
 
     def pick_ev(self, seq: int, flow: FlowKey) -> tuple[int, int]:
         """Return (plane, spine) for this packet. Round-robin plane-major."""
         spines = self._spines_for_flow(flow)
-        ev_count = NUM_PLANES * len(spines)
+        n_planes = self.topology.planes if self.topology else NUM_PLANES
+        ev_count = n_planes * len(spines)
         ev_idx = seq % ev_count
         # plane-major: ev_idx = plane * len(spines) + spine_idx_in_subset
         # ... but plane-major would visit (P0,S0), (P0,S1), ..., (P0,Sk-1),
@@ -124,8 +167,8 @@ class EvSpray:
         # row, which defeats the anti-clustering point of round-robin.
         # Use spine-major instead: (P0,S0), (P1,S0), (P2,S0), (P3,S0),
         # (P0,S1), (P1,S1), ... -- successive packets always change plane.
-        plane = ev_idx % NUM_PLANES
-        spine_idx = (ev_idx // NUM_PLANES) % len(spines)
+        plane = ev_idx % n_planes
+        spine_idx = (ev_idx // n_planes) % len(spines)
         return plane, spines[spine_idx]
 
     def pick(self, seq: int, flow: FlowKey) -> int:
@@ -143,9 +186,11 @@ class Hash5Tuple:
     not because it's MRC-correct on its own.
     """
     name: str = "hash5tuple"
+    topology: Topology | None = None
 
     def pick(self, seq: int, flow: FlowKey) -> int:
-        return flow.hash5() % NUM_PLANES
+        n_planes = self.topology.planes if self.topology else NUM_PLANES
+        return flow.hash5() % n_planes
 
 
 @dataclass
@@ -157,14 +202,17 @@ class Weighted:
     """
     weights: tuple[float, ...]
     name: str = "weighted"
+    topology: Topology | None = None
 
     # Precomputed cumulative thresholds in [0, 1).
     _cdf: tuple[float, ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if len(self.weights) != NUM_PLANES:
+        n_planes = self.topology.planes if self.topology else NUM_PLANES
+        if len(self.weights) != n_planes:
             raise ValueError(
-                f"weights must have {NUM_PLANES} entries, got {len(self.weights)}"
+                f"weights must have {n_planes} entries, "
+                f"got {len(self.weights)}"
             )
         if any(w < 0 for w in self.weights):
             raise ValueError(f"weights must be >= 0, got {self.weights}")
@@ -260,31 +308,37 @@ class HealthAwareMrc:
     """
     table: "EVStateTable"
     tenant: str
-    paths_per_plane: int = NUM_SPINES
+    paths_per_plane: int = _DEFAULT_PATHS
+    topology: Topology | None = None
     name: str = field(init=False)
 
     # Per-flow spine subset cache (mirrors EvSpray._spine_subsets).
     _spine_subsets: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
+        n_planes = self.topology.planes if self.topology else NUM_PLANES
+        n_spines = (self.topology.spines_per_plane
+                    if self.topology else NUM_SPINES)
         if self.tenant not in self.table.tenants:
             raise ValueError(
                 f"tenant {self.tenant!r} not configured in EVStateTable "
                 f"(known: {self.table.tenants})"
             )
-        if self.table.num_planes != NUM_PLANES:
+        if self.table.num_planes != n_planes:
             raise ValueError(
                 f"EVStateTable.num_planes={self.table.num_planes} but "
-                f"topo NUM_PLANES={NUM_PLANES}; tables must match topology"
+                f"topology planes={n_planes}; tables must match topology"
             )
-        if self.table.num_paths != NUM_SPINES:
+        if self.table.num_paths != n_spines:
             raise ValueError(
                 f"EVStateTable.num_paths={self.table.num_paths} but "
-                f"topo NUM_SPINES={NUM_SPINES}; tables must match topology"
+                f"topology spines_per_plane={n_spines}; tables must match topology"
             )
-        if not (1 <= self.paths_per_plane <= NUM_SPINES):
+        if self.paths_per_plane == _DEFAULT_PATHS:
+            self.paths_per_plane = n_spines
+        if not (1 <= self.paths_per_plane <= n_spines):
             raise ValueError(
-                f"paths_per_plane must be 1..{NUM_SPINES}, "
+                f"paths_per_plane must be 1..{n_spines}, "
                 f"got {self.paths_per_plane}"
             )
         object.__setattr__(self, "name", f"health_aware_mrc({self.tenant})")
@@ -294,9 +348,14 @@ class HealthAwareMrc:
         cached = self._spine_subsets.get(flow)
         if cached is not None:
             return cached
-        subset = select_spines_for_addrs(
-            flow.src_addr, flow.dst_addr, self.paths_per_plane,
-        )
+        if self.topology is not None:
+            subset = self.topology.select_spines_for_addrs(
+                flow.src_addr, flow.dst_addr, self.paths_per_plane,
+            )
+        else:
+            subset = select_spines_for_addrs(
+                flow.src_addr, flow.dst_addr, self.paths_per_plane,
+            )
         self._spine_subsets[flow] = subset
         return subset
 
@@ -309,12 +368,13 @@ class HealthAwareMrc:
         consumes them identically.
         """
         spines = self._spines_for_flow(flow)
+        n_planes = self.topology.planes if self.topology else NUM_PLANES
         # 2-D table read; atomic tuple swap on transitions.
         wgrid = self.table.weights_ev(self.tenant)
         # Slice rows by all planes, columns by the flow's spine subset.
         # Build a flat weight vector over (plane, subset_idx) pairs.
         flat: list[float] = []
-        for plane in range(NUM_PLANES):
+        for plane in range(n_planes):
             row = wgrid[plane]
             for sp in spines:
                 flat.append(row[sp])
@@ -324,7 +384,7 @@ class HealthAwareMrc:
             # flow's EV set when the slice is all-zero (which shouldn't
             # happen under normal floor behaviour but might under e.g.
             # an exotic test setup that demotes a whole spine subset).
-            n = NUM_PLANES * len(spines)
+            n = n_planes * len(spines)
             ev_idx = seq % n
         else:
             cdf = _build_cdf(tuple(flat))
@@ -369,13 +429,23 @@ class HealthAwareMrcFactory:
     size in the same way as `{ev_spray: <int>}`. Default = NUM_SPINES
     (full fan-out).
     """
-    paths_per_plane: int = NUM_SPINES
+    paths_per_plane: int = _DEFAULT_PATHS
     name: str = "health_aware_mrc"
+    topology: Topology | None = None
+
+    def __post_init__(self) -> None:
+        # Resolve the sentinel default eagerly so the factory faithfully
+        # carries the same paths_per_plane the bound policy will see.
+        if self.paths_per_plane == _DEFAULT_PATHS:
+            n_spines = (self.topology.spines_per_plane
+                        if self.topology else NUM_SPINES)
+            self.paths_per_plane = n_spines
 
     def bind(self, table: "EVStateTable", tenant: str) -> HealthAwareMrc:
         return HealthAwareMrc(
             table=table, tenant=tenant,
             paths_per_plane=self.paths_per_plane,
+            topology=self.topology,
         )
 
     # Make the factory acceptable wherever a SprayPolicy is expected for
@@ -388,7 +458,7 @@ class HealthAwareMrcFactory:
         )
 
 
-def policy_from_spec(spec) -> SprayPolicy:
+def policy_from_spec(spec, topology: Topology | None = None) -> SprayPolicy:
     """Build a policy from a scenario `policy:` value.
 
     Accepted forms:
@@ -407,26 +477,37 @@ def policy_from_spec(spec) -> SprayPolicy:
     EVStateTable or tenant context. Callers running the sender hot path
     must finish construction by calling .bind(table, tenant) on the
     returned factory.
+
+    `topology` (Refactor 1 dual-mode): if provided, every constructed
+    policy carries the topology through. When None, policies fall back
+    to module globals — same as today.
     """
     if isinstance(spec, str):
         if spec == "round_robin":
-            return RoundRobin()
+            return RoundRobin(topology=topology)
         if spec == "hash5tuple":
-            return Hash5Tuple()
+            return Hash5Tuple(topology=topology)
         if spec == "ev_spray":
-            # Bare form: full fan-out (paths_per_plane = NUM_SPINES). To
-            # tune, pass `{ev_spray: <int>}` in the YAML.
-            return EvSpray()
+            # Bare form: full fan-out (paths_per_plane = topology's
+            # spines_per_plane, or NUM_SPINES under the module-global
+            # fallback). To tune, pass `{ev_spray: <int>}` in the YAML.
+            return EvSpray(topology=topology)
         if spec == "health_aware_mrc":
-            return HealthAwareMrcFactory()
+            return HealthAwareMrcFactory(topology=topology)
         raise ValueError(f"unknown policy: {spec!r}")
     if isinstance(spec, dict) and len(spec) == 1:
         (kind, value), = spec.items()
         if kind == "weighted":
-            return Weighted(weights=tuple(float(x) for x in value))
+            return Weighted(
+                weights=tuple(float(x) for x in value),
+                topology=topology,
+            )
         if kind == "ev_spray":
-            return EvSpray(paths_per_plane=int(value))
+            return EvSpray(paths_per_plane=int(value), topology=topology)
         if kind == "health_aware_mrc":
-            return HealthAwareMrcFactory(paths_per_plane=int(value))
+            return HealthAwareMrcFactory(
+                paths_per_plane=int(value),
+                topology=topology,
+            )
         raise ValueError(f"unknown policy kind: {kind!r}")
     raise ValueError(f"bad policy spec: {spec!r}")

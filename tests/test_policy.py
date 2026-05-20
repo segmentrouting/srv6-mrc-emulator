@@ -316,5 +316,176 @@ class TestEvSprayFromSpec(unittest.TestCase):
         self.assertEqual(p.paths_per_plane, 2)
 
 
+# ---------------------------------------------------------------------------
+# Refactor 1 Step 2: dual-mode topology binding
+#
+# Every policy class takes optional `topology=...`. When None, dimensions
+# come from `topo` module globals (legacy path). When a Topology is
+# supplied, dimensions come from the instance. These tests prove the two
+# paths are observably identical when the supplied Topology matches the
+# active module globals.
+#
+# When per-call-site migration completes (Phase B), every call site will
+# pass an explicit Topology and the None branch will be deleted (Phase C).
+# Until then, this sweep is the safety net for the dual-mode invariant.
+# ---------------------------------------------------------------------------
+
+from pathlib import Path
+
+from srv6_mrc.topology import Topology
+
+
+_DEFAULT_TOPO_YAML = (
+    Path(__file__).resolve().parent.parent
+    / "topologies" / "4p-8x16" / "topo.yaml"
+)
+
+
+class _DualModeMixin:
+    """Build a Topology that matches the active module globals.
+
+    Tests in this module run under the default 4p-8x16 SRV6_TOPO; that
+    matches `topologies/4p-8x16/topo.yaml`. If the env shifts, the
+    parity assertion would catch the mismatch immediately (dimensions
+    diverge -> picks diverge).
+    """
+
+    @classmethod
+    def topology(cls) -> Topology:
+        return Topology.from_yaml(_DEFAULT_TOPO_YAML)
+
+
+class TestDualModeParity(unittest.TestCase, _DualModeMixin):
+    """For every policy that's now dual-mode, the topology=None and
+    topology=<matching> paths must produce identical picks across a
+    range of (seq, flow) inputs."""
+
+    SEQS = list(range(64))
+    FLOWS = [
+        FlowKey(f"2001:db8:bbbb:{a:02x}::2",
+                f"2001:db8:bbbb:{b:02x}::2", 9999, 9999)
+        for a in (0, 3, 7, 15) for b in (1, 4, 8, 11) if a != b
+    ]
+
+    def _assert_pick_identical(self, p_legacy, p_topo):
+        for flow in self.FLOWS:
+            for seq in self.SEQS:
+                self.assertEqual(
+                    p_legacy.pick(seq, flow),
+                    p_topo.pick(seq, flow),
+                    f"divergence at seq={seq} flow={flow}",
+                )
+
+    def test_round_robin_parity(self):
+        self._assert_pick_identical(
+            policy.RoundRobin(),
+            policy.RoundRobin(topology=self.topology()),
+        )
+
+    def test_hash5tuple_parity(self):
+        self._assert_pick_identical(
+            policy.Hash5Tuple(),
+            policy.Hash5Tuple(topology=self.topology()),
+        )
+
+    def test_weighted_parity(self):
+        w = tuple(float(x) for x in (1, 2, 3, 4))
+        self._assert_pick_identical(
+            policy.Weighted(weights=w),
+            policy.Weighted(weights=w, topology=self.topology()),
+        )
+
+    def test_ev_spray_pick_parity(self):
+        self._assert_pick_identical(
+            policy.EvSpray(),
+            policy.EvSpray(topology=self.topology()),
+        )
+
+    def test_ev_spray_pick_ev_parity(self):
+        # pick_ev is the actually-interesting axis (plane, spine), so
+        # check it directly rather than only via the pick() projection.
+        T = self.topology()
+        p1 = policy.EvSpray()
+        p2 = policy.EvSpray(topology=T)
+        for flow in self.FLOWS:
+            for seq in self.SEQS:
+                self.assertEqual(p1.pick_ev(seq, flow),
+                                 p2.pick_ev(seq, flow))
+
+    def test_ev_spray_paths_per_plane_default_resolves_to_topology(self):
+        T = self.topology()
+        p = policy.EvSpray(topology=T)
+        # paths_per_plane sentinel should be replaced with the topology's
+        # spines_per_plane at __post_init__ time.
+        self.assertEqual(p.paths_per_plane, T.spines_per_plane)
+
+    def test_ev_spray_explicit_paths_per_plane_honoured(self):
+        T = self.topology()
+        p = policy.EvSpray(paths_per_plane=3, topology=T)
+        self.assertEqual(p.paths_per_plane, 3)
+
+    def test_factory_carries_topology_into_bound_policy(self):
+        T = self.topology()
+        f = policy.HealthAwareMrcFactory(topology=T)
+        # The factory's paths_per_plane sentinel should also resolve.
+        self.assertEqual(f.paths_per_plane, T.spines_per_plane)
+        # And a bound policy should still carry the same Topology.
+        from srv6_mrc.mrc.ev_state import EVStateTable
+        table = EVStateTable(
+            tenants=("green",),
+            num_planes=T.planes,
+            num_paths=T.spines_per_plane,
+        )
+        bound = f.bind(table=table, tenant="green")
+        self.assertIs(bound.topology, T)
+        self.assertEqual(bound.paths_per_plane, T.spines_per_plane)
+
+    def test_policy_from_spec_threads_topology(self):
+        T = self.topology()
+        p = policy.policy_from_spec("ev_spray", topology=T)
+        self.assertIs(p.topology, T)
+        p2 = policy.policy_from_spec({"ev_spray": 3}, topology=T)
+        self.assertIs(p2.topology, T)
+        self.assertEqual(p2.paths_per_plane, 3)
+        f = policy.policy_from_spec("health_aware_mrc", topology=T)
+        self.assertIs(f.topology, T)
+
+
+class TestTopologyValidation(unittest.TestCase):
+    """When a Topology with different dimensions is supplied, the
+    policy's own dimension reads must reflect the topology, not the
+    module globals."""
+
+    def _alt_topology(self) -> Topology:
+        # Construct a topology whose dimensions differ from the active
+        # 4p-8x16 module globals, so a divergence test actually diverges.
+        return Topology.from_dict({
+            "name": "tiny", "planes": 2,
+            "spines_per_plane": 2, "leaves_per_plane": 2,
+            "tenants": ["green", "yellow"],
+        })
+
+    def test_round_robin_planes_track_topology(self):
+        p = policy.RoundRobin(topology=self._alt_topology())
+        out = [p.pick(i, F) for i in range(8)]
+        # 2-plane topology -> cycle period 2, not 4.
+        self.assertEqual(out, [0, 1] * 4)
+
+    def test_weighted_validation_against_topology_planes(self):
+        T = self._alt_topology()
+        # 2-plane topology: 4 weights should be rejected.
+        with self.assertRaises(ValueError):
+            policy.Weighted(weights=(1, 1, 1, 1), topology=T)
+        # 2 weights should be accepted.
+        policy.Weighted(weights=(1, 1), topology=T)
+
+    def test_ev_spray_validates_against_topology_spines(self):
+        T = self._alt_topology()
+        # spines_per_plane = 2 on the tiny topology.
+        with self.assertRaises(ValueError):
+            policy.EvSpray(paths_per_plane=3, topology=T)
+        policy.EvSpray(paths_per_plane=2, topology=T)
+
+
 if __name__ == "__main__":
     unittest.main()
