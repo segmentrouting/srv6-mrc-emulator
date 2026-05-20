@@ -553,15 +553,56 @@ remaining live EVs cluster on a couple of planes by chance.
    ~6ms — scapy build for a 32-byte SRv6 outer typically takes
    1-3ms on alpine-on-docker-sonic-vs, so we may be at the edge.
 
-**Next diagnostic step (tomorrow)**: tcpdump on a single spine's
-ingress interface during a 60s `yellow-allreduce-ring` run. Filter
-on PROBE magic byte `0xA5`. Three buckets to count:
-- probes that arrived at the spine but never came out (spine-side
-  drop — points to fabric/routing bug)
-- probes that crossed the spine but no reply came back from the
-  receiver (host-side bug, hypothesis 3 or 5)
-- probes + replies both flow normally but the sender's RX thread
-  never matches them (hypothesis 4 or a deeper agent bug)
+**Diagnostic progress (session log)**:
+
+- Single-spine tcpdump runs (p0-spine00 Ethernet0, then p2-spine00
+  Ethernet0) confirmed data + replies *do* traverse the fabric
+  for ring pairs, encapsulated correctly with `encap.red` outer.
+  Single-spine captures CANNOT answer the real question (is
+  traffic concentrated on a few EVs?) — they only confirm the
+  spine being watched is carrying something.
+- **µSID decoding reminder** (got this wrong twice in one
+  session — don't repeat): outer `fc00:<plane>:e00L:e009:d00H::`
+  on a spine's Ethernet0 is *post-spine-uN-pop*, so the leftmost
+  remaining slot `e00L` is "uA from this spine toward leaf `L`",
+  `e009` is "leaf uA out the host port", `d00H` is "uDT decap on
+  the yellow host at leaf `H`". The spine identity is implicit
+  in WHICH router you captured on, not in the µSID string.
+- **ICMPv6 port-unreachable on port 9999** observed in p0-spine00
+  capture — host00 sending PROBE_REPLY/LOSS_REPORT to host15:9999,
+  host15's kernel returning ICMP unreachable. Six in ~150ms then
+  stopped. Probably a startup race (receiver-side sender process
+  not yet bound on `:::9999` when first reply arrives) or process
+  teardown. **Parked as a separate issue** — not believed to be
+  the cause of the 16/32 EV demotion. Revisit once main bug is
+  fixed.
+
+**Next diagnostic step (tomorrow morning, 2 minutes of lab time)**:
+4×8 grid scan to count packets per (plane, spine) during a 60s
+`yellow-allreduce-ring` run:
+
+```bash
+for p in 0 1 2 3; do
+  for s in 00 01 02 03 04 05 06 07; do
+    n=$(timeout 5 docker exec p${p}-spine${s} tcpdump -nni Ethernet0 \
+        'ip6 and udp' 2>/dev/null | wc -l)
+    printf "p%d-spine%s: %s pkts\n" $p $s $n
+  done
+done
+```
+
+Three possible outcomes branch the investigation cleanly:
+
+1. **All 32 cells roughly equal** → data is well-distributed
+   across EVs. The 16/32 demotion is purely a probe/reply path
+   bug (hypotheses 3, 4, 5 above remain in play; the ICMP-9999
+   issue gets promoted back to suspect).
+2. **~16 of 32 cells near zero** → data path itself isn't using
+   half the EVs. Probe loss on those cells is a *consequence*
+   not a cause. Root cause is in `select_spines_for_addrs` or
+   in how `EvSpray` / `health_aware_mrc` rotates outer DAs.
+3. **Skewed but not binary** → look at the actual distribution
+   shape; hypothesis-set depends on which cells are cold.
 
 ### Spurious "orphan flow" report warnings on collective scenarios
 
