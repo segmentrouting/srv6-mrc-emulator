@@ -103,6 +103,12 @@ TOPO_DIR: Path = REPO_ROOT / "topologies" / "4p-8x16"
 CONFIG_DIR: Path = TOPO_DIR / "config"
 REF_LEAF_CONFIG: Path = CONFIG_DIR / "p0-leaf00" / "config_db.json"
 
+# Embedded SONiC PORT-table template, identical across every spine and
+# leaf in every topology size (docker-sonic-vs ships a single 32-port
+# config). Used as the default seed so new topologies don't need a
+# pre-existing config_db.json before the first `make regen`.
+EMBEDDED_PORT_TEMPLATE: Path = SCRIPT_DIR / "sonic_vs_port_table.json"
+
 # Management subnet (172.20.18.0/24): plenty of room for 96 switches + 32 hosts.
 MGMT_SUBNET_BASE = "172.20.18"
 SPINE_MGMT_START = 10   # .10 .. .41   (4 planes * 8 spines = 32)
@@ -286,10 +292,20 @@ yellow_host_loopback_addr = yellow_host_anycast_addr
 
 
 def load_port_template() -> dict:
+    # Prefer a per-topology seed if one already exists (preserves any
+    # local edits a user made to the PORT block for that topology).
     if REF_LEAF_CONFIG.is_file():
         with open(REF_LEAF_CONFIG, encoding="utf-8") as f:
             return json.load(f)["PORT"]
-    raise SystemExit(f"Missing reference PORT template: {REF_LEAF_CONFIG}")
+    # Fall back to the bundled template so a fresh topology only needs
+    # a topo.yaml — no manual seed-file copy.
+    if EMBEDDED_PORT_TEMPLATE.is_file():
+        with open(EMBEDDED_PORT_TEMPLATE, encoding="utf-8") as f:
+            return json.load(f)
+    raise SystemExit(
+        f"Missing PORT template: tried {REF_LEAF_CONFIG} and "
+        f"{EMBEDDED_PORT_TEMPLATE}"
+    )
 
 
 # ---------------------------------------------------------------------------

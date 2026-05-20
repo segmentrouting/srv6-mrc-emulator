@@ -48,21 +48,9 @@ clab:
 EOF
 ```
 
-### 2. Seed the SONiC PORT template, then generate
-
-The generator needs an existing `p0-leaf00/config_db.json` to read the
-SONiC `PORT` table from (a 32-entry block of `Ethernet0..Ethernet124`
-metadata that docker-sonic-vs ships with). The PORT block is identical
-across every leaf and spine and across every topology size, so just
-copy it from any existing topology — the generator will overwrite the
-file in place with the correct 4p-4x8 leaf config but reuse the PORT
-block as a template for every other node.
+### 2. Generate clab + SONiC config
 
 ```bash
-mkdir -p topologies/4p-4x8/config/p0-leaf00
-cp topologies/2p-4x8/config/p0-leaf00/config_db.json \
-   topologies/4p-4x8/config/p0-leaf00/config_db.json
-
 make TOPO=4p-4x8 regen
 ```
 
@@ -70,6 +58,15 @@ make TOPO=4p-4x8 regen
 - `topologies/4p-4x8/topology.clab.yaml`
 - `topologies/4p-4x8/config/<node>/config_db.json` for every spine and leaf
 - `topologies/4p-4x8/config/<node>/frr.conf` for every spine and leaf
+
+The generator uses an embedded SONiC PORT-table template
+(`generators/sonic_vs_port_table.json`) for the per-node
+`config_db.json` PORT block, so a fresh topology only needs `topo.yaml`
+to exist. If you ever want to override the PORT table for a specific
+topology (e.g. different lane mappings or speeds), drop a hand-edited
+`config_db.json` at `topologies/<name>/config/p0-leaf00/config_db.json`
+before running `make regen` — the generator will prefer that over the
+embedded template.
 
 ### 3. Copy routes and scenarios from an existing topology
 
@@ -119,7 +116,7 @@ Tip: `export TOPO=4p-4x8` once at the top of your shell to drop the
 | `topology.clab.yaml` | yes |
 | `config/<node>/config_db.json` (per spine, per leaf) | yes |
 | `config/<node>/frr.conf` (per spine, per leaf) | yes |
-| `config/p0-leaf00/config_db.json` PORT seed | **no** — must exist before first `make regen` (copy from any other topology) |
+| `config/p0-leaf00/config_db.json` PORT seed | yes — generator falls back to embedded `generators/sonic_vs_port_table.json`; only override by hand if you need topology-specific PORT settings |
 | `routes/full-mesh.yaml` | no — copy from another topology, but works as-is |
 | `routes/host00-fanout.yaml`, `routes/reference-pairs.yaml` | no — review before reusing across sizes |
 | `scenarios/*.yaml` (named pair-sets) | no — copy from another topology, auto-sizes at runtime |
