@@ -92,10 +92,12 @@ cp topologies/4p-8x16/scenarios/{green,yellow}-mrc-baseline.yaml \
 ```
 
 Scenarios that need editing before copying: anything with explicit
-leaf IDs that may not exist in the smaller fabric. `host00-fanout.yaml`
-is fine since host00 always exists; `reference-pairs.yaml` references
-hardcoded pairs that may reference leaves past `NUM_LEAVES-1` — check
-before using.
+leaf IDs that may not exist in the smaller fabric, or that uses
+size-suffixed pair-set aliases (`-pairs-8`, `-pairs-4`) instead of
+the auto-sized form (`-pairs`). Prefer the auto-sized aliases
+(`<tenant>-pairs`, `<tenant>-ring`, `<tenant>-all-to-all`) for any
+new scenario — they expand from `NUM_LEAVES` at scenario-load time
+and work unchanged on every topology size.
 
 ### 4. Deploy and use
 

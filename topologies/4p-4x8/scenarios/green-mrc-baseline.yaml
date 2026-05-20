@@ -21,7 +21,7 @@ description: |
   weights — sanity check that enabling MRC is a no-op on a clean fabric.
 
 flows:
-  - pairs: green-pairs-8
+  - pairs: green-pairs
     policy: health_aware_mrc
     rate: 500pps
     duration: 5s

@@ -29,7 +29,7 @@ description: |
 paths_per_plane: 8
 
 flows:
-  - pairs: green-pairs-8
+  - pairs: green-pairs
     policy: health_aware_mrc
     rate: 100pps
     duration: 60s

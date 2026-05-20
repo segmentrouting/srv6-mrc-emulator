@@ -225,9 +225,25 @@ def _ring_pairs(tenant: str) -> list[FlowPair]:
     return [FlowPair(tenant, i, (i + 1) % n) for i in range(n)]
 
 
+def _reference_pairs(tenant: str) -> list[FlowPair]:
+    """Mirror-pattern pairs i <-> (N-1-i), N/2 pairs total.
+
+    Auto-sizes from NUM_LEAVES so the same alias `<tenant>-pairs` works
+    on every topology size:
+      8 hosts  -> 4 pairs:  (0,7), (1,6), (2,5), (3,4)
+      16 hosts -> 8 pairs:  (0,15), (1,14), ..., (7,8)
+    On 4p-8x16 the resulting spine assignments line up with
+    topo.REFERENCE_PAIRS_SPINES (so per-pair spine selection is
+    deterministic and matches the reference design).
+    """
+    n = NUM_LEAVES
+    return [FlowPair(tenant, i, n - 1 - i) for i in range(n // 2)]
+
+
 for _tenant in TENANTS:
     NAMED_PAIR_SETS[f"{_tenant}-all-to-all"] = _all_to_all_pairs(_tenant)
     NAMED_PAIR_SETS[f"{_tenant}-ring"] = _ring_pairs(_tenant)
+    NAMED_PAIR_SETS[f"{_tenant}-pairs"] = _reference_pairs(_tenant)
 del _tenant
 
 

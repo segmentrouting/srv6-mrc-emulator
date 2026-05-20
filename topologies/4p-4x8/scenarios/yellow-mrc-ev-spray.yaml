@@ -56,7 +56,7 @@ description: |
 paths_per_plane: 8
 
 flows:
-  - pairs: yellow-pairs-8
+  - pairs: yellow-pairs
     policy: health_aware_mrc
     rate: 100pps
     duration: 60s

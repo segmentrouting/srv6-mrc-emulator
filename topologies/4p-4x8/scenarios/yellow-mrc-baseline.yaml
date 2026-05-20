@@ -37,7 +37,7 @@ description: |
   rx socket sees probes arriving via the host-side decap.
 
 flows:
-  - pairs: yellow-pairs-8
+  - pairs: yellow-pairs
     policy: health_aware_mrc
     rate: 500pps
     duration: 5s
