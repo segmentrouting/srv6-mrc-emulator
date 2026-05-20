@@ -589,6 +589,11 @@ remaining live EVs cluster on a couple of planes by chance.
   teardown. **Parked as a separate issue** — not believed to be
   the cause of the 16/32 EV demotion. Revisit once main bug is
   fixed.
+- **2026-05-20**: 4p-4x8 phantom-demote investigation closed (see
+  RESOLVED entry below). Two stacked bugs in `loss_compute` +
+  `ev_state` defaults; fixed in `d37d70e` (skip-on-no-pairing) and
+  `5093246` (raise loss thresholds above straggle floor). 16/16 EVs
+  on healthy fabric across green and yellow baselines confirmed.
 
 **Next diagnostic step (tomorrow morning, 2 minutes of lab time)**:
 4×8 grid scan to count packets per (plane, spine) during a 60s
@@ -634,6 +639,71 @@ has distinct inner addresses (`cccc::2`, `cccc:1::2`, etc).
 counts (e.g. 16 ring pairs). See "Things learned" above. Expected
 to self-balance at all-to-all scale (240 flows); benchmark and
 confirm once the probe-failure bug is fixed.
+
+### RESOLVED: Phantom EV demotions on healthy 4p-4x8 baselines
+
+**Symptom (4p-4x8 green/yellow MRC baseline runs, all flows 0% loss
+with clean probes)**: 5–8 of 16 EVs per flow ended in `assumed_bad`
+with `last_loss_ratio` 0.14–0.86, `consecutive_probe_timeouts: 0`,
+and the demoted EVs always had dramatically fewer `per_ev_sent`
+packets than their plane peers (e.g. 30–55 vs ~125).
+
+**Root cause was two stacked bugs**:
+
+1. **Receiver-derived `expected` fallback** (commit `d37d70e`).
+   `loss_compute.apply_loss_report` fell back to the receiver's
+   `rec.expected = max_seq − min_seq + 1` when no `SentWindow`
+   could be paired against a `LossReport` (first 1–2 windows of a
+   flow, or wall-clock skew bursts beyond `max_window_skew_ms`).
+   Under packet-level EV spray that field is the **flow-global**
+   seq span seen on a single EV, which is a strict and typically
+   wildly inflated upper bound: `seen=10` on an EV whose seqs span
+   0..400 yields a 97.5% phantom loss ratio. Two such reports
+   crossed `loss_demote_consecutive` and demoted healthy EVs.
+   *Fix:* skip the plane entirely when no sender-side denominator
+   is available; the `fell_back_to_receiver_expected` counter is
+   kept for diagnostics but now means "skipped" instead of
+   "attributed via rec.expected". Wire format unchanged.
+
+2. **Window-edge straggle** (commit `5093246`). After (1), residual
+   phantom demotes still appeared in flows where one or two EVs
+   had skewed `per_ev_sent`. Cause: with 16 EVs at ~370 pps/flow
+   and 200ms loss windows, each EV accumulates ~5 packets per
+   window. A single packet straddling a window boundary (sent in
+   sender-window N but received in receiver-window N+1, or vice
+   versa) shows up as ~20% apparent loss in the paired report.
+   The `seen < sent` case can't be clamped — it's structurally
+   indistinguishable from real loss. With the old defaults
+   (`loss_threshold=0.05`, `loss_demote_consecutive=2`) two
+   unlucky windows in a row tripped the demote, and the
+   redistribution after demote skewed neighbor EVs' counts
+   further, cascading. *Fix:* lift defaults to
+   `loss_threshold=0.25`, `loss_demote_consecutive=3`. Three
+   consecutive >25% windows on a healthy EV from random straggle
+   is statistically negligible. Real EV failures (interface
+   shutdown, spine down) produce ~100% loss on affected EVs and
+   demote in `3 * loss_window_ms = 600ms`, matching the probe
+   path's `3 * probe_interval_ms = 600ms` floor — neither path
+   becomes the long pole.
+
+**Lab confirmation**: post-fix re-runs of `green-mrc-baseline` and
+`yellow-mrc-baseline` show 16/16 EVs across all 8 flows, 0% loss,
+balanced per-plane distribution.
+
+**Lessons / invariants worth pinning down**:
+- The receiver's `expected_local = max_seq − min_seq + 1` field is
+  a *strict upper bound* under packet-level spray, never a usable
+  denominator. The receiver still emits it for wire compatibility
+  but the sender ignores it.
+- Tune loss-window thresholds to the **window-edge straggle noise
+  floor**, not to the lossy-fabric SLO. `loss_threshold` lower than
+  `1 / (avg_packets_per_ev_per_window)` is below the noise floor
+  by construction. At 5 pkts/EV/window, anything under 20% is
+  noise.
+- The probe path's `probe_fail_threshold * probe_interval_ms` is
+  the lower bound on detection latency for a hard EV failure;
+  loss-window tuning should aim to match it, not beat it (cheap
+  detection latency is bought with false positives, which cascade).
 
 
 
