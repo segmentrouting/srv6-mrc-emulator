@@ -37,7 +37,7 @@ description: |
   AI collective pattern; every host both sends 15 streams and receives
   15 streams (incast at every leaf downlink).
 
-paths_per_plane: 8
+paths_per_plane: 4
 
 flows:
   - pairs: yellow-all-to-all

@@ -47,7 +47,7 @@ description: |
   Models one step of a bandwidth-optimal ring all-reduce — the dominant
   pattern in production AI training.
 
-paths_per_plane: 8
+paths_per_plane: 4
 
 flows:
   - pairs: yellow-ring

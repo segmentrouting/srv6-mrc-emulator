@@ -53,7 +53,7 @@ description: |
   seen/expected, sender's SentWindow is per-EV, apply_loss_report
   demotes the single bad (plane, path) cell on link failure.
 
-paths_per_plane: 8
+paths_per_plane: 4
 
 flows:
   - pairs: yellow-pairs

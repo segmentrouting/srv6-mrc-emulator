@@ -216,7 +216,7 @@ srctl get topology
 srctl run --list
 ```
 
-### MRC traffic generation scenarios
+### MRC traffic generation scenarios using 'make'
 
 1. Basic EV spray, no MRC state or failure detection
 ```bash

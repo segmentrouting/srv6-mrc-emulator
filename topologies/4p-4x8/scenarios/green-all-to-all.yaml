@@ -18,7 +18,7 @@ description: |
   running concurrently at 20 pps each. Companion to yellow-all-to-all
   on the simpler green leaf-decap data path.
 
-paths_per_plane: 8
+paths_per_plane: 4
 
 flows:
   - pairs: green-all-to-all
