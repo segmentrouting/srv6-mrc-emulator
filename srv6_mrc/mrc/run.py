@@ -83,7 +83,7 @@ _infer_srv6_topo_from_argv()
 from srv6_mrc.netem import Fault, Netem
 from srv6_mrc.report import ScenarioReport
 from srv6_mrc.mrc.scenario import MrcSpec, Scenario, from_yaml_file
-from srv6_mrc.topo import (NUM_PLANES, NUM_SPINES, inner_addr,
+from srv6_mrc.topo import (current_topology, inner_addr,
                               select_spines_for_addrs, usid_outer_dst)
 
 
@@ -404,7 +404,7 @@ def _ev_spray_n(policy_cli: str,
         except ValueError:
             return None
     if s == "ev_spray":
-        return scenario_ppp if scenario_ppp is not None else NUM_SPINES
+        return scenario_ppp if scenario_ppp is not None else current_topology().spines_per_plane
     return None
 
 
@@ -428,12 +428,13 @@ def _print_ev_preview(flows: list[FlowRun],
         return
 
     print(f"  ev preview (paths_per_plane="
-          f"{scenario_ppp if scenario_ppp is not None else NUM_SPINES}):")
+          f"{scenario_ppp if scenario_ppp is not None else current_topology().spines_per_plane}):")
     for flow, n in ev_flows:
         src_addr = inner_addr(flow.tenant, flow.src_id)
         dst_addr = inner_addr(flow.tenant, flow.dst_id)
         spines = select_spines_for_addrs(src_addr, dst_addr, n)
-        ev_count = NUM_PLANES * len(spines)
+        topo_t = current_topology()
+        ev_count = topo_t.planes * len(spines)
         print(f"    {flow.src_host} -> {flow.dst_host}  "
               f"spines={list(spines)}  ev_count={ev_count}")
         # Spine-major round-robin: plane = seq % NUM_PLANES;
@@ -441,7 +442,7 @@ def _print_ev_preview(flows: list[FlowRun],
         # per (plane, spine) — the full EV set this flow will rotate
         # through, in transmit order so seq=k maps to the k-th row.
         for spine in spines:
-            for plane in range(NUM_PLANES):
+            for plane in range(topo_t.planes):
                 outer = usid_outer_dst(flow.tenant, plane, spine,
                                        flow.dst_id)
                 print(f"      P{plane}:S{spine}  {outer}")
@@ -522,14 +523,15 @@ def run_scenario(scenario: Scenario, *,
         except Exception as e:
             print(f"  ! revert failed: {e}", file=sys.stderr)
 
+    topo_t = current_topology()
     paths_per_plane = (
         scenario.paths_per_plane
         if scenario.paths_per_plane is not None
-        else NUM_SPINES
+        else topo_t.spines_per_plane
     )
     return ScenarioReport.from_records(
         scenario.name, sender_records, receiver_records,
-        topology_dims=(NUM_PLANES, paths_per_plane),
+        topology_dims=(topo_t.planes, paths_per_plane),
     )
 
 

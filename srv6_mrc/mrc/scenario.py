@@ -53,7 +53,7 @@ from typing import Any
 
 from ..netem import normalize_spec, parse_target
 from ..policy import policy_from_spec
-from ..topo import NUM_LEAVES, NUM_SPINES, TENANTS, host_name
+from ..topo import NUM_LEAVES, NUM_SPINES, TENANTS, current_topology, host_name
 
 
 # --- public dataclasses -----------------------------------------------------
@@ -327,8 +327,12 @@ def _validate_flow(item: Any, path: str) -> FlowSpec:
     policy_raw = item["policy"]
     # Validate policy spec by attempting to build it — but don't keep
     # the instance (FlowSpec stores the raw spec for runner-side rebuild).
+    # Refactor 1 Phase B: pass the active Topology so policy validation
+    # uses the same plane/path dimensions the runner will use. With the
+    # singleton accessor this is identity-stable across the whole
+    # validation pass.
     try:
-        policy_from_spec(policy_raw)
+        policy_from_spec(policy_raw, topology=current_topology())
     except ValueError as e:
         raise ScenarioError(f"{path}.policy", str(e)) from None
 

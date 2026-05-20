@@ -52,6 +52,7 @@ from srv6_mrc.policy import (
 )
 from srv6_mrc.topo import (
     NUM_PLANES, NUM_SPINES, PLANE_NICS, SPRAY_PORT,
+    current_topology,
     host_underlay_addr, inner_addr, usid_outer_dst, spine_for,
 )
 
@@ -104,17 +105,29 @@ def parse_policy(s: str, *, tenant: str, ev_config=None,
     Embedded "ev_spray:N" syntax always wins over the override, so a
     user with a CLI policy spec doesn't get silently retuned by a
     leftover env var.
+
+    Refactor 1 Phase B: every `policy_from_spec` call here threads in
+    `current_topology()` so the resulting policy object's plane / path
+    dimensions come from the active Topology rather than `policy.py`'s
+    legacy module-import-time read of `srv6_mrc.topo.NUM_*`. Behavior
+    is identical (the Topology is built from the same `_TOPO` dict);
+    the change is making the data dependency explicit so subsequent
+    sites can be migrated incrementally and `policy.py`'s `topology=
+    None` fallback can be removed in Phase C.
     """
     s = s.strip()
+    topology = current_topology()
     if s.startswith("weighted:"):
         weights = [float(w) for w in s.split(":", 1)[1].split(",")]
-        return policy_from_spec({"weighted": weights})
+        return policy_from_spec({"weighted": weights}, topology=topology)
     if s.startswith("ev_spray:"):
         n = int(s.split(":", 1)[1])
-        return policy_from_spec({"ev_spray": n})
+        return policy_from_spec({"ev_spray": n}, topology=topology)
     if s == "ev_spray" and paths_per_plane is not None:
-        return policy_from_spec({"ev_spray": paths_per_plane})
-    policy = policy_from_spec(s)
+        return policy_from_spec(
+            {"ev_spray": paths_per_plane}, topology=topology,
+        )
+    policy = policy_from_spec(s, topology=topology)
     if isinstance(policy, HealthAwareMrcFactory):
         # Lazy import: keeps stdlib-only imports at top of file and
         # mirrors the laziness around scapy elsewhere in the runner.
@@ -122,8 +135,8 @@ def parse_policy(s: str, *, tenant: str, ev_config=None,
         # One tenant per sender process today. If we ever multiplex
         # tenants in a single sender, this becomes a per-host singleton.
         table = EVStateTable(
-            tenants=(tenant,), num_planes=NUM_PLANES,
-            num_paths=NUM_SPINES, cfg=ev_config,
+            tenants=(tenant,), num_planes=topology.planes,
+            num_paths=topology.spines_per_plane, cfg=ev_config,
         )
         return policy.bind(table=table, tenant=tenant)
     return policy

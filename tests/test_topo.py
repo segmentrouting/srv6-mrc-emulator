@@ -22,6 +22,31 @@ class TestTopoConstants(unittest.TestCase):
         self.assertEqual(topo.REFERENCE_PAIRS_SPINES, expected)
 
 
+class TestCurrentTopology(unittest.TestCase):
+    """Verifies the typed `Topology` accessor agrees with the legacy
+    module-level constants and is a stable singleton.
+
+    Refactor 1 Phase B is migrating call sites from the legacy
+    constants to the typed accessor; both must produce identical
+    dimensions for any topology the lab can deploy.
+    """
+
+    def test_dimensions_match_module_constants(self):
+        t = topo.current_topology()
+        self.assertEqual(t.planes, topo.NUM_PLANES)
+        self.assertEqual(t.spines_per_plane, topo.NUM_SPINES)
+        self.assertEqual(t.leaves_per_plane, topo.NUM_LEAVES)
+        self.assertEqual(t.tenants, topo.TENANTS)
+
+    def test_singleton_identity(self):
+        # Identity stability matters: any consumer that memoizes
+        # against `id(topology)` (planned in policy.py) should not
+        # see a different instance on subsequent calls.
+        a = topo.current_topology()
+        b = topo.current_topology()
+        self.assertIs(a, b)
+
+
 class TestTenantRegistry(unittest.TestCase):
     """The tenant -> u16 mapping used on the wire by MRC PROBE v2.
 

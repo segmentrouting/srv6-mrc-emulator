@@ -79,6 +79,41 @@ def _load_topo() -> dict:
 _TOPO = _load_topo()
 
 
+# --- typed Topology accessor -----------------------------------------------
+
+# Lazily-built singleton `Topology` instance for the active topology.
+# Refactor 1 Phase B is migrating call sites from the module-level
+# constants below (NUM_PLANES, NUM_SPINES, ...) to passing this
+# Topology object as an explicit parameter. During the migration both
+# paths remain available; once every call site takes a Topology, the
+# module-level constants and most of the helper functions in this file
+# become deprecated and can be removed in Phase C / Refactor 1.
+#
+# We hold a reference (not just a property on _TOPO) so identity-based
+# memoization in policy/topology consumers stays stable across calls.
+_CURRENT_TOPOLOGY: "Topology | None" = None
+
+
+def current_topology() -> "Topology":
+    """Return the `Topology` instance for the active topology.
+
+    Built once from the same `_TOPO` dict that drives the module-level
+    constants in this file, so `current_topology().planes == NUM_PLANES`
+    by construction. Cached on first call; subsequent calls return the
+    same instance (so `is` comparisons are valid).
+
+    Lazy import of `srv6_mrc.topology` keeps `srv6_mrc.topo` importable
+    in environments where the dataclass module isn't yet on path (and
+    sidesteps a potential cycle if `topology.py` ever needs to consult
+    `topo.py` at import time).
+    """
+    global _CURRENT_TOPOLOGY
+    if _CURRENT_TOPOLOGY is None:
+        from srv6_mrc.topology import Topology
+        _CURRENT_TOPOLOGY = Topology.from_dict(_TOPO)
+    return _CURRENT_TOPOLOGY
+
+
 # --- topology shape ---------------------------------------------------------
 
 NUM_PLANES: int = _TOPO["planes"]
