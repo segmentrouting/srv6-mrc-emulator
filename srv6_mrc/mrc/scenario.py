@@ -188,6 +188,49 @@ NAMED_PAIR_SETS: dict[str, list[FlowPair]] = {
 }
 
 
+# --- collective-communication pair sets -------------------------------------
+
+# Pair-set generators for emulating AI-collective traffic patterns. These
+# are computed once at import time from the topology's host count
+# (`NUM_LEAVES`), so they auto-size between 2p-4x8 (8 hosts) and 4p-8x16
+# (16 hosts) without needing a per-topology alias name.
+#
+# all-to-all: every host sends to every other host (N*(N-1) ordered pairs).
+#   Models the most fabric-stressful collective; every receiver sees N-1
+#   concurrent senders (incast at the destination leaf's downlink).
+#   16 hosts -> 240 flows; 8 hosts -> 56 flows.
+#
+# ring: each host i sends to host (i+1) mod N. Models one step of NCCL's
+#   ring all-reduce (the dominant pattern in AI training). All N hosts
+#   send simultaneously — this is the bandwidth-optimal collective
+#   pattern, not a serial chain. A real all-reduce is 2(N-1) such steps
+#   with the ring "rotated" so different chunks traverse different links;
+#   we model one step with sustained traffic, which captures the per-link
+#   load characteristic without the orchestration overhead.
+
+def _all_to_all_pairs(tenant: str) -> list[FlowPair]:
+    """Every ordered (src, dst) with src != dst, in (src, dst) order."""
+    n = NUM_LEAVES
+    return [
+        FlowPair(tenant, i, j)
+        for i in range(n)
+        for j in range(n)
+        if i != j
+    ]
+
+
+def _ring_pairs(tenant: str) -> list[FlowPair]:
+    """Each host i sends to host (i+1) mod N. NCCL-style unidirectional ring."""
+    n = NUM_LEAVES
+    return [FlowPair(tenant, i, (i + 1) % n) for i in range(n)]
+
+
+for _tenant in TENANTS:
+    NAMED_PAIR_SETS[f"{_tenant}-all-to-all"] = _all_to_all_pairs(_tenant)
+    NAMED_PAIR_SETS[f"{_tenant}-ring"] = _ring_pairs(_tenant)
+del _tenant
+
+
 # --- error type -------------------------------------------------------------
 
 class ScenarioError(ValueError):

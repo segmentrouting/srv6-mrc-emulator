@@ -1,0 +1,31 @@
+# green-allreduce-ring.yaml — NCCL-style ring all-reduce step (green).
+#
+# Green counterpart of yellow-allreduce-ring.yaml. Same 16-flow
+# unidirectional ring pattern on green's leaf-decap data path. See
+# yellow-allreduce-ring.yaml for the full description of the pattern
+# and what to look for.
+#
+# Run:
+#   make scenario SCEN=green-allreduce-ring
+
+name: green-allreduce-ring
+description: |
+  NCCL-style ring all-reduce (green tenant): 16 hosts, 16 concurrent
+  flows, each host sending to its right neighbor at 100 pps.
+  Companion to yellow-allreduce-ring on the simpler green leaf-decap
+  data path.
+
+paths_per_plane: 8
+
+flows:
+  - pairs: green-ring
+    policy: health_aware_mrc
+    rate: 100pps
+    duration: 60s
+
+faults: []
+
+mrc: {}
+
+report:
+  out: results/green-allreduce-ring.json
