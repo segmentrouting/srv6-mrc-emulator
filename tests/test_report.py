@@ -250,7 +250,7 @@ class TestEvColumnAscii(unittest.TestCase):
         )
         out = rep.render_ascii()
         self.assertIn("31/32", out)
-        self.assertIn("unused EVs: [(1, 6)]", out)
+        self.assertIn("unused EVs: ['p1-spine06']", out)
 
     def test_evs_column_dash_for_non_ev_policy(self):
         rep = ScenarioReport.from_records(
@@ -327,7 +327,7 @@ class TestEvColumnAscii(unittest.TestCase):
         )
         out = rep.render_ascii()
         self.assertIn("31/32", out)
-        self.assertIn("unused EVs: [(1, 0)]", out)
+        self.assertIn("unused EVs: ['p1-spine00']", out)
 
     def test_mrc_snapshot_overrides_per_ev_sent_for_active_count(self):
         # Even if `per_ev_sent` has all 32 keys with healthy counts,
@@ -354,7 +354,7 @@ class TestEvColumnAscii(unittest.TestCase):
         )
         out = rep.render_ascii()
         self.assertIn("31/32", out)
-        self.assertIn("unused EVs: [(2, 5)]", out)
+        self.assertIn("unused EVs: ['p2-spine05']", out)
 
     def test_malformed_mrc_snapshot_falls_back_to_counts(self):
         # If the mrc dict is missing or malformed, we must not crash and

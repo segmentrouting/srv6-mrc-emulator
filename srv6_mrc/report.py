@@ -410,7 +410,12 @@ class ScenarioReport:
                 assert self.topology_dims is not None
                 missing = _missing_evs(active, self.topology_dims)
                 if missing:
-                    lines.append(f"      ! unused EVs: {missing}")
+                    # Render each (plane, path) tuple as the matching
+                    # spine container name (p<P>-spine<SS>) so the user
+                    # can `docker exec` directly without re-deriving the
+                    # mapping. The numeric tuples are still in the JSON.
+                    pretty = [f"p{p}-spine{s:02d}" for (p, s) in missing]
+                    lines.append(f"      ! unused EVs: {pretty}")
             for note in f.notes:
                 lines.append(f"      ! {note}")
 

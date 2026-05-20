@@ -455,6 +455,18 @@ def run_scenario(scenario: Scenario, *,
 
     if verbose:
         print(f"scenario: {scenario.name}")
+        # Show the expected run wall-clock so users know whether to
+        # wait or whether to start poking at the lab in another shell.
+        # When flows have heterogeneous durations we report the max
+        # (the run blocks until the longest flow finishes).
+        if flows:
+            max_dur = max(f.duration_s for f in flows)
+            n_flows = len(flows)
+            if all(f.duration_s == max_dur for f in flows):
+                print(f"  duration: {max_dur:g}s ({n_flows} flow(s))")
+            else:
+                print(f"  duration: up to {max_dur:g}s "
+                      f"({n_flows} flow(s), mixed durations)")
         if scenario.mrc is not None:
             print(f"  mrc: enabled (env={scenario.mrc.to_env_json()})")
         _print_ev_preview(flows, scenario.paths_per_plane)
