@@ -1,0 +1,29 @@
+# full-mesh.yaml — every host talks to every other host of the same tenant.
+#
+# This expands to:
+#   16 hosts * 15 peers / 2  = 120 unique pairs per tenant
+#   120 pairs * 2 tenants    = 240 pairs total
+#   240 pairs * 8 routes/pair = 1920 routes
+#
+# Use this to stress-test the kernel route table, validate spray.py across
+# arbitrary host combinations, or just have everything reachable for ad-hoc
+# pings. Spine selection is auto: the 8 reference pairs match the original
+# PAIRS table for reproducibility, everything else falls through to a hash
+# (a * 16 + b) % 8.
+#
+# Apply with:
+#   ./routes.py apply -f routes/full-mesh.yaml
+apiVersion: srv6-lab/v1
+kind: RouteSet
+metadata:
+  name: full-mesh
+spec:
+  mesh:
+    - tenant: green
+      src: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+      dst: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+      # self-pairs (src == dst) are dropped automatically
+      # the reverse pair (15->0 vs 0->15) is canonicalized and deduped
+    - tenant: yellow
+      src: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+      dst: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]

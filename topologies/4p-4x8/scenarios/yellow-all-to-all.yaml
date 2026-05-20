@@ -1,0 +1,53 @@
+# yellow-all-to-all.yaml — yellow tenant all-to-all collective.
+#
+# Emulates an AI all-to-all collective communication pattern: every host
+# in the tenant sends a flow to every other host, all running
+# concurrently. With 16 hosts that's 16*15 = 240 unidirectional flows,
+# every host both sending 15 streams and receiving 15 streams.
+#
+# At 20 pps per flow the aggregate is 4.8 kpps across the fabric;
+# docker-sonic-vs handles this comfortably and the receivers don't get
+# CPU-bound. Bump to 50 pps / 12 kpps once you've confirmed the testbed
+# is happy.
+#
+# What to look for:
+#   - per_plane_sent: very balanced; the 32 EVs per pair * 240 pairs
+#     gives huge entropy across the fabric, so plane skew should be
+#     well under 1%.
+#   - per receiver: 15 concurrent senders converging on one leaf's
+#     downlink. This is the "incast" condition real all-to-all workloads
+#     hit; queue tension and small loss bursts are expected at higher
+#     rates.
+#   - With MRC enabled (health_aware_mrc): a single port shutdown
+#     anywhere should affect ~30 of the 240 flows (every flow that
+#     passes through that (plane, spine) cell). Each of those flows
+#     should independently converge on weight=0 for the broken EV.
+#
+# Failure injection (manual): same recipe as yellow-mrc-ev-spray —
+#   `docker exec p<P>-spine<S> config interface shutdown Ethernet<port>`
+# breaks EV (plane=P, path=S) for every flow that hashes through it.
+#
+# Run:
+#   make scenario SCEN=yellow-all-to-all
+
+name: yellow-all-to-all
+description: |
+  Yellow tenant all-to-all collective: 16 hosts, 240 ordered flows
+  running concurrently at 20 pps each. Emulates the most fabric-stressful
+  AI collective pattern; every host both sends 15 streams and receives
+  15 streams (incast at every leaf downlink).
+
+paths_per_plane: 8
+
+flows:
+  - pairs: yellow-all-to-all
+    policy: health_aware_mrc
+    rate: 20pps
+    duration: 60s
+
+faults: []
+
+mrc: {}
+
+report:
+  out: results/yellow-all-to-all.json

@@ -1,0 +1,38 @@
+# green-mrc-baseline.yaml — clean fabric, health_aware_mrc spray.
+#
+# Reference point for the MRC scenarios. All 4 planes are healthy, so
+# the EV state machine should hold every plane in UNKNOWN/GOOD and the
+# spray weights should converge on uniform — i.e. behave like
+# round_robin in expectation. The point of this scenario is to confirm
+# that turning MRC on (probes flying, loss windows rotating, reports
+# being sent and ignored) does not by itself perturb the wire.
+#
+# Compare against baseline.yaml: per-plane counts should be within a
+# few percent, loss should be ~0, reorder should match baseline.
+#
+# Run:
+#   python3 -m srv6_mrc.mrc.run \
+#       topologies/4p-8x16/scenarios/green-mrc-baseline.yaml --verbose
+
+name: green-mrc-baseline
+description: |
+  All 4 planes healthy, health_aware_mrc spray over 8 green leaf pairs.
+  Probes and loss reports are exchanged but should not influence the
+  weights — sanity check that enabling MRC is a no-op on a clean fabric.
+
+flows:
+  - pairs: green-pairs-8
+    policy: health_aware_mrc
+    rate: 500pps
+    duration: 5s
+
+faults: []
+
+# Enable MRC with defaults. The empty block is meaningful: its presence
+# is what flips the orchestrator to pass --mrc on the receivers and to
+# set SRV6_MRC_CONFIG_JSON on the senders. Override individual knobs
+# here if a scenario needs faster/slower probing.
+mrc: {}
+
+report:
+  out: results/green-mrc-baseline.json
