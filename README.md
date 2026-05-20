@@ -36,6 +36,10 @@ generator tool so additional topologies can be added under `topologies/<name>/`.
   via per-NIC `seg6local End.DT6 table 0` policies on the destination
   host. 
 
+## Quickstart
+
+[Quickstart](./docs/quickstart.md): Guide to install, deploy and configure a topology, and run MRC-SRv6 traffic simulations
+
 For more detail see design docs under [docs/](./docs/)
 
 ## Layout
@@ -97,10 +101,6 @@ results/               scenario JSON output (gitignored)
 - docker-sonic-vs: tested with Branch Master docker-sonic-vs.gz from [SONiC Dowloads](https://sonic.software/) site.
 - at least 16 vCPU and 32GB of memory (tested with 32 vCPU and 96GB memory)
 
-## Quickstart
-
-
-
 ## License
 
-Apache-2.0. See `LICENSE`.
+Apache-2.0. See [LICENSE](./LICENSE)
