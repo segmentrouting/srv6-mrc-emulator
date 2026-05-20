@@ -24,10 +24,25 @@ expected one-way delay (which we approximate at 0 — it's always small
 relative to a 100ms window for our lab fabric).
 
 If we can't find a snapshot within `max_window_skew_ns` of the report's
-implied window, we fall back to using the receiver's `expected_local`
-and emit a warning counter. That keeps the system functional during
-startup or after a long quiet period when the sender ring has nothing
-to pair against.
+implied window, we SKIP the plane entirely and increment a warning
+counter. We do NOT fall back to the receiver's `expected_local`: with
+packet-level EV spray, that field is `max_seq - min_seq + 1` over a
+flow-global seq stream sprayed across many EVs, which is a strict and
+typically wildly inflated upper bound (e.g. seen=10 on seqs spanning
+0..400 yields a 97% phantom loss ratio on a healthy fabric). Two such
+windows in a row would cross `loss_demote_consecutive` and demote a
+healthy EV. The startup / skew-burst windows where pairing fails just
+have no loss signal — probes still detect EV failures, and as soon as
+pairing succeeds again we resume normal demotion behaviour.
+
+Historical note: an earlier version of this module DID fall back to
+`rec.expected` here. It produced phantom EV demotions on the 4p-4x8
+baselines (multiple flows showed 5+/16 EVs demoted with `loss: 0` and
+`consecutive_probe_timeouts: 0`). The fallback was removed; the
+`fell_back_to_receiver_expected` counter is kept for diagnostics so
+existing dashboards / log scrapers don't break, but it now means
+"plane was skipped because we couldn't pair" rather than "plane was
+attributed using receiver's seq-span estimate".
 
 Invariants
 ----------
@@ -152,7 +167,25 @@ def compute_loss_ratio(seen: int, sent_or_expected: int) -> float:
 @dataclass
 class LossFusionStats:
     """Diagnostic counters for the fusion logic. Tests assert against
-    these to confirm the right code path was taken."""
+    these to confirm the right code path was taken.
+
+    Counter semantics:
+      - reports_processed: LossReports with at least one plane record.
+      - planes_updated: EV state machine was fed a (seen, expected).
+      - planes_skipped_no_data: report record had seen==0 AND expected==0.
+      - paired_with_sent_window: an EV was attributed using the sender's
+        own sent[plane][path] counter. Always equals planes_updated
+        in the current implementation; kept distinct for forward-compat
+        if we ever re-introduce alternate denominators.
+      - fell_back_to_receiver_expected: an EV was SKIPPED because we
+        had no usable sender-side denominator (no paired SentWindow,
+        or paired but sent[plane][path]==0). Despite the historical
+        name, this counter no longer means "we used rec.expected" —
+        see module docstring for the rationale.
+      - no_pairing_window_in_ring: per-report counter (not per-plane);
+        increments once per LossReport that couldn't pair against any
+        SentWindow within max_window_skew_ns.
+    """
     reports_processed: int = 0
     planes_updated: int = 0
     planes_skipped_no_data: int = 0
@@ -181,10 +214,11 @@ def apply_loss_report(
     No-op if the report has zero plane records (receiver saw nothing).
 
     For each plane in the report:
-      - If we have a paired SentWindow with sent[plane] > 0, use that
-        as the denominator (sender-driven attribution).
-      - Else fall back to the receiver's expected_local field. If that
-        is also zero, skip the plane (no signal either way).
+      - If we have a paired SentWindow with sent[plane][path] > 0, use
+        that as the denominator (sender-driven attribution).
+      - Else skip the plane: leave the EV's bad-window counter where
+        it is. We deliberately do NOT use `rec.expected` as a fallback
+        denominator — see module docstring for why.
     """
     if stats is None:
         stats = LossFusionStats()  # local-only, discarded
@@ -206,7 +240,6 @@ def apply_loss_report(
             continue
 
         denominator = 0
-        used_sender_counter = False
         if paired is not None:
             # Per-EV sender count: rows are planes, columns are paths.
             # Defensive bounds-check in case a malformed/forward-compat
@@ -217,31 +250,31 @@ def apply_loss_report(
                     sender_sent = row[rec.path_id]
                     if sender_sent > 0:
                         denominator = sender_sent
-                        used_sender_counter = True
 
         if denominator == 0:
-            denominator = rec.expected
-            if denominator == 0:
-                # No signal from either side. Don't push noise into
-                # the EV table — leave the consecutive-bad-window
-                # counter where it is.
-                stats.planes_skipped_no_data += 1
-                continue
+            # No sender-side counter for this EV. Either:
+            #   (a) we couldn't pair against any SentWindow (paired is
+            #       None), or
+            #   (b) we paired but the snapshot's sent[plane][path] was
+            #       0 (sender didn't emit on this EV in the matched
+            #       window — receiver's record is from straggler /
+            #       skew packets that landed in this window).
+            # In both cases we have no trustworthy denominator. The
+            # receiver's `rec.expected` is `max_seq - min_seq + 1`
+            # computed over the flow-global seq stream sprayed across
+            # all EVs, which is a wildly inflated upper bound and
+            # produces phantom loss demotions on healthy EVs. Skip
+            # the plane; leave the bad-window counter where it is.
+            stats.fell_back_to_receiver_expected += 1
+            continue
 
         # NB: once a plane is demoted to weight=0, the sender stops
         # spraying it, so subsequent SentWindows have sent[plane]=0
-        # and pairing falls through to rec.expected. The receiver's
-        # `expected_local = max_seq - min_seq + 1` is computed from
-        # the global seq stream, so a trickle of stragglers on a
-        # demoted plane (seq=7, 91, 4023, ...) yields a wildly
-        # inflated denominator and a bogus-looking 0.8+ loss ratio
-        # in the EV-state snapshot. That's cosmetic, not behavioral:
-        # the plane is already ASSUMED_BAD, the inflated ratio just
-        # keeps the consecutive_loss_demote_windows counter high so
-        # the plane stays demoted, which is the desired behavior.
-        # A real recovery still happens via the probe path
-        # (consecutive_probe_successes >= probe_recover_threshold AND
-        # loss-window counter quiet), not via this loss-window path.
+        # and we hit the `denominator == 0` skip above. The plane
+        # stays demoted via the consecutive-counter ratchet from when
+        # it was first demoted; recovery happens via the probe path
+        # (consecutive_probe_successes >= probe_recover_threshold),
+        # not via this loss-window path.
 
         # EVStateTable.record_loss_window takes (seen, expected) and
         # does the ratio internally; we keep compute_loss_ratio public
@@ -253,10 +286,7 @@ def apply_loss_report(
             tenant, rec.plane_id, rec.path_id, rec.seen, denominator,
         )
         stats.planes_updated += 1
-        if used_sender_counter:
-            stats.paired_with_sent_window += 1
-        else:
-            stats.fell_back_to_receiver_expected += 1
+        stats.paired_with_sent_window += 1
 
 
 __all__ = [

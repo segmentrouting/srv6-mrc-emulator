@@ -529,7 +529,11 @@ class TestApplyLossReport(unittest.TestCase):
         self.assertEqual(t.state("green", 0, 0), EVState.ASSUMED_BAD)
 
     def test_falls_back_to_receiver_expected(self):
-        # No SentWindow in ring. Use receiver's expected_local field.
+        # No SentWindow in ring -> we must NOT use receiver's
+        # expected_local (it's a strict and typically wildly inflated
+        # upper bound under packet-level EV spray; using it produces
+        # phantom EV demotions on healthy fabrics). Plane is skipped;
+        # state machine is not touched.
         t = self._table(loss_threshold=0.05, loss_demote_consecutive=2)
         ring = self._ring()
         report = LossReport(window_id=0, planes=(
@@ -542,9 +546,70 @@ class TestApplyLossReport(unittest.TestCase):
             max_window_skew_ns=10**9,
             stats=stats,
         )
-        self.assertEqual(stats.planes_updated, 1)
+        # Plane was skipped; no state-machine update.
+        self.assertEqual(stats.planes_updated, 0)
+        self.assertEqual(stats.paired_with_sent_window, 0)
+        # Counter name is historical; now means "skipped because no
+        # sender-side denominator was available".
         self.assertEqual(stats.fell_back_to_receiver_expected, 1)
         self.assertEqual(stats.no_pairing_window_in_ring, 1)
+        # State machine MUST stay at UNKNOWN (not demoted) despite the
+        # report carrying a 50/80 = 37.5% phantom loss ratio.
+        self.assertEqual(t.state("green", 1, 0), EVState.UNKNOWN)
+
+    def test_phantom_loss_fallback_does_not_demote(self):
+        # Regression for the 4p-4x8 baseline phantom-demotion bug:
+        # under packet-level EV spray a healthy EV that received e.g.
+        # 10 packets sees seqs spanning 0..400 (because the other 15
+        # EVs are taking the rest), so rec.expected = 401 and the naive
+        # fallback ratio is 1 - 10/401 = 97.5% loss. Two consecutive
+        # such reports (>= loss_demote_consecutive) used to demote the
+        # EV. The skip-on-no-pairing fix means the EV stays UNKNOWN
+        # no matter how many unpairable reports arrive.
+        t = self._table(loss_threshold=0.05, loss_demote_consecutive=2,
+                        min_active_evs=1)
+        ring = self._ring()  # empty ring, all reports unpairable
+        phantom_report = LossReport(window_id=0, planes=(
+            PlaneLossRecord(plane_id=0, path_id=0, seen=10, expected=401,
+                            max_gap=80),
+        ))
+        for _ in range(5):
+            apply_loss_report(
+                table=t, tenant="green", report=phantom_report,
+                sent_ring=ring, received_at_ns=0,
+                max_window_skew_ns=10**9,
+            )
+        self.assertEqual(t.state("green", 0, 0), EVState.UNKNOWN)
+
+    def test_paired_but_sent_zero_skips_plane(self):
+        # If the receiver claims to have seen packets on an EV but the
+        # sender's matched window has sent[plane][path]==0, we don't
+        # know the right denominator (the receiver's view is from
+        # straggler/skew packets sent in a neighbouring window). Skip.
+        t = self._table(loss_threshold=0.05, loss_demote_consecutive=2)
+        ring = self._ring()
+        ring.push(SentWindow(
+            start_ns=0, end_ns=100_000_000,
+            # Plane 0 path 0 has 0 sent in this window.
+            sent=self._per_ev_sent((0, 100, 100, 100), self.NUM_PLANES),
+        ))
+        report = LossReport(window_id=0, planes=(
+            PlaneLossRecord(plane_id=0, path_id=0, seen=5, expected=200,
+                            max_gap=40),
+        ))
+        stats = LossFusionStats()
+        apply_loss_report(
+            table=t, tenant="green", report=report,
+            sent_ring=ring, received_at_ns=50_000_000,
+            max_window_skew_ns=10**9,
+            stats=stats,
+        )
+        self.assertEqual(stats.planes_updated, 0)
+        self.assertEqual(stats.fell_back_to_receiver_expected, 1)
+        # Pairing succeeded (no_pairing_window_in_ring stays 0); the
+        # skip is per-plane, not per-report.
+        self.assertEqual(stats.no_pairing_window_in_ring, 0)
+        self.assertEqual(t.state("green", 0, 0), EVState.UNKNOWN)
 
     def test_skips_plane_with_no_signal(self):
         # seen=0 AND expected=0 -> no info.
