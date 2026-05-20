@@ -89,15 +89,22 @@ def _infer_srv6_topo_from_argv() -> None:
         return
 
     # Multiple topologies have this scenario name. Use docker ps to
-    # find the deployed one. Best-effort: any failure leaves SRV6_TOPO
-    # unset (preserves the previous behaviour for users without docker).
+    # find the deployed one. Containerlab in this repo uses prefix:""
+    # so container names are short-form (e.g. "yellow-host00") with no
+    # topology-name prefix to grep for. Discriminate by host count
+    # instead: read each candidate topo.yaml's leaves_per_plane and
+    # check whether the highest-numbered expected host container
+    # (yellow-host<N-1>) actually exists. The unique topology that
+    # matches "exists at N-1 AND does NOT exist at N" wins. Best-effort:
+    # any failure leaves SRV6_TOPO unset (preserves prior behaviour for
+    # users without docker).
     try:
         import subprocess
         out = subprocess.run(
             ["docker", "ps", "--format", "{{.Names}}"],
             capture_output=True, text=True, timeout=2, check=False,
         )
-        running = out.stdout.split()
+        running = set(out.stdout.split())
     except Exception:
         return
     if not running:
@@ -112,11 +119,13 @@ def _infer_srv6_topo_from_argv() -> None:
         try:
             with open(topo_yaml) as f:
                 t = yaml.safe_load(f)
-            clab_name = t.get("clab", {}).get("topology_name")
-            if not clab_name:
-                continue
-            prefix = f"clab-{clab_name}-"
-            if any(n.startswith(prefix) for n in running):
+            n = int(t["leaves_per_plane"])
+            # Sentinel: highest-numbered yellow host of this topology
+            # exists, AND the next one above it does NOT (i.e. this is
+            # the topology with exactly N hosts, not the smaller one).
+            sentinel_in = f"yellow-host{n - 1:02d}"
+            sentinel_out = f"yellow-host{n:02d}"
+            if sentinel_in in running and sentinel_out not in running:
                 live_hits.append(topo_yaml)
         except Exception:
             continue
