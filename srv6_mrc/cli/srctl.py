@@ -34,70 +34,74 @@ from typing import Any, Iterable
 
 
 def _infer_srv6_topo_from_argv() -> None:
-    """Set SRV6_TOPO from a scenario reference on argv, before importing
-    srv6_mrc.topo. Idempotent: does nothing if SRV6_TOPO is already set.
+    """Set SRV6_TOPO before importing srv6_mrc.topo. Idempotent: does
+    nothing if SRV6_TOPO is already set.
 
-    Recognized argv shapes for `srctl run`:
-      - bare scenario name: `srctl run <name>` — search topologies/*/scenarios/<name>.yaml
-      - explicit path:      `srctl run path/to/foo.yaml`
-    For both forms, once a unique topology is identified, SRV6_TOPO is
-    set to that topology's topo.yaml so module-level constants in
-    srv6_mrc.topo bind to the right NUM_LEAVES/NUM_PLANES at import.
+    Strategy depends on the subcommand:
+      - `srctl run <scenario>`: derive topology from the scenario path
+        or name (see implementation below).
+      - everything else (`srctl get ...`): fall back to host-count
+        sentinel detection only — pick the unique deployed topology
+        whose `leaves_per_plane` matches the running container set.
+
+    The fallback ensures `srctl get evs <a> <b>` shows the correct
+    NUM_SPINES / NUM_PLANES for the deployed topology, not the
+    hardcoded dev default.
     """
     if os.environ.get("SRV6_TOPO"):
         return
     argv = sys.argv[1:]
-    if not argv or argv[0] != "run":
-        return
-    # Find the first non-flag positional after "run".
-    scen_arg: str | None = None
-    for a in argv[1:]:
-        if a.startswith("-"):
-            continue
-        scen_arg = a
-        break
-    if not scen_arg:
-        return
 
     here = Path(__file__).resolve()
     repo_root = here.parent.parent.parent
     topos_dir = repo_root / "topologies"
 
-    # Explicit path: derive topo from <topo>/scenarios/<scen>.yaml.
-    p = Path(scen_arg)
-    if p.is_file():
-        try:
-            topo_yaml = p.resolve().parents[1] / "topo.yaml"
-            if topo_yaml.is_file():
-                os.environ["SRV6_TOPO"] = str(topo_yaml)
-                return
-        except IndexError:
-            pass
+    # `srctl run`: try scenario-path / scenario-name disambiguation first.
+    if argv and argv[0] == "run":
+        scen_arg: str | None = None
+        for a in argv[1:]:
+            if a.startswith("-"):
+                continue
+            scen_arg = a
+            break
+        if scen_arg:
+            # Explicit path: derive topo from <topo>/scenarios/<scen>.yaml.
+            p = Path(scen_arg)
+            if p.is_file():
+                try:
+                    topo_yaml = p.resolve().parents[1] / "topo.yaml"
+                    if topo_yaml.is_file():
+                        os.environ["SRV6_TOPO"] = str(topo_yaml)
+                        return
+                except IndexError:
+                    pass
+            # Bare name: scan topologies/*/scenarios/<scen>.yaml.
+            if topos_dir.is_dir():
+                hits = list(topos_dir.glob(f"*/scenarios/{scen_arg}.yaml"))
+                if len(hits) == 1:
+                    os.environ["SRV6_TOPO"] = str(
+                        hits[0].resolve().parents[1] / "topo.yaml"
+                    )
+                    return
+                # If multiple match, fall through to host-count sentinel.
 
-    # Bare name: scan topologies/*/scenarios/<scen>.yaml. If exactly
-    # one topology has it, use that. If multiple do, narrow down by
-    # checking which topology is currently deployed (clab topology_name
-    # appears in `docker ps`). Last resort: leave SRV6_TOPO unset and
-    # let the user disambiguate.
+    # Fall through (any subcommand including `get`): identify the
+    # deployed topology by host-count sentinel. This makes `srctl get
+    # ...` reflect the live topology size automatically.
+    _select_topo_by_host_sentinel(topos_dir)
+
+
+def _select_topo_by_host_sentinel(topos_dir: Path) -> None:
+    """Pick the unique deployed topology among all topologies/*/topo.yaml
+    by checking which one's expected highest-numbered host container
+    exists (and the next one above does not).
+
+    Containerlab in this repo is configured with prefix:"" so container
+    names are short-form (yellow-host00, not clab-<topo>-yellow-host00).
+    The host-count sentinel is the cheapest way to discriminate.
+    """
     if not topos_dir.is_dir():
         return
-    hits = list(topos_dir.glob(f"*/scenarios/{scen_arg}.yaml"))
-    if not hits:
-        return
-    if len(hits) == 1:
-        os.environ["SRV6_TOPO"] = str(hits[0].resolve().parents[1] / "topo.yaml")
-        return
-
-    # Multiple topologies have this scenario name. Use docker ps to
-    # find the deployed one. Containerlab in this repo uses prefix:""
-    # so container names are short-form (e.g. "yellow-host00") with no
-    # topology-name prefix to grep for. Discriminate by host count
-    # instead: read each candidate topo.yaml's leaves_per_plane and
-    # check whether the highest-numbered expected host container
-    # (yellow-host<N-1>) actually exists. The unique topology that
-    # matches "exists at N-1 AND does NOT exist at N" wins. Best-effort:
-    # any failure leaves SRV6_TOPO unset (preserves prior behaviour for
-    # users without docker).
     try:
         import subprocess
         out = subprocess.run(
@@ -113,24 +117,20 @@ def _infer_srv6_topo_from_argv() -> None:
         import yaml  # type: ignore[import-not-found]
     except ImportError:
         return
-    live_hits: list[Path] = []
-    for h in hits:
-        topo_yaml = h.resolve().parents[1] / "topo.yaml"
+    live: list[Path] = []
+    for cand in topos_dir.glob("*/topo.yaml"):
         try:
-            with open(topo_yaml) as f:
+            with open(cand) as f:
                 t = yaml.safe_load(f)
             n = int(t["leaves_per_plane"])
-            # Sentinel: highest-numbered yellow host of this topology
-            # exists, AND the next one above it does NOT (i.e. this is
-            # the topology with exactly N hosts, not the smaller one).
             sentinel_in = f"yellow-host{n - 1:02d}"
             sentinel_out = f"yellow-host{n:02d}"
             if sentinel_in in running and sentinel_out not in running:
-                live_hits.append(topo_yaml)
+                live.append(cand)
         except Exception:
             continue
-    if len(live_hits) == 1:
-        os.environ["SRV6_TOPO"] = str(live_hits[0])
+    if len(live) == 1:
+        os.environ["SRV6_TOPO"] = str(live[0])
 
 
 _infer_srv6_topo_from_argv()
