@@ -186,6 +186,28 @@ the `srv6_mrc.topo` ↔ `spray` reference-pairs map in sync.
   Ship both `green-mrc-ev-spray-*` and `yellow-mrc-ev-spray-*`
   scenario sets together — yellow parity is now the steady-state
   expectation, not a follow-up.
+- **Collective-communication scenarios (in progress):** scaffolding
+  shipped for AI-style traffic patterns on top of the existing
+  `health_aware_mrc` data path.
+  - Pair-set aliases in `srv6_mrc/mrc/scenario.py`:
+    `{green,yellow}-all-to-all` (N*(N-1) ordered pairs) and
+    `{green,yellow}-ring` (N pairs forming `i -> (i+1) mod N`,
+    NCCL-style unidirectional ring). Both auto-size from
+    `NUM_LEAVES`: 240 / 16 on 4p-8x16, 56 / 8 on 2p-4x8.
+  - 4p-8x16 scenarios shipped:
+    `green-all-to-all.yaml`, `yellow-all-to-all.yaml`
+    (240 flows @ 20pps, `paths_per_plane: 8`),
+    `green-allreduce-ring.yaml`, `yellow-allreduce-ring.yaml`
+    (16 flows @ 100pps, `paths_per_plane: 8`), plus the diagnostic
+    `yellow-allreduce-ring-half.yaml` (paths_per_plane: 4).
+  - **Known-broken**: every `health_aware_mrc` scenario where every
+    host runs *both* a sender process AND a receiver process (i.e.
+    the ring and all-to-all patterns) fails to keep EVs healthy.
+    At paths_per_plane=8 every flow ends with ~16/32 EVs demoted to
+    `assumed_bad` despite 0% data-plane loss; per-plane traffic
+    spreads ~5-7x. `yellow-mrc-ev-spray` (8 senders, 8 *different*
+    receivers, same paths_per_plane=8) is unaffected. See "Things
+    learned" below for the current diagnostic state.
 
 ## Yellow parity — do not forget
 
@@ -466,8 +488,100 @@ make test
   that compares IPv6 addresses-as-strings, route them through
   `ipaddress.IPv6Address` first. See `_canon_addr()` in
   `srv6_mrc/report.py`.
+- **`yellow-mrc-ev-spray` is NOT a general MRC smoke test**: it works
+  because hosts 0-7 are senders-only and hosts 8-15 are receivers-only
+  — a host runs `SenderMrcAgent` XOR `ReceiverMrcAgent`, never both.
+  Any scenario where the same host appears as both source AND
+  destination across the flow set (ring, all-to-all, any future
+  collective) puts both agents in the same network namespace and
+  exposes a class of bugs that the sender-only/receiver-only scenarios
+  never hit. Treat collective-comm scenarios as a distinct regression
+  surface from the existing MRC scenarios.
+- **`select_spines_for_addrs` doesn't balance at small N**: with N=16
+  ring pairs and paths_per_plane=4 (= 16 EVs per pair from a 32-EV
+  grid), the union of selected (plane, spine) cells across all 16
+  pairs is non-uniform. Per-plane traffic can still skew 3-4x even
+  when all MRC weights are equal. all-to-all (N=240) gets way more
+  entropy and is expected to self-balance. Not a bug per se — just
+  a property to be aware of when reading ring-scenario reports.
 
-## Things to avoid
+## Open investigations (not yet root-caused)
+
+These are bugs surfaced by the collective-comm scenarios; carry
+forward across sessions until resolved. Adding new diagnostic data?
+Update this section, don't start a fresh "what we know" thread.
+
+### Universal probe failure in "every host is both sender AND receiver" scenarios
+
+**Symptom**: Run `yellow-allreduce-ring` (16 flows, 16 hosts each
+acting as both source and destination in the ring). Data plane is
+perfect (0% loss, 5800 packets per flow, balanced delivery). But
+the MRC snapshot shows **every EV has 294-296 consecutive probe
+timeouts and 0 successes**. Half end up `assumed_bad` (weight 0),
+half stay `unknown` only because the per-tenant "demotes suppressed
+by floor" guard fires. Per-plane traffic spreads 5-7x because the
+remaining live EVs cluster on a couple of planes by chance.
+
+**Falsified hypotheses**:
+1. *MRC config inconsistency between flows* — no, the policy is
+   round-robin/weighted-CDF per packet over the per-flow EV grid;
+   16/32 active is a real demotion not a structural cap.
+2. *Probe-emit thundering herd* (16 senders firing 32-probe bursts
+   in lockstep every 200ms saturates spine TX queues) — pacing
+   `_emit_loop` to one probe per `interval/num_evs` slot plus
+   per-instance startup jitter (committed; see
+   `tests/test_mrc_agent_io.py::ProbePacingTests`) did not fix it.
+   The lab repro after pacing is essentially identical to before.
+
+**Still open**:
+3. *Probe egress NIC contention*: every host in the ring has TWO
+   `Srv6RawTransport` instances open simultaneously — one in the
+   sender process (4 raw sockets bound to PLANE_NICS), one in the
+   receiver process (4 more raw sockets bound to the SAME
+   PLANE_NICS). SO_BINDTODEVICE is per-socket but the kernel TX
+   queue is shared. Maybe contention, maybe a routing oddity when
+   two processes both have raw sends out the same NIC.
+4. *Probe ingress demux*: receiver listens on `::, SPRAY_PROBE_PORT`
+   with SO_REUSEPORT; sender listens on `::, SPRAY_REPORT_PORT` also
+   with SO_REUSEPORT. Different ports so they shouldn't fight, but
+   SO_REUSEPORT load-balancing kernels-side could be a factor at
+   higher scales than the existing tests exercise.
+5. *Receiver probe-RX thread starvation*: each receiver runs ONE
+   probe-RX thread that decodes the probe and synchronously builds
+   + sends a reply via scapy outer construction. With 32 probes
+   landing per round per receiver, the per-probe budget is
+   ~6ms — scapy build for a 32-byte SRv6 outer typically takes
+   1-3ms on alpine-on-docker-sonic-vs, so we may be at the edge.
+
+**Next diagnostic step (tomorrow)**: tcpdump on a single spine's
+ingress interface during a 60s `yellow-allreduce-ring` run. Filter
+on PROBE magic byte `0xA5`. Three buckets to count:
+- probes that arrived at the spine but never came out (spine-side
+  drop — points to fabric/routing bug)
+- probes that crossed the spine but no reply came back from the
+  receiver (host-side bug, hypothesis 3 or 5)
+- probes + replies both flow normally but the sender's RX thread
+  never matches them (hypothesis 4 or a deeper agent bug)
+
+### Spurious "orphan flow" report warnings on collective scenarios
+
+Every host in the ring scenario gets an "orphan flow" warning where
+the source/dest inner addresses match the host's own send pair. The
+data is delivered correctly to the real destination too; this is a
+report-side false positive. Receiver process appears to count its
+own outbound packets as inbound, then `report.py` doesn't find a
+matching scenario flow keyed to that direction. Lower priority than
+the probe-failure bug. Anycast routing was ruled out — every host
+has distinct inner addresses (`cccc::2`, `cccc:1::2`, etc).
+
+### Per-plane traffic skew on small-N scenarios
+
+`select_spines_for_addrs` doesn't balance well across small flow
+counts (e.g. 16 ring pairs). See "Things learned" above. Expected
+to self-balance at all-to-all scale (240 flows); benchmark and
+confirm once the probe-failure bug is fixed.
+
+
 
 - Renaming subcommands or files without sweeping `README.md`, `AGENTS.md`,
   and the relevant `docs/*.md`.
