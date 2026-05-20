@@ -50,6 +50,8 @@ threads.
 
 from __future__ import annotations
 
+import logging
+import os
 import socket
 from abc import ABC, abstractmethod
 from typing import Dict, Optional, Tuple
@@ -66,8 +68,26 @@ from ..topo import (
 )
 
 
+log = logging.getLogger(__name__)
+
+
 DEFAULT_RECV_BUFSIZE = 4096
 DEFAULT_SOCKET_TIMEOUT_S = 0.25
+
+# UDP listener socket buffer for the probe / probe-reply / loss-report
+# RX path. The Linux default rmem_default is ~208 KB which is far too
+# small for all-to-all MRC at 56-sender scale where a single listener
+# socket fans in probes/replies from every peer. Empirically the
+# default causes silent UDP drops -> probe timeouts -> false EV
+# demotes (the "all transitions are unknown->assumed_bad with
+# probe_timeouts=3, loss_windows=0" cascade fingerprint).
+#
+# Override with SRV6_MRC_RCVBUF_BYTES; the kernel will silently cap to
+# net.core.rmem_max so the lab also needs `sysctl -w
+# net.core.rmem_max=33554432` (or higher) for the bump to take full
+# effect. We log the granted size after setsockopt + getsockopt so the
+# JSON report makes the kernel cap visible.
+DEFAULT_RCVBUF_BYTES = 16 * 1024 * 1024
 
 
 # --- public interface ------------------------------------------------------
@@ -350,6 +370,11 @@ def _open_udp_listener(*, bind_addr: str, bind_port: int) -> socket.socket:
     happy (e.g. when several spray.py --role recv binaries share a
     host in CI). Timeout matches the rest of the agent so RX loops
     can poll `_stop` at a fixed cadence.
+
+    SO_RCVBUF is bumped to DEFAULT_RCVBUF_BYTES (override via
+    SRV6_MRC_RCVBUF_BYTES). The kernel doubles the requested size and
+    silently caps it to net.core.rmem_max; we read back the granted
+    size with getsockopt and log it so lab runs surface kernel caps.
     """
     s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, 0)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -358,9 +383,54 @@ def _open_udp_listener(*, bind_addr: str, bind_port: int) -> socket.socket:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except OSError:
             pass
+
+    requested = _rcvbuf_bytes_from_env()
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, requested)
+    except OSError as exc:  # pragma: no cover - kernel always accepts
+        log.warning("mrc.transport: SO_RCVBUF=%d failed: %s", requested, exc)
+    granted = s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+    if granted < 2 * requested:
+        # Kernel doubles internally, so granted >= 2*requested means we
+        # got what we asked for. Anything less means rmem_max capped us
+        # and the lab needs to raise net.core.rmem_max.
+        log.warning(
+            "mrc.transport: SO_RCVBUF requested=%d granted=%d "
+            "(kernel rmem_max likely caps; consider "
+            "`sysctl -w net.core.rmem_max=%d`)",
+            requested, granted, requested * 2,
+        )
+    else:
+        log.info(
+            "mrc.transport: SO_RCVBUF requested=%d granted=%d on %s:%d",
+            requested, granted, bind_addr, bind_port,
+        )
+
     s.bind((bind_addr, bind_port))
     s.settimeout(DEFAULT_SOCKET_TIMEOUT_S)
     return s
+
+
+def _rcvbuf_bytes_from_env() -> int:
+    """Read SRV6_MRC_RCVBUF_BYTES override; fall back to default."""
+    raw = os.environ.get("SRV6_MRC_RCVBUF_BYTES")
+    if not raw:
+        return DEFAULT_RCVBUF_BYTES
+    try:
+        n = int(raw)
+    except ValueError:
+        log.warning(
+            "mrc.transport: SRV6_MRC_RCVBUF_BYTES=%r is not an int; "
+            "using default %d", raw, DEFAULT_RCVBUF_BYTES,
+        )
+        return DEFAULT_RCVBUF_BYTES
+    if n <= 0:
+        log.warning(
+            "mrc.transport: SRV6_MRC_RCVBUF_BYTES=%d non-positive; "
+            "using default %d", n, DEFAULT_RCVBUF_BYTES,
+        )
+        return DEFAULT_RCVBUF_BYTES
+    return n
 
 
 __all__ = [
@@ -369,4 +439,5 @@ __all__ = [
     "LoopbackUdpTransport",
     "DEFAULT_RECV_BUFSIZE",
     "DEFAULT_SOCKET_TIMEOUT_S",
+    "DEFAULT_RCVBUF_BYTES",
 ]
