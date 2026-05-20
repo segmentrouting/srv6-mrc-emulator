@@ -265,12 +265,18 @@ def _validate_spine(v, ctx: str) -> int | str:
 
 
 def _as_id_list(v, ctx: str) -> list[int]:
-    """Accept a single int or a list of ints; return list of ints."""
+    """Accept a single int, a list of ints, or the string "all" (= every
+    host id 0..NUM_LEAVES-1); return list of ints. The "all" form makes
+    `mesh:` blocks topology-agnostic — the same YAML works on any
+    topology size without hardcoding host IDs.
+    """
+    if v == "all":
+        return list(range(NUM_LEAVES))
     if isinstance(v, int):
         return [_validate_host_id(v, ctx)]
     if isinstance(v, list):
         return [_validate_host_id(x, f"{ctx}[{i}]") for i, x in enumerate(v)]
-    raise ValueError(f"{ctx}: expected int or list of ints, got {v!r}")
+    raise ValueError(f"{ctx}: expected int, list of ints, or \"all\", got {v!r}")
 
 
 def expand_spec(spec_doc: dict) -> list[Pair]:

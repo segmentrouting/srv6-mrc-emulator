@@ -20,10 +20,10 @@ metadata:
 spec:
   mesh:
     - tenant: green
-      src: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-      dst: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+      src: all
+      dst: all
       # self-pairs (src == dst) are dropped automatically
-      # the reverse pair (15->0 vs 0->15) is canonicalized and deduped
+      # the reverse pair (a->b vs b->a) is canonicalized and deduped
     - tenant: yellow
-      src: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-      dst: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+      src: all
+      dst: all

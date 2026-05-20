@@ -16,8 +16,8 @@ metadata:
 spec:
   mesh:
     - tenant: green
-      src: [0, 1, 2, 3, 4, 5, 6, 7]
-      dst: [0, 1, 2, 3, 4, 5, 6, 7]
+      src: all
+      dst: all
     - tenant: yellow
-      src: [0, 1, 2, 3, 4, 5, 6, 7]
-      dst: [0, 1, 2, 3, 4, 5, 6, 7]
+      src: all
+      dst: all
