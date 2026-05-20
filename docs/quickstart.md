@@ -41,6 +41,11 @@ docker build -f host-image/Dockerfile \
 make deploy
 # equivalent to:
 sudo clab deploy -t topologies/4p-8x16/topology.clab.yaml
+
+# other topologies
+make TOPO=2p-4x8 deploy
+
+make TOPO=4p-4x8 deploy
 ```
 
 3. Run `make config` to apply sonic *`config_db.json`* and *`frr.conf`* configs to each device (under `topologies/4p-8x16/config/`)
@@ -48,6 +53,11 @@ sudo clab deploy -t topologies/4p-8x16/topology.clab.yaml
 make config
 # equivalent to:
 scripts/config.sh all
+
+# other topologies
+make TOPO=2p-4x8 config
+
+make TOPO=4p-4x8 config
 ```
 
 It will take a couple minutes for the script to run through all 96 routers.
@@ -72,6 +82,11 @@ Deploy complete!
 make host-routes
 # equivalent to:
 routes apply -f topologies/4p-8x16/routes/full-mesh.yaml
+
+# other topologies
+make TOPO=2p-4x8 host-routes
+
+make TOPO=4p-4x8 host-routes
 ```
 
 ### Quick test - Tenant Green - Host SRv6 Encap, Egress Leaf SRv6 uDT
@@ -171,6 +186,34 @@ PLANE  PATH  EV     SID
 0      1     P0:S1  fc00:0000:f001:e007:d000::
 0      2     P0:S2  fc00:0000:f002:e007:d000::
 <snip>
+```
+
+### srctl run - running MRC traffic scenarios:
+
+# List available scenarios for the active topology:
+```bash
+srctl run --list
+```
+
+# Run one (just the scenario stem name, no .yaml):
+```bash
+srctl run yellow-mrc-baseline
+```
+
+# Or with options:
+```bash
+srctl run yellow-allreduce-ring --verbose
+```
+```bash
+srctl run green-mrc-baseline --dry-run
+```
+It auto-discovers scenarios under topologies/<active>/scenarios/ (where "active" is determined by _active_topo_dir() — likely the most-recently-deployed clab topology, or SRV6_TOPO env). If you have multiple topologies and want to be explicit, set TOPO=4p-4x8 srctl run … if it honors that, or check srctl get topology to see which one srctl thinks is active.
+Equivalent to: make TOPO=4p-4x8 scenario SCEN=yellow-mrc-baseline. Both call the same underlying srv6_mrc.mrc.run.main.
+
+Quick sanity check to verify it sees your new topology:
+```bash
+srctl get topology
+srctl run --list
 ```
 
 ### MRC traffic generation scenarios

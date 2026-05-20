@@ -363,7 +363,7 @@ class ScenarioReport:
         lines.append(f"scenario: {self.scenario}")
         lines.append("=" * 78)
 
-        hdr = (f"  {'flow':<30}  {'policy':<14} "
+        hdr = (f"  {'flow':<30}  {'policy':<24} "
                f"{'sent':>6} {'rx':>6} {'loss%':>7} "
                f"{'reord':>6} {'max':>4} {'evs':>7}")
         lines.append(hdr)
