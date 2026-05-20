@@ -358,5 +358,156 @@ class ReceiverNoSenderKnownTests(unittest.TestCase):
             receiver.stop(timeout_s=0.5)
 
 
+class _TimestampingLoopbackTransport(LoopbackUdpTransport):
+    """Loopback transport that timestamps every probe send call.
+
+    Used by ProbePacingTests to assert _emit_loop spreads probes
+    across the cadence window rather than firing them in a tight burst
+    at the top of each interval. Records (monotonic_s, plane, path)
+    on every send_probe(); other send_* paths are unchanged.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.send_times: list[Tuple[float, int, int]] = []
+        self._send_times_lock = threading.Lock()
+
+    def send_probe(self, *, plane, path, dst_leaf, payload) -> None:
+        # Record before the actual send so the timestamp reflects when
+        # the sender thread *decided* to emit, not when the kernel
+        # finished the syscall. Pacing-correctness is about the former.
+        with self._send_times_lock:
+            self.send_times.append((time.monotonic(), plane, path))
+        super().send_probe(
+            plane=plane, path=path, dst_leaf=dst_leaf, payload=payload,
+        )
+
+
+class ProbePacingTests(unittest.TestCase):
+    """Verify the emit loop spreads probes across the interval (issue
+    surfaced by the yellow-allreduce-ring lab run: 16 senders all
+    firing 32-probe bursts in lockstep saturated spine TX queues and
+    pushed RTT_p50 to ~1s, causing universal probe timeouts even with
+    a healthy data path).
+
+    These tests don't reproduce the lab failure (no fabric here);
+    they pin the *invariants* that prevent it: (a) within one round,
+    consecutive probes are not back-to-back, and (b) two independent
+    SenderMrcAgent instances pick distinct startup jitter offsets so
+    they don't lockstep when launched in the same wall-clock instant.
+    """
+
+    def _build_sender(
+        self, *, src_id: int = 0,
+    ) -> Tuple[SenderMrcAgent, _TimestampingLoopbackTransport]:
+        sender_report_port = PORTS.take(1)
+        receiver_probe_port = PORTS.take(1)
+        sender_send = _make_send_sockets()
+        sender_rx = _make_rx_socket(sender_report_port)
+        xport = _TimestampingLoopbackTransport(
+            is_sender=True,
+            per_plane_send_sockets=sender_send,
+            rx_socket=sender_rx,
+            peer_rx_port=receiver_probe_port,
+        )
+        table = EVStateTable(
+            tenants=("green",), num_planes=NUM_PLANES, num_paths=NUM_SPINES,
+        )
+        sender = SenderMrcAgent(
+            tenant="green",
+            src_id=src_id,
+            dst_id=15,
+            table=table,
+            config=FAST_CONFIG,
+            transport=xport,
+        )
+        return sender, xport
+
+    def test_probes_spread_within_interval_not_bursty(self) -> None:
+        """Within one round, consecutive probes are paced ~interval/num_evs
+        apart rather than emitted as a tight back-to-back burst at the
+        top of the interval.
+
+        Allows generous slack for scheduling jitter (the FAST_CONFIG
+        slot is 20ms / 32 = 625us, which is well within typical Linux
+        scheduling granularity), but asserts the *shape* of the
+        distribution: the span across one round should be a sizable
+        fraction of the interval rather than a few microseconds.
+        """
+        sender, xport = self._build_sender()
+        sender.start()
+        try:
+            # Wait for at least one full round to complete. With
+            # FAST_CONFIG.probe_interval_ms=20 and 32 EVs that's at
+            # most ~40ms (jitter U(0,20) + one round of paced sends).
+            # Give it 250ms to be safe under loaded CI.
+            deadline = time.monotonic() + 0.25
+            num_evs = NUM_PLANES * NUM_SPINES
+            while time.monotonic() < deadline:
+                with xport._send_times_lock:
+                    n = len(xport.send_times)
+                if n >= num_evs:
+                    break
+                time.sleep(0.005)
+        finally:
+            sender.stop(timeout_s=0.5)
+
+        with xport._send_times_lock:
+            times = [t for t, _, _ in xport.send_times[:num_evs]]
+        self.assertEqual(
+            len(times), num_evs,
+            f"expected {num_evs} probes in first round, "
+            f"got {len(times)} in 250ms"
+        )
+        span_s = times[-1] - times[0]
+        interval_s = FAST_CONFIG.probe_interval_ms / 1000.0
+        # With perfect pacing the span is ~(num_evs - 1) * slot_s
+        # = 31/32 * 20ms = 19.4ms. We allow span >= 25% of the
+        # interval as the "definitely not bursty" floor; the original
+        # buggy loop produced a span on the order of single-digit
+        # microseconds (32 Python-level sendto calls back-to-back).
+        min_acceptable_span_s = interval_s * 0.25
+        self.assertGreater(
+            span_s, min_acceptable_span_s,
+            f"one-round probe span = {span_s*1000:.2f}ms, expected "
+            f">{min_acceptable_span_s*1000:.2f}ms (interval="
+            f"{interval_s*1000:.0f}ms, num_evs={num_evs}); "
+            "looks like _emit_loop reverted to a bursty inner loop"
+        )
+
+    def test_independent_agents_have_distinct_jitter(self) -> None:
+        """Two SenderMrcAgent instances pick independent startup
+        jitter offsets, so their first probes are not synchronized
+        even when constructed back-to-back in the same wall-clock ms.
+
+        The jitter range is U(0, probe_interval_ms). With 32 random
+        draws from that range the chance of two values landing within
+        100us of each other is ~32*100us/20ms = 16%, so we sample 8
+        agents and require at least one pair to differ by >= 500us.
+        This is loose enough to ride out python random implementation
+        details but tight enough to catch a hard-coded jitter of 0.
+        """
+        jitters: list[float] = []
+        for src_id in range(8):
+            sender, _xport = self._build_sender(src_id=src_id)
+            jitters.append(sender._emit_jitter_s)
+            # Don't actually start the agent — we only care about the
+            # constructor-time jitter draw.
+            sender.stop(timeout_s=0.0)
+        interval_s = FAST_CONFIG.probe_interval_ms / 1000.0
+        # All jitter values must be in [0, interval_s].
+        for j in jitters:
+            self.assertGreaterEqual(j, 0.0)
+            self.assertLessEqual(j, interval_s)
+        # At least one pair differs by >= 500us. Constant or
+        # near-constant jitter would fail this assertion.
+        spread = max(jitters) - min(jitters)
+        self.assertGreaterEqual(
+            spread, 0.0005,
+            f"8 agents' jitter spread = {spread*1e6:.0f}us, expected "
+            f">=500us; jitter likely hard-coded or seeded badly"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

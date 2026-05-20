@@ -81,6 +81,7 @@ default. Tests inject their own transport via the `transport=` kwarg.
 from __future__ import annotations
 
 import logging
+import random
 import socket
 import threading
 import time
@@ -299,6 +300,26 @@ class SenderMrcAgent:
             )
         self.transport = transport
 
+        # Per-instance random jitter applied once at emit-thread start.
+        # When many SenderMrcAgent processes are launched in quick
+        # succession by the same orchestrator (e.g. an N-host ring
+        # all-reduce scenario starts N senders within a ~1s window),
+        # their emit loops would otherwise lockstep on the same
+        # `probe_interval_ms` cadence, all firing their per-round
+        # `NUM_PLANES * NUM_SPINES` probe burst at the same wall-clock
+        # instant. With N=16 senders and a 4*8 EV grid that's 512
+        # probes hitting the fabric every 200ms -- enough to push spine
+        # TX queues into a queueing regime where p50 RTT climbs to
+        # ~1s and every probe times out under the 100ms default.
+        # Jittering the start offset by U(0, interval) decorrelates
+        # the herd; combined with the in-round pacing in _emit_loop
+        # (one probe per interval/num_evs slot rather than a tight
+        # burst at the top of every interval), per-probe TX events
+        # are now spread roughly uniformly across the cadence window.
+        self._emit_jitter_s: float = random.uniform(
+            0.0, config.probe_interval_ms / 1000.0,
+        )
+
         # Sender-side per-EV TX counter for the current emit-window,
         # indexed `[plane][path]`. Updated by record_sent() on the hot
         # path; snapshotted (and reset) by the window-rotate thread.
@@ -371,15 +392,43 @@ class SenderMrcAgent:
         """Send one PROBE per `(plane, path)` EV every probe_interval_ms.
 
         Iterates the full NUM_PLANES * NUM_SPINES grid each round so
-        every EV gets independent liveness and RTT signal. With the
-        default probe_interval_ms=200 and the 4*8 grid that's
-        160 probes/sec — trivial overhead next to the data rate.
+        every EV gets independent liveness and RTT signal. The
+        per-EV cadence stays at `probe_interval_ms` (default 200ms),
+        but probes within one round are *spread* across the interval
+        rather than emitted as a back-to-back burst. With the default
+        4*8 grid and 200ms interval that's one probe per 6.25ms slot;
+        the resulting per-host TX rate is identical to the old loop
+        averaged over the interval but lacks the bursty peak that
+        saturated spine TX queues at scale (see __init__ for context).
+
+        A per-instance startup jitter (computed in __init__) further
+        decorrelates senders that were launched within the same wall
+        clock second by the orchestrator. Without jitter, even paced
+        emission lines up across senders if they're all started by
+        the same `docker exec ... &` loop.
+
         Probes use the transport, which builds the SRv6 outer for the
         EV in the lab path and addresses the matching per-plane
         loopback socket in tests.
         """
         interval_s = self.cfg.probe_interval_ms / 1000.0
-        next_tick = time.monotonic()
+        num_evs = NUM_PLANES * NUM_SPINES
+        # Per-EV slot within one interval. We sleep `slot_s` between
+        # each probe in a round; the final sleep at the end of the
+        # round (to reach `next_tick`) absorbs any drift / scheduling
+        # slop so the per-EV cadence stays close to interval_s on
+        # average.
+        slot_s = interval_s / num_evs
+
+        # Startup jitter: stagger the very first round so concurrently
+        # launched agents don't lockstep. Subsequent rounds inherit
+        # the offset via the next_tick accumulator below.
+        if self._emit_jitter_s > 0.0:
+            self._stop.wait(self._emit_jitter_s)
+            if self._stop.is_set():
+                return
+
+        next_tick = time.monotonic() + interval_s
         while not self._stop.is_set():
             now_ns = self.clock_ns()
             for plane in range(NUM_PLANES):
@@ -420,13 +469,27 @@ class SenderMrcAgent:
                         # will time out naturally and trigger a
                         # probe-fail signal. Right semantic for "I
                         # tried to probe but the kernel refused."
-            next_tick += interval_s
+                    # Pace within the round: sleep one slot between
+                    # probes. The last iteration's slot is absorbed by
+                    # the round-end deadline wait below.
+                    if self._stop.wait(slot_s):
+                        return
+                    # Refresh `now_ns` so each probe's tx_ns reflects
+                    # actual wall-clock dispatch (matters for RTT math
+                    # on the receiver: a probe sent in slot 31 of the
+                    # round should record tx_ns ~slot_s*31 later than
+                    # the slot 0 probe). Without this refresh all 32
+                    # probes in a round would share the same tx_ns
+                    # and the EV-level RTT histogram would be biased.
+                    now_ns = self.clock_ns()
             sleep_s = next_tick - time.monotonic()
-            if sleep_s < 0:
-                # Falling behind; reset cadence rather than spin.
-                next_tick = time.monotonic()
+            next_tick += interval_s
+            if sleep_s > 0:
+                if self._stop.wait(sleep_s):
+                    return
             else:
-                self._stop.wait(sleep_s)
+                # Falling behind; reset cadence rather than spin.
+                next_tick = time.monotonic() + interval_s
 
     def _sweep_loop(self) -> None:
         """Check for outstanding probes past the timeout."""
