@@ -48,7 +48,27 @@ flows:
 
 faults: []
 
-mrc: {}
+# probe_timeout_ms bumped from the default 100ms to 300ms specifically
+# for all-to-all because at 56-sender scale the agent's reply RX loop
+# (one Python thread under the GIL, processing both probe replies AND
+# loss reports for ~9000 pps fan-in) cannot keep up with the default
+# timeout. Replies arrive at the kernel socket on time but the user-
+# space loop is slow enough that the parallel sweep thread (cadence =
+# probe_interval_ms = 200ms) marks 3 consecutive probes as timed-out
+# before the RX loop drains them, demoting the EV to assumed_bad. The
+# wire shows clean bidirectional probe + reply traffic on every plane;
+# the demotes are an agent-side timing race, not a fabric problem.
+#
+# 300ms is a safety margin (3x the default) that should comfortably
+# cover RX-loop latency while still detecting real failed paths within
+# 3*300ms = 900ms (close to the kernel-level neighbor-discovery scale,
+# which is the limit of what we can resolve over docker-sonic-vs
+# anyway). The `mrc.probe_clock.stale_replies` counter in the JSON
+# report is the canary: if it's non-zero we still have RX falling
+# behind sweep and a deeper agent-side fix (lazy-on-emit timeout
+# checks, or batched RX with non-blocking drain) is needed.
+mrc:
+  probe_timeout_ms: 300
 
 report:
   out: results/yellow-all-to-all.json

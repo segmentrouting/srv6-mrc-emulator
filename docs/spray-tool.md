@@ -1,6 +1,6 @@
 # spray — userspace SRv6/uSID packet spray
 
-A small Python tool that demonstrates the SRv6 packet spray model published [Here](https://cdn.openai.com/pdf/resilient-ai-supercomputer-networking-using-mrc-and-srv6.pdf): one logical flow is split across all 4 fabric planes by varying only the **outer** SID list, while the **inner** tenant address stays plane-independent.
+A small Python tool that demonstrates a very basic SRv6 packet spray model where one logical flow is split across all 4 fabric planes by varying only the **outer** SID list.
 
 The tool has two roles, sender and receiver. Run the receiver first, then the sender in a separate terminal. Tenant (Green/Yellow) is auto-detected from the container hostname; the same flags work for both.
 
