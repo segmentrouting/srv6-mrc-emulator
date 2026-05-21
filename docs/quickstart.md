@@ -198,10 +198,11 @@ srctl run --list
 Example output
 ```bash
 $ srctl run --list
-green-all-to-all
-green-allreduce-ring
-green-mrc-baseline
-green-mrc-ev-spray
+green-all-to-all         # models all-to-all collective for tenant green
+green-allreduce-ring     # models all-reduce collective ring for tenant green
+green-mrc-baseline       # a generic 'pairs' traffic pattern with MRC probes to establish base functionality
+green-mrc-ev-spray       # full path EV packet spray without 
+
 yellow-all-to-all
 yellow-allreduce-ring
 yellow-mrc-baseline

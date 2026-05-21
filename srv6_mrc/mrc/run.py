@@ -534,18 +534,40 @@ def run_flows(flows: list[FlowRun], *,
                     f"stdout={res.stdout[:200]!r}"
                 )
 
-    # Stop daemons. SIGTERM via `docker exec ... kill` would be cleaner
-    # but Popen.terminate() on the docker-exec subprocess delivers
-    # SIGTERM to the docker client, which propagates to the in-container
-    # spray process via the exec session — same effect as killing it
-    # directly. cmd_mrc_daemon installs a SIGTERM handler that flushes
-    # final_report() to stdout, so .communicate() then returns the
-    # daemon's per-flow JSON for merging into the ScenarioReport.
+    # Stop daemons. NOTE: Popen.terminate() on the local `docker exec`
+    # subprocess does NOT propagate SIGTERM through dockerd into the
+    # in-container `spray` process — the exec session detaches the
+    # in-container child from the local client's signal group. Empirically
+    # this leaks one daemon per src_host per scenario run; orphans
+    # accumulate, share port 9997 via SO_REUSEPORT, and after a few
+    # runs poison subsequent scenarios with rising loss
+    # (see PR #1 lab regression diagnosis).
+    #
+    # Cure: ask dockerd to deliver SIGTERM directly inside the container
+    # via `docker exec <host> pkill -TERM -x spray`. cmd_mrc_daemon's
+    # SIGTERM handler then sets _stop, the daemon flushes final_report
+    # to stdout, and the original Popen's .communicate() returns the
+    # JSON for merging into the ScenarioReport. We still call
+    # proc.terminate() as belt-and-braces in case pkill itself fails
+    # (e.g. container has already exited), so the local docker-exec
+    # client doesn't linger.
     daemon_records: list[dict] = []
     if daemon_procs:
         if verbose:
             print(f"  stopping {len(daemon_procs)} mrc-daemon(s)")
         for src_host, proc in daemon_procs.items():
+            # In-container kill — the only signal-delivery path that
+            # actually reaches the daemon process. rc=1 means "no
+            # matching process" which is fine (daemon already exited).
+            kill_res = docker_exec(
+                src_host, ["pkill", "-TERM", "-x", "spray"],
+                timeout_s=5.0,
+            )
+            if kill_res.rc not in (0, 1):
+                daemon_failures.append(
+                    f"daemon on {src_host} pkill rc={kill_res.rc} "
+                    f"stderr={kill_res.stderr.strip()[:200]}"
+                )
             try:
                 proc.terminate()
             except OSError as e:
@@ -560,6 +582,15 @@ def run_flows(flows: list[FlowRun], *,
                 # Give it up to 10s to be safe under heavy load.
                 out, err = proc.communicate(timeout=10.0)
             except subprocess.TimeoutExpired:
+                # Daemon didn't exit on SIGTERM. Force-kill in-container
+                # via SIGKILL (`docker exec pkill -KILL`) — proc.kill()
+                # alone only reaps the local docker-exec client and
+                # leaves the orphan running on the host (the exact
+                # bug this teardown path exists to prevent).
+                docker_exec(
+                    src_host, ["pkill", "-KILL", "-x", "spray"],
+                    timeout_s=5.0,
+                )
                 proc.kill()
                 out, err = proc.communicate()
                 daemon_failures.append(
