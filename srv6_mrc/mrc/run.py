@@ -103,6 +103,20 @@ FAULT_SETTLE_S = 1.0
 # between bursts. Default of 6s matches the `spray` CLI default.
 RECV_IDLE_TIMEOUT_S = 6.0
 
+# How long to wait after spawning per-host MRC daemons before launching
+# data senders. Lets each daemon's first probe round complete and write
+# at least one snapshot, so senders' MrcSnapshot policies start from
+# real EV health rather than 200ms of cold-start uniform. Set to ~5x
+# probe_interval_ms so a few rounds have certainly completed even on a
+# slow host.
+MRC_DAEMON_SETTLE_S = 1.5
+
+# Base directory for per-flow MRC snapshot files. Each daemon writes
+# under <base>/<src_host>/<tenant>_<dst_id:02d>.json (matching the
+# MrcDaemon's _snapshot_path() convention). Lives on tmpfs in the
+# container so the writes are cheap and never hit disk.
+MRC_SNAPSHOT_BASE = "/dev/shm/srv6-mrc"
+
 
 # --- subprocess helpers -----------------------------------------------------
 
@@ -227,13 +241,20 @@ def expand_flows(scenario: Scenario) -> list[FlowRun]:
     return out
 
 
-def _send_argv(flow: FlowRun) -> list[str]:
+def _send_argv(flow: FlowRun, *, policy_cli: str | None = None) -> list[str]:
+    """Build argv for `srctl spray --role send` for one flow.
+
+    `policy_cli` overrides flow.policy_cli when provided. Used by the
+    MRC daemon path to swap `health_aware_mrc` for the corresponding
+    `mrc_snapshot:<path>` (see _translate_policy_for_daemon). When
+    None the flow's own policy_cli is used unchanged.
+    """
     return [
         "spray", "--role", "send",
         "--dst-id", str(flow.dst_id),
         "--rate", f"{flow.rate_pps}pps",
         "--duration", f"{flow.duration_s}s",
-        "--policy", flow.policy_cli,
+        "--policy", policy_cli if policy_cli is not None else flow.policy_cli,
         "--json",
     ]
 
@@ -283,13 +304,106 @@ def _mrc_env(mrc: MrcSpec | None) -> dict[str, str] | None:
     return _scenario_env(mrc, paths_per_plane=None)
 
 
+# --- MRC daemon orchestration (refactor: 1 daemon per src_host) -------------
+#
+# When MRC is enabled and at least one flow uses the health_aware_mrc
+# policy, we run ONE MRC daemon per src_host that owns the shared reply
+# socket and writes per-flow snapshot files to /dev/shm/srv6-mrc. Data
+# senders then run a passive `mrc_snapshot:<path>` policy that reads
+# weights out of those snapshots. This is the structural cure for the
+# SO_REUSEPORT reply-misdelivery cascade that bit all-to-all scale —
+# see docs/mrc-daemon-design.md.
+
+
+def _flow_uses_mrc(flow: FlowRun) -> bool:
+    """True if this flow's policy is health_aware_mrc (in any form).
+
+    The base shape `health_aware_mrc` and the parameterized
+    `health_aware_mrc:N` are the only forms that need the daemon's
+    snapshot feed. All other policies (round_robin, ev_spray, weighted,
+    etc.) are pure functions of (seq, flow) and run without daemon
+    support.
+    """
+    return flow.policy_cli == "health_aware_mrc"
+
+
+def _snapshot_path_for_flow(src_host: str, tenant: str,
+                            dst_id: int) -> str:
+    """Path the daemon writes (and the snapshot policy reads) for a flow.
+
+    Must match MrcDaemon._snapshot_path() — a deviation here would mean
+    senders happily reading uniform-cold-start forever while the daemon
+    is publishing fresh data right next door. The format is
+    /dev/shm/srv6-mrc/<src_host>/<tenant>_<dst_id:02d>.json.
+    """
+    return f"{MRC_SNAPSHOT_BASE}/{src_host}/{tenant}_{dst_id:02d}.json"
+
+
+def _translate_policy_for_daemon(flow: FlowRun) -> str:
+    """If this flow uses health_aware_mrc, swap to mrc_snapshot:<path>.
+
+    The translation is what makes the data-sender process MRC-passive:
+    instead of running its own SenderMrcAgent (which would re-introduce
+    the SO_REUSEPORT bind() the daemon refactor exists to eliminate),
+    it reads EV health from the daemon's published snapshot.
+
+    All non-health_aware_mrc policies pass through unchanged so a
+    mixed scenario (some flows MRC, others ev_spray) works correctly.
+    """
+    if not _flow_uses_mrc(flow):
+        return flow.policy_cli
+    return "mrc_snapshot:" + _snapshot_path_for_flow(
+        flow.src_host, flow.tenant, flow.dst_id,
+    )
+
+
+def _daemon_argv(daemon_flows: list[FlowRun]) -> list[str]:
+    """Build the argv for `srctl spray --role mrc-daemon ...`.
+
+    All flows in `daemon_flows` must share the same src_host (caller
+    enforces this). The daemon process is per-host and serves every
+    health_aware_mrc flow originating on that host through a single
+    shared reply socket.
+
+    --flows-json carries [{tenant, dst_id}, ...]; the daemon
+    deserializes and constructs DaemonFlow objects internally.
+    """
+    flows_spec = [
+        {"tenant": f.tenant, "dst_id": f.dst_id}
+        for f in daemon_flows
+    ]
+    return [
+        "spray", "--role", "mrc-daemon",
+        "--flows-json", json.dumps(flows_spec),
+        "--snapshot-dir", MRC_SNAPSHOT_BASE,
+        "--json",
+    ]
+
+
+def _select_mrc_daemon_flows(flows: list[FlowRun]) -> dict[str, list[FlowRun]]:
+    """Group flows that need the daemon by src_host.
+
+    Returns {src_host: [FlowRun, ...]} containing only flows whose
+    policy_cli is health_aware_mrc. Empty dict when no flow needs the
+    daemon (in which case the orchestrator skips daemon spawning
+    entirely and the run is identical to pre-daemon behavior).
+    """
+    by_host: dict[str, list[FlowRun]] = {}
+    for f in flows:
+        if not _flow_uses_mrc(f):
+            continue
+        by_host.setdefault(f.src_host, []).append(f)
+    return by_host
+
+
 def run_flows(flows: list[FlowRun], *,
               idle_timeout_s: float = RECV_IDLE_TIMEOUT_S,
               settle_s: float = RECEIVER_SETTLE_S,
               mrc: MrcSpec | None = None,
               paths_per_plane: int | None = None,
-              verbose: bool = False) -> tuple[list[dict], list[dict]]:
-    """Run all flows concurrently. Returns (sender_records, receiver_records).
+              verbose: bool = False) -> tuple[list[dict], list[dict], list[dict]]:
+    """Run all flows concurrently. Returns (sender_records, receiver_records,
+    daemon_records).
 
     One receiver process per unique dst_host (multiple flows to the same
     host share a receiver). Senders are launched in parallel after a
@@ -298,6 +412,27 @@ def run_flows(flows: list[FlowRun], *,
     When `mrc` is set, receivers are launched with --mrc and both sides
     get SRV6_MRC_CONFIG_JSON set so the AgentConfig + EVStateConfig
     overrides from the scenario yaml take effect.
+
+    MRC daemon orchestration (when mrc is set AND at least one flow uses
+    health_aware_mrc):
+        1. Spawn one MRC daemon per src_host that owns a
+           health_aware_mrc flow. Each daemon publishes per-flow
+           snapshots to /dev/shm/srv6-mrc/<src_host>/<tenant>_<dst>.json.
+        2. Wait MRC_DAEMON_SETTLE_S so each daemon's first probe round
+           completes — senders' MrcSnapshot policies prefer real
+           weights to cold-start uniform.
+        3. Translate every health_aware_mrc flow's --policy from
+           "health_aware_mrc" to "mrc_snapshot:<path>" so the data
+           sender reads weights from the daemon's snapshot file
+           instead of running its own SenderMrcAgent (which would
+           re-introduce the SO_REUSEPORT bind that the daemon refactor
+           exists to eliminate).
+        4. After all senders finish, SIGTERM each daemon, collect its
+           final-report JSON from stdout, return as `daemon_records`.
+
+    Non-MRC (or pure-ev_spray) scenarios skip steps 1-4 entirely and
+    behave exactly as they did before this refactor — same daemon=0
+    process count, same wire behavior.
     """
     # Group flows by dst_host so we spawn exactly one receiver per host.
     dsts = sorted({f.dst_host for f in flows})
@@ -323,14 +458,43 @@ def run_flows(flows: list[FlowRun], *,
 
     time.sleep(settle_s)
 
+    # MRC daemons (one per src_host, only when MRC enabled and at least
+    # one flow uses health_aware_mrc).
+    daemon_procs: dict[str, subprocess.Popen] = {}
+    daemon_failures: list[str] = []
+    if mrc_enabled:
+        daemon_groups = _select_mrc_daemon_flows(flows)
+        if daemon_groups and verbose:
+            print(f"  spawning {len(daemon_groups)} mrc-daemon(s): "
+                  f"{', '.join(sorted(daemon_groups))}")
+        for src_host, group in daemon_groups.items():
+            daemon_procs[src_host] = docker_exec_async(
+                src_host, _daemon_argv(group), env=env,
+            )
+        if daemon_procs:
+            # Let each daemon write its first snapshot before senders
+            # spin up, so the very first sender pick is health-aware
+            # rather than cold-start uniform. MrcSnapshot does an
+            # eager synchronous load on construction (see policy.py),
+            # so this only needs to be > one daemon probe interval.
+            time.sleep(MRC_DAEMON_SETTLE_S)
+
     # Launch senders in parallel.
     sender_records: list[dict] = []
     send_failures: list[str] = []
 
     def _do_send(flow: FlowRun) -> tuple[FlowRun, ExecResult]:
-        return flow, docker_exec(flow.src_host, _send_argv(flow),
-                                 timeout_s=flow.duration_s + 30.0,
-                                 env=env)
+        # Translate the flow's policy once we know whether the daemon
+        # path is in play. Without daemons spawned (mrc disabled, or
+        # no flow uses health_aware_mrc), the translation is a no-op.
+        policy_cli = (
+            _translate_policy_for_daemon(flow)
+            if daemon_procs else None
+        )
+        return flow, docker_exec(
+            flow.src_host, _send_argv(flow, policy_cli=policy_cli),
+            timeout_s=flow.duration_s + 30.0, env=env,
+        )
 
     if verbose:
         print(f"  spawning {len(flows)} sender(s)")
@@ -370,6 +534,60 @@ def run_flows(flows: list[FlowRun], *,
                     f"stdout={res.stdout[:200]!r}"
                 )
 
+    # Stop daemons. SIGTERM via `docker exec ... kill` would be cleaner
+    # but Popen.terminate() on the docker-exec subprocess delivers
+    # SIGTERM to the docker client, which propagates to the in-container
+    # spray process via the exec session — same effect as killing it
+    # directly. cmd_mrc_daemon installs a SIGTERM handler that flushes
+    # final_report() to stdout, so .communicate() then returns the
+    # daemon's per-flow JSON for merging into the ScenarioReport.
+    daemon_records: list[dict] = []
+    if daemon_procs:
+        if verbose:
+            print(f"  stopping {len(daemon_procs)} mrc-daemon(s)")
+        for src_host, proc in daemon_procs.items():
+            try:
+                proc.terminate()
+            except OSError as e:
+                daemon_failures.append(
+                    f"daemon on {src_host} terminate failed: {e}"
+                )
+                continue
+            try:
+                # The daemon's SIGTERM handler is fast (sets _stop and
+                # returns); the daemon then tears down threads and
+                # writes final_report JSON within a few hundred ms.
+                # Give it up to 10s to be safe under heavy load.
+                out, err = proc.communicate(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, err = proc.communicate()
+                daemon_failures.append(
+                    f"daemon on {src_host} did not exit on SIGTERM "
+                    f"(killed); stderr={err.strip()[:200]}"
+                )
+                continue
+            if proc.returncode not in (0, -15):  # 0 = clean, -15 = SIGTERM
+                daemon_failures.append(
+                    f"daemon on {src_host} rc={proc.returncode} "
+                    f"stderr={err.strip()[:200]}"
+                )
+                # Don't continue: try to parse stdout anyway, the
+                # daemon may have flushed before exiting nonzero.
+            line = out.strip()
+            if not line:
+                daemon_failures.append(
+                    f"daemon on {src_host}: empty stdout (rc={proc.returncode})"
+                )
+                continue
+            try:
+                daemon_records.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                daemon_failures.append(
+                    f"daemon on {src_host} bad JSON: {e}: "
+                    f"stdout={line[:200]!r}"
+                )
+
     # Wait for all receivers to self-exit on idle-timeout, then collect.
     receiver_records: list[dict] = []
     recv_failures: list[str] = []
@@ -401,12 +619,12 @@ def run_flows(flows: list[FlowRun], *,
                 f"receiver on {dst} bad JSON: {e}: stdout={line[:200]!r}"
             )
 
-    if send_failures or recv_failures:
-        for msg in send_failures + recv_failures:
+    if send_failures or recv_failures or daemon_failures:
+        for msg in send_failures + recv_failures + daemon_failures:
             print(f"  ! {msg}", file=sys.stderr)
         # Continue rather than abort: partial results are useful.
 
-    return sender_records, receiver_records
+    return sender_records, receiver_records, daemon_records
 
 
 # --- fault application ------------------------------------------------------
@@ -514,6 +732,7 @@ def run_scenario(scenario: Scenario, *,
     nm = Netem(faults=faults_for_netem(scenario))
     sender_records: list[dict] = []
     receiver_records: list[dict] = []
+    daemon_records: list[dict] = []
 
     if verbose:
         print(f"scenario: {scenario.name}")
@@ -539,7 +758,7 @@ def run_scenario(scenario: Scenario, *,
     try:
         if scenario.faults:
             time.sleep(FAULT_SETTLE_S)
-        sender_records, receiver_records = run_flows(
+        sender_records, receiver_records, daemon_records = run_flows(
             flows, mrc=scenario.mrc,
             paths_per_plane=scenario.paths_per_plane,
             verbose=verbose,
@@ -559,6 +778,7 @@ def run_scenario(scenario: Scenario, *,
     return ScenarioReport.from_records(
         scenario.name, sender_records, receiver_records,
         topology_dims=(topo_t.planes, paths_per_plane),
+        daemon_records=daemon_records,
     )
 
 

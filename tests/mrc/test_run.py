@@ -211,7 +211,7 @@ class TestRunFlows(unittest.TestCase):
 
         with mock.patch("srv6_mrc.mrc.run.docker_exec_async", return_value=recv_proc), \
              mock.patch("srv6_mrc.mrc.run.docker_exec", return_value=send_res):
-            senders, receivers = run_flows(flows, settle_s=0,
+            senders, receivers, daemons = run_flows(flows, settle_s=0,
                                             idle_timeout_s=1.0)
         self.assertEqual(len(senders), 1)
         self.assertEqual(len(receivers), 1)
@@ -225,7 +225,7 @@ class TestRunFlows(unittest.TestCase):
                              cmd=[], elapsed_s=0.1)
         with mock.patch("srv6_mrc.mrc.run.docker_exec_async", return_value=recv_proc), \
              mock.patch("srv6_mrc.mrc.run.docker_exec", return_value=send_res):
-            senders, receivers = run_flows(flows, settle_s=0,
+            senders, receivers, daemons = run_flows(flows, settle_s=0,
                                             idle_timeout_s=1.0)
         self.assertEqual(senders, [])
         # Receiver still collected (partial info is better than none).
@@ -239,7 +239,7 @@ class TestRunFlows(unittest.TestCase):
             cmd=[], elapsed_s=1.0)
         with mock.patch("srv6_mrc.mrc.run.docker_exec_async", return_value=recv_proc), \
              mock.patch("srv6_mrc.mrc.run.docker_exec", return_value=send_res):
-            senders, receivers = run_flows(flows, settle_s=0,
+            senders, receivers, daemons = run_flows(flows, settle_s=0,
                                             idle_timeout_s=1.0)
         self.assertEqual(len(senders), 1)
         self.assertEqual(receivers, [])
