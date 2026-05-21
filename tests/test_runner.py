@@ -9,8 +9,9 @@ import unittest
 from srv6_mrc.runner import (
     FlowEndpoint, SenderResult, detect_self_id,
     encode_payload, host_for, parse_payload,
+    _canon_inner, _should_count_inner,
 )
-from srv6_mrc.topo import SPRAY_PORT
+from srv6_mrc.topo import SPRAY_PORT, inner_addr
 
 
 class TestPayloadCodec(unittest.TestCase):
@@ -156,6 +157,53 @@ class TestDetectSelfId(unittest.TestCase):
     def test_trailing_garbage_rejected(self):
         with self.assertRaises(ValueError):
             detect_self_id("green-host00.local")
+
+
+class TestSnifferEgressFilter(unittest.TestCase):
+    """Cover `_should_count_inner`, the helper that drops egress packets
+    the receiver sniffer captures on this host's own NICs.
+
+    Background: in all-to-all scenarios every host runs both a sender
+    and a receiver. The receiver's per-NIC sniffer captures BOTH
+    directions, so without this filter the receiver records this host's
+    own outbound flows as if they were inbound, surfacing as 56 spurious
+    "orphan flow" warnings on a 4p-4x8 yellow-all-to-all run.
+    """
+
+    def test_canon_zero_padded_matches_compressed(self):
+        # topo.inner_addr() returns zero-padded ("...:01::2"); scapy
+        # gives the RFC-5952 form ("...:1::2"). Both must canonicalize
+        # to the same string.
+        padded = inner_addr("yellow", 1)        # 2001:db8:cccc:01::2
+        compressed = "2001:db8:cccc:1::2"       # what scapy emits
+        self.assertEqual(_canon_inner(padded), _canon_inner(compressed))
+
+    def test_canon_handles_garbage(self):
+        # Falls back to the input on parse failure rather than raising.
+        # Lets the sniffer drop bad packets via the != self_canon path.
+        self.assertEqual(_canon_inner("not-an-addr"), "not-an-addr")
+
+    def test_count_when_inner_dst_is_self(self):
+        self_canon = _canon_inner(inner_addr("yellow", 1))
+        # Inbound traffic: inner_dst is this host (RFC-5952 form from scapy).
+        self.assertTrue(_should_count_inner("2001:db8:cccc:1::2", self_canon))
+
+    def test_drop_when_inner_dst_is_other_host(self):
+        # The all-to-all egress case: this host sends to another host;
+        # sniffer captures the packet at NIC egress with inner_dst != self.
+        self_canon = _canon_inner(inner_addr("yellow", 1))
+        for other_id in (0, 2, 3, 7):
+            with self.subTest(other_id=other_id):
+                other = inner_addr("yellow", other_id)
+                self.assertFalse(_should_count_inner(other, self_canon))
+
+    def test_drop_when_inner_dst_is_other_tenant(self):
+        # Cross-tenant packets (shouldn't happen, but defensive):
+        # green and yellow inner addresses differ, so a green packet
+        # captured on a yellow host's NIC is not for this host.
+        self_canon = _canon_inner(inner_addr("yellow", 0))
+        green0 = inner_addr("green", 0)
+        self.assertFalse(_should_count_inner(green0, self_canon))
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ from srv6_mrc.runner import (
     FlowEndpoint, run_receiver, run_sender, detect_self_id,
 )
 from srv6_mrc.policy import (
-    policy_from_spec, HealthAwareMrc, HealthAwareMrcFactory,
+    policy_from_spec, HealthAwareMrc, HealthAwareMrcFactory, MrcSnapshot,
 )
 from srv6_mrc.topo import (
     NUM_PLANES, NUM_SPINES, PLANE_NICS, SPRAY_PORT,
@@ -92,6 +92,11 @@ def parse_policy(s: str, *, tenant: str, ev_config=None,
         ev_spray              (uses paths_per_plane override or NUM_SPINES)
         ev_spray:N            (explicit fan-out, overrides paths_per_plane arg)
         health_aware_mrc
+        mrc_snapshot:<path>[:<paths_per_plane>]
+                              (snapshot-backed read-only twin of
+                               health_aware_mrc; reads per-EV weights
+                               from a file written by an MrcDaemon —
+                               see srv6_mrc.policy.MrcSnapshot)
 
     `health_aware_mrc` resolves the factory returned by policy_from_spec
     into a live policy by binding it to an EVStateTable for this
@@ -125,6 +130,37 @@ def parse_policy(s: str, *, tenant: str, ev_config=None,
     if s.startswith("ev_spray:"):
         n = int(s.split(":", 1)[1])
         return policy_from_spec({"ev_spray": n}, topology=topology)
+    if s.startswith("mrc_snapshot:"):
+        # mrc_snapshot:<path>[:<paths_per_plane>]
+        # The path is the absolute file location written by an
+        # MrcDaemon (one file per (tenant, dst_id) flow). The optional
+        # paths_per_plane suffix configures the per-flow spine subset
+        # exactly as in `ev_spray:N`. Built directly here (not via
+        # policy_from_spec) because we already have the live tenant in
+        # scope, and the policy needs it eagerly to validate the
+        # snapshot's tenants dict.
+        rest = s.split(":", 1)[1]
+        parts = rest.rsplit(":", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            snapshot_path, ppp_s = parts
+            ppp = int(ppp_s)
+        else:
+            snapshot_path = rest
+            ppp = (paths_per_plane if paths_per_plane is not None
+                   else topology.spines_per_plane)
+        policy = MrcSnapshot(
+            snapshot_path=snapshot_path,
+            tenant=tenant,
+            paths_per_plane=ppp,
+            topology=topology,
+        )
+        # Start the refresh thread so the policy keeps in sync with
+        # the daemon's snapshot updates. Caller (cmd_send / step d
+        # data sender) is responsible for calling .stop() during
+        # teardown — same lifecycle hook as the SenderMrcAgent it
+        # replaces.
+        policy.start()
+        return policy
     if s == "ev_spray" and paths_per_plane is not None:
         return policy_from_spec(
             {"ev_spray": paths_per_plane}, topology=topology,
@@ -473,6 +509,112 @@ def cmd_recv(args, tenant: str, my_id: int) -> int:
     return 0
 
 
+# --- mrc-daemon ------------------------------------------------------------
+
+def cmd_mrc_daemon(args, tenant: str, my_id: int) -> int:
+    """Run as a per-host MRC daemon for one or more flows.
+
+    The daemon owns the single shared reply socket for this src_host
+    and dispatches inbound replies to per-flow SenderMrcAgent
+    instances by peer source address. See srv6_mrc/mrc/daemon.py for
+    full design rationale.
+
+    Lifecycle:
+      1. Parse --flows-json (or fall back to a single flow from --dst-id).
+      2. Build AgentConfig + EVStateConfig from SRV6_MRC_CONFIG_JSON.
+      3. Construct + start MrcDaemon. snapshot files appear under
+         <snapshot_dir>/<src_host>/<tenant>_<dst_id>.json.
+      4. Block on SIGTERM (orchestrator-driven shutdown).
+      5. Stop daemon, flush final per-flow JSON to stdout.
+    """
+    import signal
+    from srv6_mrc.mrc.agent import load_configs_from_env
+    from srv6_mrc.mrc.daemon import (
+        DEFAULT_SNAPSHOT_DIR, DaemonFlow, MrcDaemon,
+    )
+
+    # Resolve flows.
+    flows: list = []
+    if args.flows_json:
+        try:
+            spec = json.loads(args.flows_json)
+        except json.JSONDecodeError as e:
+            print(f"spray.py: --flows-json is not valid JSON: {e}",
+                  file=sys.stderr)
+            return 2
+        if not isinstance(spec, list) or not spec:
+            print("spray.py: --flows-json must be a non-empty list",
+                  file=sys.stderr)
+            return 2
+        for item in spec:
+            try:
+                t = item["tenant"]
+                d = int(item["dst_id"])
+            except (KeyError, TypeError, ValueError) as e:
+                print(f"spray.py: bad flow item {item!r}: {e}",
+                      file=sys.stderr)
+                return 2
+            flows.append(DaemonFlow(tenant=t, dst_id=d))
+    else:
+        if args.dst_id is None:
+            print("spray.py: --role mrc-daemon needs --dst-id "
+                  "or --flows-json", file=sys.stderr)
+            return 2
+        if my_id == args.dst_id:
+            print("spray.py: --dst-id must differ from my own id",
+                  file=sys.stderr)
+            return 2
+        flows.append(DaemonFlow(tenant=tenant, dst_id=args.dst_id))
+
+    # MRC configs from env (set by mrc/run.py).
+    try:
+        agent_cfg, ev_cfg = load_configs_from_env()
+    except ValueError as e:
+        print(f"spray.py: {e}", file=sys.stderr)
+        return 2
+
+    snapshot_dir = args.snapshot_dir or DEFAULT_SNAPSHOT_DIR
+
+    # Detect src_host name from container env if available; fall back
+    # to "host{my_id:02d}". The orchestrator sets HOSTNAME naturally
+    # because docker exec runs inside a named container.
+    src_host = os.environ.get("HOSTNAME") or f"host{my_id:02d}"
+
+    daemon = MrcDaemon(
+        src_host=src_host, src_id=my_id, flows=flows,
+        agent_cfg=agent_cfg, ev_cfg=ev_cfg,
+        snapshot_dir=snapshot_dir,
+    )
+
+    # Wire SIGTERM (orchestrator's shutdown signal) and SIGINT (Ctrl-C
+    # for interactive use) to a clean stop. Both just set the daemon's
+    # _stop event; the publisher / dispatcher exit on next wakeup.
+    def _on_signal(signum, _frame):
+        log_msg = f"spray.py mrc-daemon: received signal {signum}, stopping\n"
+        sys.stderr.write(log_msg)
+        sys.stderr.flush()
+        daemon._stop.set()
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+
+    daemon.start()
+    try:
+        daemon.wait_for_stop()
+    finally:
+        daemon.stop(timeout_s=2.0)
+
+    # Final report: print JSON to stdout for the orchestrator to merge.
+    try:
+        report = daemon.final_report()
+    except Exception as e:
+        print(f"spray.py: final_report failed: {e}", file=sys.stderr)
+        return 1
+    json.dump(report, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
 # --- main -------------------------------------------------------------------
 
 def main() -> int:
@@ -481,7 +623,8 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--role", required=True, choices=("send", "recv"))
+    p.add_argument("--role", required=True,
+                   choices=("send", "recv", "mrc-daemon"))
     p.add_argument("--dst-id", type=int, default=None,
                    help="(send) destination host id 0..15")
     p.add_argument("--rate", type=parse_rate, default=parse_rate("1000pps"),
@@ -513,6 +656,15 @@ def main() -> int:
                         "responder + per-window loss reporter back to "
                         "senders. Default off — baseline runs stay "
                         "scapy-only.")
+    p.add_argument("--flows-json", type=str, default=None,
+                   help="(mrc-daemon) JSON list of flows the daemon "
+                        "should manage, e.g. "
+                        "'[{\"tenant\":\"green\",\"dst_id\":1},...]'. "
+                        "When omitted, falls back to a single flow built "
+                        "from --dst-id with the auto-detected tenant.")
+    p.add_argument("--snapshot-dir", type=str, default=None,
+                   help="(mrc-daemon) override default /dev/shm/srv6-mrc "
+                        "snapshot output directory; mainly for tests.")
     p.add_argument("--json", action="store_true",
                    help="emit machine-readable JSON result instead of "
                         "human-readable output (used by mrc orchestrator)")
@@ -526,6 +678,8 @@ def main() -> int:
 
     if args.role == "send":
         return cmd_send(args, tenant, my_id)
+    if args.role == "mrc-daemon":
+        return cmd_mrc_daemon(args, tenant, my_id)
     return cmd_recv(args, tenant, my_id)
 
 

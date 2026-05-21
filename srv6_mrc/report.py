@@ -177,6 +177,14 @@ class ScenarioReport:
     # and to list any unused EVs. None when unknown (legacy callers /
     # tests that don't care).
     topology_dims: tuple[int, int] | None = None
+    # Per-src_host MRC daemon final reports. One dict per daemon
+    # (one daemon per src_host) when the scenario ran with MRC enabled
+    # and at least one flow used health_aware_mrc. Each dict is the
+    # output of MrcDaemon.final_report() — see srv6_mrc/mrc/daemon.py.
+    # Empty list when MRC was disabled or no flows used the snapshot
+    # policy. Carried through unmerged so offline analysis can correlate
+    # the daemon-side EV state machine with sender-side per-EV counts.
+    daemon_records: list[dict] = field(default_factory=list)
 
     @property
     def expected_evs(self) -> int | None:
@@ -193,6 +201,7 @@ class ScenarioReport:
                      sender_records: list[dict],
                      receiver_records: list[dict],
                      topology_dims: tuple[int, int] | None = None,
+                     daemon_records: list[dict] | None = None,
                      ) -> "ScenarioReport":
         """Merge raw JSON records into a ScenarioReport.
 
@@ -201,13 +210,20 @@ class ScenarioReport:
         topology_dims: (num_planes, paths_per_plane) for this scenario.
             Renderer uses this to show the per-flow "used/expected" EV
             count and to list any unused EVs by index.
+        daemon_records: list of dicts from `MrcDaemon.final_report()`,
+            one per src_host that ran a daemon. Optional; defaults to
+            an empty list. Stored verbatim for offline analysis.
 
         Matching strategy (see module docstring): by host names from the
         sender side, and by inner IPv6 addresses on the receiver side
         (FlowStats keys flows by `(src, dst, sport, dport)` where src/dst
         are IPv6 strings).
         """
-        report = cls(scenario=scenario_name, topology_dims=topology_dims)
+        report = cls(
+            scenario=scenario_name,
+            topology_dims=topology_dims,
+            daemon_records=list(daemon_records) if daemon_records else [],
+        )
 
         # Build dst_host -> receiver record map for O(1) lookup.
         recv_by_host: dict[str, dict] = {}

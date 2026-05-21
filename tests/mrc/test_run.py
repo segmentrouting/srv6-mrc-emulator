@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 from srv6_mrc.mrc.scenario import (
-    FaultSpec, FlowPair, FlowSpec, ReportSpec, Scenario,
+    FaultSpec, FlowPair, FlowSpec, MrcSpec, ReportSpec, Scenario,
 )
 from srv6_mrc.mrc.run import (
     _ev_spray_n, _print_ev_preview, _recv_argv, _send_argv,
@@ -211,7 +211,7 @@ class TestRunFlows(unittest.TestCase):
 
         with mock.patch("srv6_mrc.mrc.run.docker_exec_async", return_value=recv_proc), \
              mock.patch("srv6_mrc.mrc.run.docker_exec", return_value=send_res):
-            senders, receivers = run_flows(flows, settle_s=0,
+            senders, receivers, daemons = run_flows(flows, settle_s=0,
                                             idle_timeout_s=1.0)
         self.assertEqual(len(senders), 1)
         self.assertEqual(len(receivers), 1)
@@ -225,7 +225,7 @@ class TestRunFlows(unittest.TestCase):
                              cmd=[], elapsed_s=0.1)
         with mock.patch("srv6_mrc.mrc.run.docker_exec_async", return_value=recv_proc), \
              mock.patch("srv6_mrc.mrc.run.docker_exec", return_value=send_res):
-            senders, receivers = run_flows(flows, settle_s=0,
+            senders, receivers, daemons = run_flows(flows, settle_s=0,
                                             idle_timeout_s=1.0)
         self.assertEqual(senders, [])
         # Receiver still collected (partial info is better than none).
@@ -239,7 +239,7 @@ class TestRunFlows(unittest.TestCase):
             cmd=[], elapsed_s=1.0)
         with mock.patch("srv6_mrc.mrc.run.docker_exec_async", return_value=recv_proc), \
              mock.patch("srv6_mrc.mrc.run.docker_exec", return_value=send_res):
-            senders, receivers = run_flows(flows, settle_s=0,
+            senders, receivers, daemons = run_flows(flows, settle_s=0,
                                             idle_timeout_s=1.0)
         self.assertEqual(len(senders), 1)
         self.assertEqual(receivers, [])
@@ -319,6 +319,117 @@ class TestEvSprayPreview(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             _print_ev_preview(flows, scenario_ppp=None)
         self.assertEqual(buf.getvalue(), "")
+
+
+# --- mrc-daemon teardown ----------------------------------------------------
+#
+# These tests pin the orphan-prevention contract introduced after the lab
+# regression where consecutive `srctl run` invocations leaked one daemon
+# per src_host (Popen.terminate() does not propagate SIGTERM through
+# `docker exec` into the in-container process). The cure is an explicit
+# `docker exec <host> pkill -TERM -x spray` in run_flows() teardown.
+
+def _ok_daemon_json(src_host="green-host00"):
+    """Daemon final_report JSON shape — minimal, just enough to parse."""
+    return json.dumps({
+        "src_host": src_host, "src_id": 0, "tenant": "green",
+        "flows": [],
+    })
+
+
+class _FakeDaemonPopen:
+    """Stands in for an mrc-daemon docker_exec_async Popen.
+
+    Unlike _FakePopen it tracks .terminate() / .kill() / .returncode
+    so the teardown path can be exercised end-to-end.
+    """
+    def __init__(self, stdout: str, returncode: int = 0):
+        self._stdout = stdout
+        self.returncode = None  # set on terminate()
+        self._final_rc = returncode
+        self.terminated = False
+        self.killed = False
+
+    def terminate(self):
+        self.terminated = True
+        # Simulate the daemon flushing final_report on SIGTERM.
+        self.returncode = self._final_rc
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def communicate(self, timeout=None):
+        # If terminate() wasn't called we still return stdout (mimics
+        # daemon that exited on its own).
+        if self.returncode is None:
+            self.returncode = self._final_rc
+        return self._stdout, ""
+
+
+class TestMrcDaemonTeardown(unittest.TestCase):
+    """run_flows must not leak in-container daemon processes."""
+
+    def _mrc_flow(self):
+        return [FlowRun(
+            src_host="green-host00", dst_host="green-host15",
+            tenant="green", src_id=0, dst_id=15,
+            policy_cli="health_aware_mrc",
+            rate_pps=1000, duration_s=1.0,
+        )]
+
+    def test_pkill_invoked_per_daemon_host_on_teardown(self):
+        # Mock docker_exec_async to dispatch by argv: receivers get a
+        # _FakePopen, the mrc-daemon gets a _FakeDaemonPopen so we can
+        # observe .terminate(). Mock docker_exec to record every
+        # synchronous call (sender + the new pkill teardown call).
+        flows = self._mrc_flow()
+        daemon_proc = _FakeDaemonPopen(stdout=_ok_daemon_json())
+
+        def fake_async(container, argv, *, env=None):
+            if "mrc-daemon" in argv:
+                return daemon_proc
+            return _FakePopen(stdout=_ok_receiver_json())
+
+        sync_calls = []
+        def fake_exec(container, argv, *, timeout_s=None, env=None):
+            sync_calls.append((container, tuple(argv)))
+            # First arg "pkill" → teardown call. Anything else (spray
+            # send) returns a successful sender JSON.
+            if argv and argv[0] == "pkill":
+                return mock.Mock(rc=0, stdout="", stderr="",
+                                 cmd=[], elapsed_s=0.01)
+            return mock.Mock(
+                rc=0,
+                stdout=_ok_sender_json("green-host00", "green-host15"),
+                stderr="", cmd=[], elapsed_s=1.0,
+            )
+
+        with mock.patch("srv6_mrc.mrc.run.docker_exec_async",
+                        side_effect=fake_async), \
+             mock.patch("srv6_mrc.mrc.run.docker_exec",
+                        side_effect=fake_exec), \
+             mock.patch("srv6_mrc.mrc.run.time.sleep"):
+            senders, receivers, daemons = run_flows(
+                flows, settle_s=0, idle_timeout_s=1.0,
+                mrc=MrcSpec(),
+            )
+
+        # The daemon-host got a `pkill -TERM -x spray` during teardown.
+        pkill_calls = [
+            c for c in sync_calls
+            if c[1] and c[1][0] == "pkill"
+        ]
+        self.assertEqual(
+            len(pkill_calls), 1,
+            f"expected 1 pkill teardown call, got {pkill_calls}",
+        )
+        host, argv = pkill_calls[0]
+        self.assertEqual(host, "green-host00")
+        self.assertIn("-TERM", argv)
+        self.assertIn("spray", argv)
+        # Daemon report parsed and merged.
+        self.assertEqual(len(daemons), 1)
 
 
 if __name__ == "__main__":

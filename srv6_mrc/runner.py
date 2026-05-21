@@ -133,6 +133,41 @@ def host_for(tenant: str, host_id: int) -> str:
     return f"{tenant}-host{host_id:02d}"
 
 
+def _canon_inner(addr: str) -> str:
+    """Canonicalize an IPv6 literal so string compares are stable.
+
+    Sniffer-side IPv6 addresses come from scapy in RFC-5952 compressed
+    form ("2001:db8:cccc:1::2") while topo.inner_addr() returns the
+    zero-padded form ("2001:db8:cccc:01::2"). `ipaddress.ip_address()`
+    canonicalizes both to the same string. Mirrors `report._canon_addr`
+    but kept private to runner so the receiver path doesn't have to
+    import report (which pulls in dataclass machinery the sniffer
+    handler doesn't need).
+
+    Falls back to the input on parse failure: a malformed inner_dst
+    will simply not match self_inner_canon and the packet will be
+    dropped, which is the right behavior anyway.
+    """
+    import ipaddress
+    try:
+        return str(ipaddress.ip_address(addr))
+    except (ValueError, TypeError):
+        return addr
+
+
+def _should_count_inner(inner_dst: str, self_inner_canon: str) -> bool:
+    """Return True iff a sniffed packet's inner destination is this host.
+
+    Used by `run_receiver` to drop egress packets the sniffer captures
+    on this host's own NICs. In single-direction scenarios (host A
+    sends to host B, B is not a sender) this is always True for legit
+    traffic. In all-to-all scenarios every host both sends and
+    receives; the sniffer sees outbound packets too, and those have
+    inner_dst == some-other-host's anycast, so this returns False.
+    """
+    return _canon_inner(inner_dst) == self_inner_canon
+
+
 # --- payload encode/decode (no scapy required) ------------------------------
 
 def encode_payload(seq: int, plane: int, path: int = 0) -> bytes:
@@ -360,6 +395,14 @@ def run_receiver(self_host: str,
     per_plane: Counter[int] = Counter()
     last_rx = [0.0]                # monotonic time of most recent packet
 
+    # Precomputed canonical form of this host's inner anycast. Sniffers
+    # see traffic in BOTH directions on each NIC, so an all-to-all run
+    # where every host is simultaneously sender and receiver captures
+    # this host's own egress packets in addition to legitimate ingress.
+    # Compare canonical forms because scapy returns RFC-5952-compressed
+    # IPv6 strings while inner_addr() returns the zero-padded form.
+    self_inner_canon = _canon_inner(inner_addr(tenant, self_id))
+
     def handle(pkt) -> None:
         if IPv6 not in pkt:
             return
@@ -382,6 +425,15 @@ def run_receiver(self_host: str,
             inner_dst = outer.dst
 
         if udp.dport != SPRAY_PORT:
+            return
+
+        # Drop egress observations: the sniffer captures this host's own
+        # outbound flows (where inner_dst is some other host) on the
+        # plane NIC at egress time. Without this filter, in all-to-all
+        # scenarios every host logs N-1 spurious "flows" outbound from
+        # itself, which then surface as orphan-flow warnings in the
+        # report and (worse) inflate per-NIC rx counters.
+        if not _should_count_inner(inner_dst, self_inner_canon):
             return
 
         parsed = parse_payload(bytes(udp.payload))
