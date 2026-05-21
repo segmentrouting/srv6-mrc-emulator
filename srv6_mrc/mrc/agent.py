@@ -336,28 +336,53 @@ class SenderMrcAgent:
 
     # --- public API ----------------------------------------------------
 
-    def start(self) -> None:
-        """Start all daemon threads."""
+    def start(self, *, own_reply_rx: bool = True) -> None:
+        """Start all daemon threads.
+
+        `own_reply_rx=True` (default) preserves legacy single-process
+        behavior: the agent runs its own reply-RX loop, blocking on the
+        transport's reply socket. Used by tests and by single-flow
+        non-daemon runs.
+
+        `own_reply_rx=False` is the multi-flow daemon path: an
+        MrcDaemon owns the shared reply socket and dispatches inbound
+        replies to the right per-flow agent by calling
+        `_handle_probe_reply` / `_handle_loss_report` directly. The
+        agent skips spawning its own RX loop and never touches the
+        reply socket itself. The agent must NOT also have constructed
+        its own Srv6RawTransport in this mode (the daemon injects a
+        shared transport via the `transport=` kwarg).
+        """
         self._stop.clear()
         self._spawn(self._emit_loop, name="mrc-emit")
         self._spawn(self._sweep_loop, name="mrc-sweep")
         self._spawn(self._window_rotate_loop, name="mrc-window")
-        # Single rx thread: demultiplexes PROBE_REPLY vs LOSS_REPORT
-        # by magic byte. Replaces the per-plane reply-rx loops and
-        # the separate report-rx loop that the pre-Phase-1b/step-2
-        # design used.
-        self._spawn(self._reply_rx_loop, name="mrc-reply-rx")
+        if own_reply_rx:
+            # Single rx thread: demultiplexes PROBE_REPLY vs LOSS_REPORT
+            # by magic byte. Replaces the per-plane reply-rx loops and
+            # the separate report-rx loop that the pre-Phase-1b/step-2
+            # design used.
+            self._spawn(self._reply_rx_loop, name="mrc-reply-rx")
 
-    def stop(self, *, timeout_s: float = 1.0) -> None:
-        """Signal threads to exit; close sockets. Threads are daemons so
-        we don't require them to actually join in time."""
+    def stop(self, *, timeout_s: float = 1.0,
+             close_transport: bool = True) -> None:
+        """Signal threads to exit; optionally close sockets. Threads are
+        daemons so we don't require them to actually join in time.
+
+        `close_transport=True` (default) keeps legacy behavior: the agent
+        constructed (or was given) a transport it owns, and tearing it
+        down on stop is correct. The daemon path passes
+        `close_transport=False` because the shared transport's lifetime
+        is bound to the daemon, not to any individual agent.
+        """
         self._stop.set()
-        # Closing the transport's sockets unblocks any in-flight
-        # recvfrom. The transport owns close()-safety; we just call it.
-        try:
-            self.transport.close()
-        except Exception:
-            pass
+        if close_transport:
+            # Closing the transport's sockets unblocks any in-flight
+            # recvfrom. The transport owns close()-safety; we just call it.
+            try:
+                self.transport.close()
+            except Exception:
+                pass
         deadline = time.monotonic() + timeout_s
         for t in self._threads:
             remaining = deadline - time.monotonic()
