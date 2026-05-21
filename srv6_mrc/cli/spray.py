@@ -49,7 +49,7 @@ from srv6_mrc.runner import (
     FlowEndpoint, run_receiver, run_sender, detect_self_id,
 )
 from srv6_mrc.policy import (
-    policy_from_spec, HealthAwareMrc, HealthAwareMrcFactory,
+    policy_from_spec, HealthAwareMrc, HealthAwareMrcFactory, MrcSnapshot,
 )
 from srv6_mrc.topo import (
     NUM_PLANES, NUM_SPINES, PLANE_NICS, SPRAY_PORT,
@@ -92,6 +92,11 @@ def parse_policy(s: str, *, tenant: str, ev_config=None,
         ev_spray              (uses paths_per_plane override or NUM_SPINES)
         ev_spray:N            (explicit fan-out, overrides paths_per_plane arg)
         health_aware_mrc
+        mrc_snapshot:<path>[:<paths_per_plane>]
+                              (snapshot-backed read-only twin of
+                               health_aware_mrc; reads per-EV weights
+                               from a file written by an MrcDaemon —
+                               see srv6_mrc.policy.MrcSnapshot)
 
     `health_aware_mrc` resolves the factory returned by policy_from_spec
     into a live policy by binding it to an EVStateTable for this
@@ -125,6 +130,37 @@ def parse_policy(s: str, *, tenant: str, ev_config=None,
     if s.startswith("ev_spray:"):
         n = int(s.split(":", 1)[1])
         return policy_from_spec({"ev_spray": n}, topology=topology)
+    if s.startswith("mrc_snapshot:"):
+        # mrc_snapshot:<path>[:<paths_per_plane>]
+        # The path is the absolute file location written by an
+        # MrcDaemon (one file per (tenant, dst_id) flow). The optional
+        # paths_per_plane suffix configures the per-flow spine subset
+        # exactly as in `ev_spray:N`. Built directly here (not via
+        # policy_from_spec) because we already have the live tenant in
+        # scope, and the policy needs it eagerly to validate the
+        # snapshot's tenants dict.
+        rest = s.split(":", 1)[1]
+        parts = rest.rsplit(":", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            snapshot_path, ppp_s = parts
+            ppp = int(ppp_s)
+        else:
+            snapshot_path = rest
+            ppp = (paths_per_plane if paths_per_plane is not None
+                   else topology.spines_per_plane)
+        policy = MrcSnapshot(
+            snapshot_path=snapshot_path,
+            tenant=tenant,
+            paths_per_plane=ppp,
+            topology=topology,
+        )
+        # Start the refresh thread so the policy keeps in sync with
+        # the daemon's snapshot updates. Caller (cmd_send / step d
+        # data sender) is responsible for calling .stop() during
+        # teardown — same lifecycle hook as the SenderMrcAgent it
+        # replaces.
+        policy.start()
+        return policy
     if s == "ev_spray" and paths_per_plane is not None:
         return policy_from_spec(
             {"ev_spray": paths_per_plane}, topology=topology,

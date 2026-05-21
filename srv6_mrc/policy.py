@@ -36,6 +36,9 @@ dual-mode parity sweep enforces.
 
 from __future__ import annotations
 
+import json
+import os
+import threading
 from dataclasses import dataclass, field
 from typing import Protocol, TYPE_CHECKING
 
@@ -404,6 +407,329 @@ class HealthAwareMrc:
         plane, _ = self.pick_ev(seq, flow)
         return plane
 
+
+
+class MrcSnapshot:
+    """Snapshot-backed health-aware MRC policy.
+
+    Wire-compatible behavioral twin of `HealthAwareMrc`, but instead of
+    holding a live `EVStateTable` it reads per-EV weights from a JSON
+    snapshot file written by an `MrcDaemon`. The snapshot file is the
+    output of `EVStateTable.snapshot()` (see srv6_mrc.mrc.ev_state) and
+    is refreshed atomically by the daemon on every probe interval.
+
+    Lifecycle (Refactor: MRC daemon, step b)
+    =========================================
+
+    Built as the spray policy of a *data sender* process. Data senders
+    no longer own a `SenderMrcAgent`; instead, one `MrcDaemon` per
+    src_host owns all the agents and publishes per-flow snapshots to
+    `/dev/shm/srv6-mrc/<host>/<tenant>_<dst_id>.json`. Each data sender
+    constructs `MrcSnapshot(snapshot_path, tenant, ...)` pointing at
+    *its* flow's snapshot, and the policy's background refresh thread
+    reloads the file every `refresh_interval_ms` (default 200 ms,
+    matching the daemon's snapshot cadence).
+
+    The data sender's hot loop is unchanged: it calls `pick_ev(seq,
+    flow)` exactly the same way it would call `HealthAwareMrc.pick_ev`,
+    and the policy serves the most recently loaded weight grid. The
+    only difference visible to the rest of the system is *where the
+    EVStateTable lives*: in another process, behind a snapshot file.
+
+    Cold-start
+    ----------
+
+    If the snapshot file does not yet exist when the policy starts (the
+    daemon is still warming up its first probe round), the policy falls
+    back to *uniform weights* over all (plane, path) cells. That's
+    indistinguishable from the cold-start behavior of `HealthAwareMrc`
+    (when every EV is UNKNOWN, `weights_ev()` also returns uniform).
+
+    Once the daemon writes its first snapshot the refresh thread picks
+    it up on the next tick and the policy becomes health-aware.
+
+    Transient read failures
+    -----------------------
+
+    If a refresh attempt fails (file vanished, partial write, JSON
+    decode error), the policy keeps the previously loaded grid rather
+    than reverting to uniform. This avoids a transient `/dev/shm` glitch
+    causing every data sender to suddenly distribute uniformly across
+    EVs that the daemon already knows are bad.
+
+    The daemon writes snapshots atomically (write-to-tmp + rename), so
+    in practice the only failure mode at steady state is the file
+    briefly not existing during process startup; the cold-start path
+    handles that.
+
+    Per-flow spine subset
+    ---------------------
+
+    Identical to `HealthAwareMrc` and `EvSpray`: hash-derived from the
+    flow's address pair, cached per-flow, sized by `paths_per_plane`.
+    """
+
+    def __init__(
+        self,
+        snapshot_path: str,
+        tenant: str,
+        paths_per_plane: int = _DEFAULT_PATHS,
+        topology: Topology | None = None,
+        refresh_interval_ms: int = 200,
+    ) -> None:
+        n_planes = topology.planes if topology else NUM_PLANES
+        n_spines = (topology.spines_per_plane
+                    if topology else NUM_SPINES)
+        if paths_per_plane == _DEFAULT_PATHS:
+            paths_per_plane = n_spines
+        if not (1 <= paths_per_plane <= n_spines):
+            raise ValueError(
+                f"paths_per_plane must be 1..{n_spines}, "
+                f"got {paths_per_plane}"
+            )
+        if refresh_interval_ms <= 0:
+            raise ValueError(
+                f"refresh_interval_ms must be > 0, "
+                f"got {refresh_interval_ms}"
+            )
+
+        self.snapshot_path = snapshot_path
+        self.tenant = tenant
+        self.paths_per_plane = paths_per_plane
+        self.topology = topology
+        self.refresh_interval_ms = refresh_interval_ms
+        self.name = f"mrc_snapshot({tenant}@{snapshot_path})"
+
+        self._n_planes = n_planes
+        self._n_spines = n_spines
+        # Atomic-swappable wgrid. Reads in pick_ev never need the lock —
+        # they grab the immutable tuple-of-tuples reference once and
+        # work from it. Refresh thread builds a new grid and assigns it
+        # in one operation.
+        self._wgrid: tuple[tuple[float, ...], ...] = self._uniform_wgrid()
+        # mtime of the most recently loaded snapshot. We only reparse
+        # when the file's mtime advances, to avoid hammering JSON parse
+        # at refresh cadence when the daemon is idle.
+        self._last_mtime: float = 0.0
+
+        # Per-flow spine subset cache (mirrors EvSpray._spine_subsets).
+        self._spine_subsets: dict = {}
+
+        # Refresh thread machinery. Started on .start(), stopped on
+        # .stop(). The data sender owns the lifecycle.
+        self._stop_event = threading.Event()
+        self._refresh_thread: threading.Thread | None = None
+
+        # Diagnostic counters — surface in tests / report.py to confirm
+        # the policy actually saw fresh snapshots during the run rather
+        # than running cold-start uniform the whole time.
+        self.refresh_attempts: int = 0
+        self.refresh_loaded: int = 0
+        self.refresh_errors: int = 0
+        self.refresh_missing: int = 0
+        # Lock guards _wgrid+_last_mtime swap and counter increments
+        # against tests that drive _refresh_once() from foreign threads.
+        self._lock = threading.Lock()
+
+        # Try an initial load synchronously so a sender that starts
+        # *after* the daemon is warm gets real weights on its very
+        # first pick rather than 200 ms of uniform.
+        self._refresh_once()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Start the background refresh thread.
+
+        Idempotent: calling .start() twice is a no-op (logs a warning
+        in noisy environments would be nice but stdlib-only and we
+        don't want to drag in logging here).
+        """
+        if self._refresh_thread is not None:
+            return
+        self._stop_event.clear()
+        t = threading.Thread(
+            target=self._refresh_loop,
+            name=f"mrc-snapshot-refresh-{self.tenant}",
+            daemon=True,
+        )
+        self._refresh_thread = t
+        t.start()
+
+    def stop(self, timeout: float = 1.0) -> None:
+        """Stop the refresh thread. Idempotent."""
+        if self._refresh_thread is None:
+            return
+        self._stop_event.set()
+        self._refresh_thread.join(timeout=timeout)
+        self._refresh_thread = None
+
+    # ------------------------------------------------------------------
+    # Pick
+    # ------------------------------------------------------------------
+
+    def _spines_for_flow(self, flow: FlowKey) -> tuple[int, ...]:
+        """Per-flow spine subset, cached (same scheme as EvSpray)."""
+        cached = self._spine_subsets.get(flow)
+        if cached is not None:
+            return cached
+        if self.topology is not None:
+            subset = self.topology.select_spines_for_addrs(
+                flow.src_addr, flow.dst_addr, self.paths_per_plane,
+            )
+        else:
+            subset = select_spines_for_addrs(
+                flow.src_addr, flow.dst_addr, self.paths_per_plane,
+            )
+        self._spine_subsets[flow] = subset
+        return subset
+
+    def pick_ev(self, seq: int, flow: FlowKey) -> tuple[int, int]:
+        """Return (plane, spine) for this packet.
+
+        Same contract as HealthAwareMrc.pick_ev — see that class for
+        the full signature rationale.
+        """
+        spines = self._spines_for_flow(flow)
+        n_planes = self._n_planes
+        # Single-shot read of the atomic weight grid reference. The
+        # refresh thread may concurrently swap _wgrid out for a new
+        # tuple; we capture our reference here and that snapshot is
+        # what the rest of this pick uses.
+        wgrid = self._wgrid
+
+        flat: list[float] = []
+        for plane in range(n_planes):
+            row = wgrid[plane]
+            for sp in spines:
+                flat.append(row[sp])
+        total = sum(flat)
+        if total <= 0:
+            n = n_planes * len(spines)
+            ev_idx = seq % n
+        else:
+            cdf = _build_cdf(tuple(flat))
+            ev_idx = _weighted_pick(seq, flow, cdf)
+        plane = ev_idx // len(spines)
+        spine = spines[ev_idx % len(spines)]
+        return plane, spine
+
+    def pick(self, seq: int, flow: FlowKey) -> int:
+        plane, _ = self.pick_ev(seq, flow)
+        return plane
+
+    # ------------------------------------------------------------------
+    # Refresh / file I/O
+    # ------------------------------------------------------------------
+
+    def _uniform_wgrid(self) -> tuple[tuple[float, ...], ...]:
+        n_planes = self._n_planes if hasattr(self, "_n_planes") \
+            else (self.topology.planes if self.topology else NUM_PLANES)
+        n_spines = self._n_spines if hasattr(self, "_n_spines") \
+            else (self.topology.spines_per_plane
+                  if self.topology else NUM_SPINES)
+        n_total = n_planes * n_spines
+        w = 1.0 / n_total if n_total > 0 else 0.0
+        return tuple(tuple(w for _ in range(n_spines))
+                     for _ in range(n_planes))
+
+    def _refresh_loop(self) -> None:
+        interval_s = self.refresh_interval_ms / 1000.0
+        while not self._stop_event.wait(interval_s):
+            self._refresh_once()
+
+    def _refresh_once(self) -> bool:
+        """Reload snapshot if mtime has advanced. Returns True iff loaded.
+
+        Public-ish (tests poke it) but not a stable API. Caller-thread
+        agnostic: safe to call from the refresh thread *or* directly
+        from a test thread.
+        """
+        with self._lock:
+            self.refresh_attempts += 1
+            try:
+                st = os.stat(self.snapshot_path)
+            except FileNotFoundError:
+                self.refresh_missing += 1
+                return False
+            except OSError:
+                self.refresh_errors += 1
+                return False
+            mtime = st.st_mtime
+            if mtime <= self._last_mtime:
+                return False
+            try:
+                with open(self.snapshot_path, "rb") as f:
+                    data = json.load(f)
+                wgrid = self._wgrid_from_snapshot(data)
+            except (OSError, json.JSONDecodeError, KeyError, ValueError,
+                    TypeError):
+                # Transient error: keep the existing grid, count the
+                # error, try again next tick.
+                self.refresh_errors += 1
+                return False
+            # Atomic swap. Tuple is immutable, so concurrent pick_ev
+            # readers either see the old grid or the new grid in full.
+            self._wgrid = wgrid
+            self._last_mtime = mtime
+            self.refresh_loaded += 1
+            return True
+
+    def _wgrid_from_snapshot(self, data: dict) -> tuple[tuple[float, ...], ...]:
+        """Convert an EVStateTable.snapshot() dict to a wgrid tuple.
+
+        Validates dimensions against this policy's topology so a
+        misaddressed snapshot file (e.g. wrong tenant or stale
+        topology) raises ValueError rather than silently producing
+        an undersized grid.
+        """
+        n_planes = int(data["num_planes"])
+        n_paths = int(data["num_paths"])
+        if n_planes != self._n_planes or n_paths != self._n_spines:
+            raise ValueError(
+                f"snapshot dimensions ({n_planes}x{n_paths}) do not "
+                f"match policy topology ({self._n_planes}x"
+                f"{self._n_spines})"
+            )
+        tenants = data.get("tenants", {})
+        if self.tenant not in tenants:
+            raise KeyError(
+                f"tenant {self.tenant!r} not in snapshot tenants "
+                f"({list(tenants.keys())})"
+            )
+        evs = tenants[self.tenant]
+        expected = n_planes * n_paths
+        if len(evs) != expected:
+            raise ValueError(
+                f"snapshot tenant {self.tenant!r} has {len(evs)} EVs, "
+                f"expected {expected}"
+            )
+        # Snapshot encodes EVs in (plane*num_paths + path) order.
+        grid: list[tuple[float, ...]] = []
+        for plane in range(n_planes):
+            row: list[float] = []
+            for path in range(n_paths):
+                rec = evs[plane * n_paths + path]
+                row.append(float(rec["weight"]))
+            grid.append(tuple(row))
+        return tuple(grid)
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    def stats(self) -> dict:
+        """Diagnostic counters for inclusion in scenario reports."""
+        with self._lock:
+            return {
+                "refresh_attempts": self.refresh_attempts,
+                "refresh_loaded": self.refresh_loaded,
+                "refresh_errors": self.refresh_errors,
+                "refresh_missing": self.refresh_missing,
+                "last_mtime": self._last_mtime,
+            }
 
 
 # --- construction from scenario YAML ---------------------------------------
