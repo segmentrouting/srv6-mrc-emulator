@@ -21,7 +21,8 @@ What we cover at this stage (step a — single-flow daemon):
        we override the daemon's _demux for the multi-flow case; for
        a single flow, the trivial demux is used).
 
-Multi-flow demux (multiple peers) is verified in step (c)'s tests.
+Multi-flow demux (multiple peers) is verified in
+test_mrc_daemon_multiflow.py (step c).
 """
 
 from __future__ import annotations
