@@ -195,6 +195,19 @@ PLANE  PATH  EV     SID
 srctl run --list
 ```
 
+Example output
+```bash
+$ srctl run --list
+green-all-to-all
+green-allreduce-ring
+green-mrc-baseline
+green-mrc-ev-spray
+yellow-all-to-all
+yellow-allreduce-ring
+yellow-mrc-baseline
+yellow-mrc-ev-spray
+```
+
 # Run one (just the scenario stem name, no .yaml):
 ```bash
 srctl run yellow-mrc-baseline
