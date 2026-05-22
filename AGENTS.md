@@ -209,6 +209,13 @@ the `srv6_mrc.topo` ↔ `spray` reference-pairs map in sync.
     receivers, same paths_per_plane=8) is unaffected. See "Things
     learned" below for the current diagnostic state.
 
+    **2026-05-20 RESOLVED** (PR #1, merged): structural cure was the
+    MRC daemon refactor + sniffer egress filter + orphan-prevention
+    teardown. Lab-verified clean on `4p-4x8` `yellow-all-to-all` over
+    4 consecutive runs (~0.1% loss steady, zero orphans between runs).
+    See "RESOLVED: SO_REUSEPORT cascade on collective scenarios" below
+    for full diagnosis and fix.
+
 ## Yellow parity — do not forget
 
 Every spray feature added for green needs a yellow counterpart in
@@ -633,12 +640,27 @@ matching scenario flow keyed to that direction. Lower priority than
 the probe-failure bug. Anycast routing was ruled out — every host
 has distinct inner addresses (`cccc::2`, `cccc:1::2`, etc).
 
+**2026-05-20 update**: PR #1 added a sniffer egress filter
+(`inner_dst == self`) which addresses the most likely contributor.
+Re-check on collective scenarios; if warnings persist they're a
+distinct issue.
+
 ### Per-plane traffic skew on small-N scenarios
 
 `select_spines_for_addrs` doesn't balance well across small flow
 counts (e.g. 16 ring pairs). See "Things learned" above. Expected
 to self-balance at all-to-all scale (240 flows); benchmark and
 confirm once the probe-failure bug is fixed.
+
+### Flaky `test_plane_loss_demotes_and_picks_shift`
+
+`tests/test_mrc_integration.py::PlaneLossShiftsDistributionTests::test_plane_loss_demotes_and_picks_shift`
+passes ~50% in isolation and in full-suite runs. Failure mode is
+"expected exactly one demoted EV; got 5" — looks like a stochastic
+ordering issue in the simulated event sequence rather than a real
+defect. Pre-existing; not introduced by PR #1 but visible now that
+the suite is otherwise clean. Worth a small follow-up before it
+masks a real regression.
 
 ### RESOLVED: Phantom EV demotions on healthy 4p-4x8 baselines
 
@@ -704,6 +726,89 @@ balanced per-plane distribution.
   the lower bound on detection latency for a hard EV failure;
   loss-window tuning should aim to match it, not beat it (cheap
   detection latency is bought with false positives, which cascade).
+
+
+### RESOLVED: SO_REUSEPORT cascade on collective scenarios
+
+**Symptom (4p-4x8 + 4p-8x16, every `health_aware_mrc` scenario where
+every host is both sender AND receiver — `*-all-to-all`,
+`*-allreduce-ring`)**: ~16 of 32 EVs per flow demoted to
+`assumed_bad` despite 0% data-plane loss; per-plane traffic spreads
+5–7×; the demote pattern was deterministic per-tenant.
+
+**Root cause was three stacked bugs**, fixed in PR #1 (merged
+2026-05-20). Same wire format, same scenario YAML — entirely a
+host-side / orchestrator-side cure.
+
+1. **SO_REUSEPORT reply misdelivery (the cascade)**.
+   When N flows on the same src_host all ran their own
+   `SenderMrcAgent`, every agent bound `(::, SPRAY_REPORT_PORT)`
+   with `SO_REUSEPORT`. The Linux kernel hashes inbound replies
+   across the bound socket set, so a probe reply destined for
+   flow A's agent gets delivered to flow B's agent ~(N−1)/N of
+   the time. B has no pending probe matching that seq → drops it
+   as unknown → A's probe times out → demote.
+   *Fix:* one MRC daemon process per src_host owns the single
+   shared reply socket and dispatches inbound replies to per-flow
+   `SenderMrcAgent` instances by peer source address (`recvfrom`
+   recovers `dst_id`). Data senders no longer run their own
+   agent; they read EV health from the daemon's snapshot file
+   `/dev/shm/srv6-mrc/<src_host>/<tenant>_<dst_id:02d>.json`
+   via the new `mrc_snapshot:<path>` policy. See
+   `docs/mrc-daemon-design.md` and `srv6_mrc/mrc/daemon.py`.
+
+2. **Sniffer egress mis-attribution**. Each receiver's per-NIC
+   sniffer listens promiscuously, so on hosts that are also
+   senders it captures *outbound* probe and data packets. When
+   `inner_dst != self`, those captured-egress packets had been
+   miscounted as "received but unexpected", inflating the orphan
+   warning counter and (worse) feeding the receiver's own loss
+   model with bogus arrivals. *Fix:* receiver precomputes its
+   own inner address and drops captures where `inner_dst != self`
+   before any further processing. New `TestSnifferEgressFilter`
+   pins this.
+
+3. **Orphan daemon accumulation across runs**. `Popen.terminate()`
+   on the local `docker exec` client does **not** propagate
+   SIGTERM through dockerd into the in-container `spray` process
+   — the exec session detaches the child from the local client's
+   signal group. Each `srctl run` therefore leaked one MRC daemon
+   per src_host. Orphans accumulated, all bound to UDP/9997 with
+   `SO_REUSEPORT`, so successive runs reproduced bug (1) at the
+   process level: only the orphan from the active run wrote
+   snapshots its own readers consumed, while N−1 orphans
+   silently swallowed reply traffic. Loss climbed monotonically
+   across consecutive identical runs (lab: 0% → 13% → 38% →
+   60% → 75%+ over 4 runs without code changes). *Fix:*
+   `mrc/run.py` daemon teardown now sends SIGTERM **inside the
+   container** via `docker_exec(host, ["pkill", "-TERM", "-x",
+   "spray"])` before draining the daemon's stdout. On
+   `TimeoutExpired`, escalates to `pkill -KILL` in-container
+   so orphans cannot survive even pathological cases. New
+   `TestMrcDaemonTeardown.test_pkill_invoked_per_daemon_host_on_teardown`
+   pins the contract.
+
+**Lab confirmation (4p-4x8)**:
+- `yellow-all-to-all` over 4 consecutive runs: per-plane loss
+  steady at ~0.05–0.30%, no run-over-run drift.
+- `docker exec yellow-host00 pgrep -x spray` returns 0 between
+  runs — zero orphan daemons.
+- tcpdump on `eth1` confirms traffic stops cleanly when `srctl
+  run` returns.
+
+**Invariants pinned by this episode**:
+- **Never bind `(::, SPRAY_REPORT_PORT)` with `SO_REUSEPORT`
+  more than once per host.** The MRC daemon is the single
+  authoritative reply-socket owner per src_host. Data senders
+  read snapshots, never bind the reply port.
+- **Subprocess SIGTERM does not cross `docker exec`.** Any
+  in-container long-lived process spawned via `docker_exec_async`
+  must be torn down with an explicit `docker exec <host> pkill
+  -TERM -x <name>`. `Popen.terminate()` alone leaks orphans.
+- **Sniffer-based receivers must filter on `inner_dst == self`**
+  on hosts that are also senders, before any accounting. Egress
+  capture is unavoidable (promiscuous sockets) but trivially
+  filterable once you know your own address.
 
 
 
