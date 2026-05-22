@@ -50,7 +50,7 @@ class TestGetTopology(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("planes:", out)
         self.assertIn("tenants:", out)
-        # The 4p-8x16 default has these dimensions:
+        # Test suite pins SRV6_TOPO=4p-8x16 via tests/__init__.py:
         self.assertIn("4", out)  # planes
         self.assertIn("8", out)  # spines
 
@@ -172,7 +172,7 @@ class TestRun(unittest.TestCase):
         rc, out, _ = _run(["run", "--list"])
         self.assertEqual(rc, 0)
         # At least the canonical green-mrc-baseline scenario should be
-        # listed for the 4p-8x16 default topology.
+        # listed; test suite pins SRV6_TOPO=4p-8x16 via tests/__init__.py.
         self.assertIn("green-mrc-baseline", out)
         self.assertIn("yellow-mrc-ev-spray", out)
 

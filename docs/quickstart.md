@@ -32,7 +32,7 @@ cd ./srv6-mrc-emulator
 make image
 # equivalent to:
 docker build -f host-image/Dockerfile \
-             --build-arg TOPO=topologies/4p-8x16/topo.yaml \
+             --build-arg TOPO=topologies/4p-4x8/topo.yaml \
              -t alpine-srv6-scapy:1.0 .
 ```
 
@@ -40,15 +40,15 @@ docker build -f host-image/Dockerfile \
 ```bash
 make deploy
 # equivalent to:
-sudo clab deploy -t topologies/4p-8x16/topology.clab.yaml
+sudo clab deploy -t topologies/4p-4x8/topology.clab.yaml
 
 # other topologies
 make TOPO=2p-4x8 deploy
 
-make TOPO=4p-4x8 deploy
+make TOPO=4p-8x16 deploy
 ```
 
-3. Run `make config` to apply sonic *`config_db.json`* and *`frr.conf`* configs to each device (under `topologies/4p-8x16/config/`)
+3. Run `make config` to apply sonic *`config_db.json`* and *`frr.conf`* configs to each device (under `topologies/4p-4x8/config/`)
 ```bash
 make config
 # equivalent to:
@@ -57,11 +57,13 @@ scripts/config.sh all
 # other topologies
 make TOPO=2p-4x8 config
 
-make TOPO=4p-4x8 config
+make TOPO=4p-8x16 config
 ```
 
-It will take a couple minutes for the script to run through all 96 routers.
-Once it has completed you should see output something like this:
+It will take a minute or two for the script to run through the
+fabric routers (32 on the default 4p-4x8, 96 on 4p-8x16). The banner
+and output below is from a 4p-8x16 deploy; on 4p-4x8 the numbers and
+topology name change but the structure is the same:
 
 ```bash
 ============================================================
@@ -81,17 +83,23 @@ Deploy complete!
 ```bash
 make host-routes
 # equivalent to:
-routes apply -f topologies/4p-8x16/routes/full-mesh.yaml
+routes apply -f topologies/4p-4x8/routes/full-mesh.yaml
 
 # other topologies
 make TOPO=2p-4x8 host-routes
 
-make TOPO=4p-4x8 host-routes
+make TOPO=4p-8x16 host-routes
 ```
 
 ### Quick test - Tenant Green - Host SRv6 Encap, Egress Leaf SRv6 uDT
 > [!Note]
 > The host-routes script sets metrics such that ping tests will default to fabric plane-0
+>
+> The walkthrough below uses `green-host15` as the destination, which
+> only exists on the 4p-8x16 reference design (`make TOPO=4p-8x16
+> deploy && make TOPO=4p-8x16 config && make TOPO=4p-8x16 host-routes`).
+> On the default 4p-4x8 substitute `green-host07` and inner DA
+> `2001:db8:bbbb:7::2`.
 
 1. Run a ping from *`green-host00`* to *`green-host15`*
 ```bash

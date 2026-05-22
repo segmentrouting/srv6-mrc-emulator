@@ -76,8 +76,9 @@ generators/
                        writes topology.clab.yaml + config/
 
 topologies/
-  4p-8x16/             4 planes × 8 spines × 16 leaves (default)
-  2p-4x8/              2 planes × 4 spines × 8 leaves  (smaller variant)
+  4p-4x8/              4 planes × 4 spines × 8 leaves  (default; mid-size dev)
+  4p-8x16/             4 planes × 8 spines × 16 leaves (full-scale reference)
+  2p-4x8/              2 planes × 4 spines × 8 leaves  (smallest variant)
     topo.yaml          single source of truth for this variant
     topology.clab.yaml containerlab topology (generated)
     config/            per-node SONiC + FRR configs   (generated)

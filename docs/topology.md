@@ -11,8 +11,8 @@ between them per command.
 | Name | Planes | Spines/plane | Leaves/plane | Containers | Use case |
 |---|---|---|---|---|---|
 | `2p-4x8` | 2 | 4 | 8 | 16 fabric + 16 hosts | smallest; laptop iteration |
-| `4p-4x8` | 4 | 4 | 8 | 32 fabric + 16 hosts | mid-size; paper-faithful 4 planes |
-| `4p-8x16` | 4 | 8 | 16 | 96 fabric + 32 hosts | reference design |
+| `4p-4x8` | 4 | 4 | 8 | 32 fabric + 16 hosts | **default**; mid-size, paper-faithful 4 planes |
+| `4p-8x16` | 4 | 8 | 16 | 96 fabric + 32 hosts | full-scale reference design |
 
 The 2-plane variant deviates from the MRC paper (which specifies 4 or 8
 planes); use it only for fast smoke-testing of code changes.

@@ -5,15 +5,17 @@ plane/spine/leaf counts, tenant names, NIC ordinals, address blocks,
 reference-pair spine assignments, and SID-list construction.
 
 The constants are loaded at import time from a topo.yaml file. By
-default that's `topologies/4p-8x16/topo.yaml` relative to the repo
-root; override via the `SRV6_TOPO` environment variable to drive a
+default that's `topologies/4p-4x8/topo.yaml` relative to the repo
+root (a mid-size dev variant; 4p-8x16 is the full-scale reference
+design and remains available via SRV6_TOPO or `make TOPO=4p-8x16`).
+Override via the `SRV6_TOPO` environment variable to drive a
 different topology. CLI tools running inside lab host containers have
 SRV6_TOPO pre-set by the host-image entrypoint to the bind-mounted
 topo.yaml.
 
 If you change a fabric constant here, change it in `topo.yaml` (not
-this file). For documentation of the YAML schema see
-`topologies/4p-8x16/topo.yaml` itself; for the design rationale of
+this file). For documentation of the YAML schema see any of the
+`topologies/<name>/topo.yaml` files; for the design rationale of
 the address scheme see `docs/topologies/<name>.md`.
 """
 
@@ -27,10 +29,13 @@ from pathlib import Path
 # --- topology loader --------------------------------------------------------
 
 def _find_default_topo_yaml() -> Path:
-    """Locate topologies/4p-8x16/topo.yaml relative to this file.
+    """Locate topologies/4p-4x8/topo.yaml relative to this file.
 
     srv6_mrc/topo.py is at <root>/srv6_mrc/topo.py, so the default
-    topology is two levels up + topologies/4p-8x16/topo.yaml.
+    topology is two levels up + topologies/4p-4x8/topo.yaml. 4p-4x8
+    is a mid-size dev variant (4 planes * 4 spines * 8 leaves);
+    4p-8x16 is the full-scale reference design and is selectable via
+    SRV6_TOPO or `make TOPO=4p-8x16`.
 
     NOTE: This is a static fallback for dev/test environments without
     a live lab. CLI entrypoints (`srv6_mrc.mrc.run`, `srv6_mrc.cli.srctl`)
@@ -38,7 +43,7 @@ def _find_default_topo_yaml() -> Path:
     drives module-level constants like NUM_LEAVES.
     """
     here = Path(__file__).resolve()
-    return here.parent.parent / "topologies" / "4p-8x16" / "topo.yaml"
+    return here.parent.parent / "topologies" / "4p-4x8" / "topo.yaml"
 
 
 def _load_topo() -> dict:
@@ -46,9 +51,9 @@ def _load_topo() -> dict:
 
     Order of precedence:
       1. $SRV6_TOPO (must point at a topo.yaml file)
-      2. <repo>/topologies/4p-8x16/topo.yaml (development default)
+      2. <repo>/topologies/4p-4x8/topo.yaml (development default)
 
-    Falls back to a hardcoded 4p-8x16 dict if neither file is reachable
+    Falls back to a hardcoded 4p-4x8 dict if neither file is reachable
     AND yaml is missing — keeps `import srv6_mrc.topo` working in
     truly minimal environments (e.g., schema-only tooling).
     """
@@ -63,16 +68,16 @@ def _load_topo() -> dict:
         # Hardcoded fallback so tests can import without yaml installed
         # and without the file present (e.g., CI bare-clone scenarios).
         return {
-            "name": "4p-8x16",
+            "name": "4p-4x8",
             "planes": 4,
-            "spines_per_plane": 8,
-            "leaves_per_plane": 16,
+            "spines_per_plane": 4,
+            "leaves_per_plane": 8,
             "tenants": ["green", "yellow"],
             "images": {
                 "sonic": "docker-sonic-vs:latest",
                 "host": "alpine-srv6-scapy:1.0",
             },
-            "clab": {"topology_name": "sonic-docker-4p-8x16"},
+            "clab": {"topology_name": "sonic-docker-4p-4x8"},
         }
 
 
@@ -126,7 +131,7 @@ NUM_LEAVES: int = _TOPO["leaves_per_plane"]            # also = hosts per tenant
 # running with the (recommended) `prefix: ""` setting and the short name
 # isn't resolvable.
 CLAB_TOPOLOGY_NAME: str = _TOPO.get("clab", {}).get(
-    "topology_name", "sonic-docker-4p-8x16"
+    "topology_name", "sonic-docker-4p-4x8"
 )
 
 TENANTS: tuple[str, ...] = tuple(_TOPO["tenants"])

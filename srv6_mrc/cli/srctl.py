@@ -205,7 +205,7 @@ def _active_topo_dir() -> Path | None:
 
     Order of precedence mirrors srv6_mrc.topo._load_topo:
       1. $SRV6_TOPO/.. (parent of the topo.yaml file)
-      2. <repo>/topologies/4p-8x16/ (development default)
+      2. <repo>/topologies/4p-4x8/ (development default)
 
     Returns None if neither path resolves to a directory; callers must
     handle (e.g., `srctl run --list` falls back to a clear error).
@@ -215,7 +215,7 @@ def _active_topo_dir() -> Path | None:
         p = Path(env).resolve().parent
         return p if p.is_dir() else None
     here = Path(__file__).resolve()
-    p = here.parent.parent.parent / "topologies" / "4p-8x16"
+    p = here.parent.parent.parent / "topologies" / "4p-4x8"
     return p if p.is_dir() else None
 
 

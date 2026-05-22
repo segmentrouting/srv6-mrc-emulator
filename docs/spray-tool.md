@@ -6,14 +6,14 @@ The tool has two roles, sender and receiver. Run the receiver first, then the se
 
 Green:
 ```
-docker exec -it green-host15 spray --role recv
-docker exec -it green-host00 spray --role send --dst-id 15 --rate 1000pps --duration 5s
+docker exec -it green-host07 spray --role recv
+docker exec -it green-host00 spray --role send --dst-id 7 --rate 1000pps --duration 5s
 ```
 
-Yellow (precondition: `make host-routes` — or `routes apply -f topologies/4p-8x16/routes/full-mesh.yaml` — to install the per-NIC `seg6local End.DT6` policies on yellow hosts):
+Yellow (precondition: `make host-routes` — or `routes apply -f topologies/4p-4x8/routes/full-mesh.yaml` — to install the per-NIC `seg6local End.DT6` policies on yellow hosts):
 ```
-docker exec -it yellow-host15 spray --role recv
-docker exec -it yellow-host00 spray --role send --dst-id 15 --rate 1000pps --duration 5s
+docker exec -it yellow-host07 spray --role recv
+docker exec -it yellow-host00 spray --role send --dst-id 7 --rate 1000pps --duration 5s
 ```
 
 The `spray` CLI is pip-installed inside the host image (see `host-image/Dockerfile`); it lives at `/usr/local/bin/spray`. The image also bakes the topology descriptor at `/etc/srv6_mrc/topo.yaml` and exports `SRV6_TOPO` pointing at it. Rebuild the image when the package or topo.yaml changes; no bind mounts are required at runtime.
@@ -120,6 +120,13 @@ A healthy lab gives:
 
 ## Spot-checking the wire
 
+The tcpdump walkthrough below uses `host15` as the destination, which
+only exists on the 4p-8x16 reference design. To follow along, deploy
+4p-8x16 (`make TOPO=4p-8x16 deploy && make TOPO=4p-8x16 config &&
+make TOPO=4p-8x16 host-routes`). On the default 4p-4x8, substitute
+`host07` for `host15` and adjust the SID-list hextets accordingly
+(spine subscript runs 0..3 instead of 0..7).
+
 Run `spray` at a low rate so you can read tcpdump in another terminal:
 
 ```bash
@@ -173,7 +180,7 @@ The receiver itself prints a one-shot diagnostic on the first encapped frame so 
 
 ```
 --role send|recv              required
---dst-id N                    (send) destination host id 0..15
+--dst-id N                    (send) destination host id (range depends on topology: 0..7 on 4p-4x8, 0..15 on 4p-8x16)
 --rate Npps | N               (send) packets/sec, default 1000pps
 --duration Ns | Nms | 0       (send) default 5s; 0 = run until ^C
 --policy SPEC                 (send) plane / EV selection policy;
@@ -210,7 +217,8 @@ The sender infers its own tenant + id from the container hostname (`green-host00
 - `weighted:30,30,20,20` — biased random; sum need not be 100.
 - `ev_spray[:N]` — rotates BOTH plane and spine per packet, so a
   single flow walks `4 × N` distinct `(plane, path)` EVs. `N` defaults
-  to `NUM_SPINES` (8 on 4p-8x16); set lower to constrain the spine
+  to `NUM_SPINES` (4 on the default 4p-4x8, 8 on 4p-8x16); set lower
+  to constrain the spine
   subset per (src, dst) pair.
 - `health_aware_mrc` — same per-packet rotation as `ev_spray`, but
   weights are driven by the EV state machine. Reads `EVStateTable`

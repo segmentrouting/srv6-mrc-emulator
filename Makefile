@@ -1,6 +1,6 @@
 # Makefile for srv6_mrc
 #
-# Convention: every target operates on a single TOPO (default 4p-8x16).
+# Convention: every target operates on a single TOPO (default 4p-4x8).
 # Override with `make TOPO=<name> <target>`; the topology directory is
 # expected at topologies/<TOPO>/ with a topo.yaml in it.
 #
@@ -17,7 +17,7 @@
 #   make scenario SCEN=green-mrc-baseline   run an MRC scenario from topologies/<TOPO>/scenarios/
 #   make help       this message
 
-TOPO ?= 4p-8x16
+TOPO ?= 4p-4x8
 TOPO_DIR := topologies/$(TOPO)
 TOPO_YAML := $(TOPO_DIR)/topo.yaml
 CLAB_YAML := $(TOPO_DIR)/topology.clab.yaml

@@ -83,14 +83,14 @@ import json
 from pathlib import Path
 
 # Module-level constants populated from topo.yaml in main(). Default
-# values (4p-8x16) are set here so a bare `import generators.fabric`
+# values (4p-4x8) are set here so a bare `import generators.fabric`
 # in tests or REPL still works; main() overrides them from the YAML
 # before any write_* function runs.
 NUM_PLANES = 4
-NUM_SPINES = 8
-NUM_LEAVES = 16
+NUM_SPINES = 4
+NUM_LEAVES = 8
 
-TOPOLOGY_NAME = "sonic-docker-4p-8x16"
+TOPOLOGY_NAME = "sonic-docker-4p-4x8"
 SONIC_IMAGE = "docker-sonic-vs:latest"
 HOST_IMAGE = "alpine-srv6-scapy:1.0"
 
@@ -99,7 +99,7 @@ HOST_IMAGE = "alpine-srv6-scapy:1.0"
 # is the SONiC PORT-table reference (committed under the same tree).
 SCRIPT_DIR = Path(__file__).resolve().parent       # generators/
 REPO_ROOT = SCRIPT_DIR.parent                       # repo root
-TOPO_DIR: Path = REPO_ROOT / "topologies" / "4p-8x16"
+TOPO_DIR: Path = REPO_ROOT / "topologies" / "4p-4x8"
 CONFIG_DIR: Path = TOPO_DIR / "config"
 REF_LEAF_CONFIG: Path = CONFIG_DIR / "p0-leaf00" / "config_db.json"
 
@@ -793,8 +793,8 @@ def main() -> None:
     ap.add_argument(
         "--topo",
         type=Path,
-        default=REPO_ROOT / "topologies" / "4p-8x16" / "topo.yaml",
-        help="Path to topo.yaml (default: topologies/4p-8x16/topo.yaml)",
+        default=REPO_ROOT / "topologies" / "4p-4x8" / "topo.yaml",
+        help="Path to topo.yaml (default: topologies/4p-4x8/topo.yaml)",
     )
     args = ap.parse_args()
 

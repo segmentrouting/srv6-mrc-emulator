@@ -1,0 +1,34 @@
+# green-ev-spray.yaml — EV-spray: vary BOTH plane and spine per packet.
+#
+# Phase 1b step 1 baseline (no MRC). Each packet's outer DA rotates
+# through 4 planes * paths_per_plane spines = 4 * paths_per_plane EVs.
+# On 4p-4x8 with paths_per_plane=4 (the default = NUM_SPINES), this
+# fans out across all 16 leaf-spine paths.
+#
+# What to look for:
+#   - per_plane_sent: balanced (round-robin still rotates planes fastest)
+#   - per_ev_sent:    balanced across all (plane, spine) keys
+#   - On the wire:    outer DA's `f<S>` hextet rotates packet-by-packet;
+#                     tcpdump on a leaf eth1..eth4 shows multiple
+#                     `fc00:000X:f00Y:...` values with Y ranging 0..3.
+#
+# Run:
+#   sudo make scenario SCEN=green-ev-spray
+name: green-ev-spray
+description: |
+  EV-spray across 4 spines * 4 planes (16 EVs per pair). Validates the
+  data-path's per-packet outer-DA rotation. No faults — this is the
+  EV-spray baseline.
+
+paths_per_plane: 4
+
+flows:
+  - pairs: green-pairs
+    policy: ev_spray
+    rate: 500pps
+    duration: 5s
+
+faults: []
+
+report:
+  out: results/green-ev-spray.json

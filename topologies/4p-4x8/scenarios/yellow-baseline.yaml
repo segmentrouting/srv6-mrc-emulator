@@ -1,0 +1,43 @@
+# yellow-baseline.yaml — clean fabric, round-robin spray across 4 planes,
+# yellow tenant.
+#
+# Counterpart to green-mrc-baseline.yaml (with policy=round_robin instead
+# of health_aware_mrc) and to the 4p-8x16 yellow-baseline scenario.
+# Yellow exercises a meaningfully different data path: decap happens on
+# the destination *host* via a per-NIC `seg6local End.DT6 table 0`
+# policy (installed by `make host-routes`). Phase 1a: yellow mirrors
+# green's anycast addressing exactly with `bbbb`->`cccc` — the inner DA
+# is anycast `2001:db8:cccc:<NN>::2`, configured `nodad` on all 4 NICs
+# *and* on `lo`. The address-plan symmetry means the only remaining
+# tenant-distinguishing feature on the wire is the SID list: yellow's
+# outer DA carries one extra segment compared to green (the host-decap
+# SID `...:d001::`).
+#
+# Prerequisites:
+#   make host-routes   # installs the per-NIC End.DT6 policies on yellow hosts
+#
+# Run:
+#   make scenario SCEN=yellow-baseline
+#
+# Expected: behavior comparable to green baseline -- near-zero loss,
+# balanced per-plane counts. Reorder may differ slightly because the
+# extra decap stage runs in software on each yellow host (not in
+# kernel-fastpath through Vrf-green's connected route as in green).
+name: yellow-baseline
+description: |
+  All 4 planes healthy, round-robin spray over the well-known yellow
+  leaf pairs (auto-sized: 4 pairs on 4p-4x8), yellow tenant (host-side
+  seg6local End.DT6 decap). Sanity check that the fabric, sprayer,
+  receiver, and per-NIC End.DT6 policies all agree on the yellow wire
+  format.
+
+flows:
+  - pairs: yellow-pairs
+    policy: round_robin
+    rate: 1000pps
+    duration: 5s
+
+faults: []
+
+report:
+  out: results/yellow-baseline.json

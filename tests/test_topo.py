@@ -3,6 +3,46 @@ import unittest
 from srv6_mrc import topo
 
 
+class TestPackageDefaultTopology(unittest.TestCase):
+    """Exercise the no-SRV6_TOPO-set code path.
+
+    The rest of the suite pins SRV6_TOPO=4p-8x16 via tests/__init__.py
+    (most assertions depend on that surface). This class is the lone
+    regression rail for the package's actual default — 4p-4x8. If
+    `_find_default_topo_yaml` or the hardcoded fallback dict ever
+    drifts away from 4p-4x8, these tests catch it.
+    """
+
+    def _subprocess_load(self):
+        import subprocess, sys, json, os
+        # Forward PATH only; explicitly unset SRV6_TOPO so the subprocess
+        # exercises the default-selection path. PYTHONPATH inherited
+        # from the parent runner is also forwarded so srv6_mrc is
+        # importable.
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": os.environ.get("PYTHONPATH", "."),
+        }
+        out = subprocess.check_output([
+            sys.executable, "-c",
+            "import json; from srv6_mrc import topo; "
+            "print(json.dumps({"
+            "'planes': topo.NUM_PLANES, "
+            "'spines': topo.NUM_SPINES, "
+            "'leaves': topo.NUM_LEAVES, "
+            "'clab': topo.CLAB_TOPOLOGY_NAME"
+            "}))"
+        ], env=env)
+        return json.loads(out)
+
+    def test_default_is_4p_4x8(self):
+        d = self._subprocess_load()
+        self.assertEqual(d["planes"], 4)
+        self.assertEqual(d["spines"], 4)
+        self.assertEqual(d["leaves"], 8)
+        self.assertEqual(d["clab"], "sonic-docker-4p-4x8")
+
+
 class TestTopoConstants(unittest.TestCase):
     def test_fabric_shape(self):
         self.assertEqual(topo.NUM_PLANES, 4)
@@ -423,19 +463,27 @@ class TestSelectSpinesForAddrs(unittest.TestCase):
         # different sender processes. select_spines_for_addrs must NOT
         # depend on hash(): the FNV mixer should give a value derived
         # purely from the address byte string.
-        import subprocess, sys, json
+        import subprocess, sys, json, os
         # Compute locally.
         local = topo.select_spines_for_addrs(
             "2001:db8:bbbb::2", "2001:db8:bbbb:f::2", 4
         )
         # Compute in a subprocess with a different PYTHONHASHSEED.
+        # Forward SRV6_TOPO so the subprocess loads the same topology
+        # as the parent (tests/__init__.py pins 4p-8x16); otherwise the
+        # subprocess falls back to the package default (4p-4x8) and
+        # NUM_SPINES differs across the two runs.
         out = subprocess.check_output([
             sys.executable, "-c",
             "from srv6_mrc.topo import select_spines_for_addrs; "
             "import json; "
             "print(json.dumps(list(select_spines_for_addrs("
             "'2001:db8:bbbb::2','2001:db8:bbbb:f::2',4))))"
-        ], env={"PYTHONHASHSEED": "12345"})
+        ], env={
+            "PYTHONHASHSEED": "12345",
+            "SRV6_TOPO": os.environ.get("SRV6_TOPO", ""),
+            "PATH": os.environ.get("PATH", ""),
+        })
         sub = tuple(json.loads(out))
         self.assertEqual(local, sub,
                          "select_spines_for_addrs varies with "

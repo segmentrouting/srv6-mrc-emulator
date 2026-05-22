@@ -1,0 +1,39 @@
+# green-mrc-plane-latency.yaml — 10ms latency on plane 3, health_aware_mrc.
+#
+# Question: does the EV state machine react to *latency* alone?
+#
+# Today: it does not directly. Latency without loss leaves
+# loss_window_ms reports clean and probe replies still arrive (just
+# slower), so plane 3 stays UNKNOWN/GOOD. The RTT samples land in the
+# rtt_ring but the policy doesn't weight on RTT yet. Expected outcome:
+# reorder histogram comparable to a baseline run with the same delay.
+#
+# This scenario exists to document that gap and give us a regression
+# fixture when RTT-aware weighting lands.
+#
+# Run:
+#   make scenario SCEN=green-mrc-plane-latency
+
+name: green-mrc-plane-latency
+description: |
+  10ms extra latency on plane 3 of green-host00's uplink, health_aware_mrc
+  spray. Current MRC build reacts to loss + probe loss, not RTT, so we
+  expect all planes to stay GOOD. Reserved as a regression fixture for
+  future RTT-aware weighting.
+
+flows:
+  - pairs:
+      - { tenant: green, src: 0, dst: 7 }
+    policy: health_aware_mrc
+    rate: 500pps
+    duration: 6s
+
+faults:
+  - kind: netem
+    target: host green-host00 plane 3
+    spec: delay 10ms
+
+mrc: {}
+
+report:
+  out: results/green-mrc-plane-latency.json

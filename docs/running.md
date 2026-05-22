@@ -9,7 +9,7 @@ already deployed and configured  (`make deploy && make config`).
 #### Baseline
 
 ```bash
-run-scenario topologies/4p-8x16/scenarios/green-mrc-baseline.yaml \
+run-scenario topologies/4p-4x8/scenarios/green-mrc-baseline.yaml \
     --report results/green-mrc-baseline.json
 # or:
 make scenario SCEN=green-mrc-baseline
@@ -19,7 +19,7 @@ Scenarios that inject faults need `sudo` because `tc netem` is applied
 via `nsenter` into container network namespaces:
 
 ```bash
-sudo run-scenario topologies/4p-8x16/scenarios/green-mrc-plane-loss.yaml \
+sudo run-scenario topologies/4p-4x8/scenarios/green-mrc-plane-loss.yaml \
     --report results/plane-loss.json
 ```
 
@@ -27,7 +27,7 @@ The orchestrator always reverts netem in a `finally` block. Verify
 between runs:
 
 ```bash
-for h in green-host00 green-host15; do
+for h in green-host00 green-host07; do
   echo "=== $h ==="
   for nic in eth1 eth2 eth3 eth4; do
     docker exec $h tc qdisc show dev $nic
@@ -44,7 +44,10 @@ docker exec <host> tc qdisc del dev <nic> root
 
 ## Bundled scenarios
 
-All scenarios live in `topologies/4p-8x16/scenarios/`. They split into
+All scenarios live in `topologies/4p-4x8/scenarios/` for the default
+4p-4x8 topology (and `topologies/4p-8x16/scenarios/` for the full-
+scale reference design — the path differs but the scenario names are
+identical). They split into
 five families based on what part of the system they exercise; the
 "Spray policy" column is the key axis (it picks how packets fan out;
 everything else is window-dressing on top).
@@ -119,8 +122,8 @@ netem specs.
 The `ev_spray` policy varies BOTH plane and spine per packet — every
 packet gets a new outer SID rotation, so a single flow walks `4 * N`
 distinct leaf-to-spine paths (entropy values, EVs) where `N` is
-`paths_per_plane`. Default `N = NUM_SPINES` (8 on the 4p-8x16
-topology).
+`paths_per_plane`. Default `N = NUM_SPINES` (4 on the default 4p-4x8
+topology, 8 on the full-scale 4p-8x16 reference design).
 
 Two ways to enable it:
 
@@ -222,7 +225,7 @@ NICs on that host), or both together (one specific NIC).
 MRC is opt-in: a scenario YAML enables it by including a top-level
 `mrc:` block (even an empty one), and the senders use it by selecting
 `policy: health_aware_mrc`. The lab-validated MRC scenarios under
-`topologies/4p-8x16/scenarios/`:
+`topologies/4p-4x8/scenarios/`:
 
 | Scenario | Fault | Expect |
 |---|---|---|
@@ -238,7 +241,7 @@ MRC is opt-in: a scenario YAML enables it by including a top-level
 Run them like any other scenario:
 
 ```bash
-sudo run-scenario topologies/4p-8x16/scenarios/green-mrc-plane-loss.yaml \
+sudo run-scenario topologies/4p-4x8/scenarios/green-mrc-plane-loss.yaml \
     --report results/green-mrc-plane-loss.json
 # or:
 make scenario SCEN=green-mrc-plane-loss
@@ -325,7 +328,7 @@ through these in order — each step gates the next:
 4. Manual two-host spray (above) — fabric carries packets
 5. Same with `--json` — receiver schema parses
 6. Same with `--policy hash5tuple` — policy plumbing works
-7. `run-scenario topologies/4p-8x16/scenarios/green-mrc-baseline.yaml --dry-run`
+7. `run-scenario topologies/4p-4x8/scenarios/green-mrc-baseline.yaml --dry-run`
    — scenario parses
 8. `make scenario SCEN=green-mrc-baseline` — orchestrator + merge + render pipeline works
 9. Three fault scenarios in order — netem inject + revert works

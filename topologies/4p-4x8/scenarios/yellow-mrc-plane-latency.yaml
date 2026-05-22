@@ -1,0 +1,43 @@
+# yellow-mrc-plane-latency.yaml — 10ms latency on plane 3,
+# health_aware_mrc, yellow tenant.
+#
+# Yellow counterpart to green-mrc-plane-latency.yaml. Same design
+# question: does the EV state machine react to latency alone? Same
+# answer: it does not, by current design. MRC consumes loss + probe
+# loss; pure latency leaves loss windows clean and probe replies
+# arrive (slower, but successfully), so all planes stay GOOD.
+#
+# Sanity also checks that the yellow data path produces equivalent
+# latency behavior to green under the same netem rule — host-side
+# End.DT6 decap onto lo shouldn't introduce its own timing asymmetries
+# that would mask the injected delay.
+#
+# Prerequisites:
+#   make host-routes   # installs host-side End.DT6 policies on yellow hosts
+#
+# Run:
+#   make scenario SCEN=yellow-mrc-plane-latency
+
+name: yellow-mrc-plane-latency
+description: |
+  10ms extra latency on plane 3 of yellow-host00's uplink, health_aware_mrc
+  spray. Current MRC build reacts to loss + probe loss, not RTT, so we
+  expect uniform per-plane spray, all planes GOOD, and elevated plane-3
+  RTT visible in the EV-state diagnostics.
+
+flows:
+  - pairs:
+      - { tenant: yellow, src: 0, dst: 7 }
+    policy: health_aware_mrc
+    rate: 500pps
+    duration: 6s
+
+faults:
+  - kind: netem
+    target: host yellow-host00 plane 3
+    spec: delay 10ms
+
+mrc: {}
+
+report:
+  out: results/yellow-mrc-plane-latency.json

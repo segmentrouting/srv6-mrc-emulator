@@ -73,7 +73,7 @@ def _infer_srv6_topo_from_argv(argv: list[str]) -> str | None:
     topologies/2p-4x8/routes/full-mesh.yaml` automatically run against the
     2p-4x8 topology even if the operator forgot to export $SRV6_TOPO on
     the deploy host. Without this, srv6_mrc.topo falls back to the
-    default (4p-8x16) and the route generator iterates the wrong number
+    default (4p-4x8) and the route generator iterates the wrong number
     of planes, attempting `eth3`/`eth4` on hosts that only have
     `eth1`/`eth2` and producing hundreds of spurious failures.
 
