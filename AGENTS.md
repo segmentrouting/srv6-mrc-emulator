@@ -822,6 +822,23 @@ host-side / orchestrator-side cure.
   cat`. The MRC daemon does this for `final_report.json`; the
   orchestrator falls back to stdout only for back-compat with
   pre-fix daemon images.
+- **`docker exec cat` immediately after the previous exec
+  session ends can transiently return rc=1.** Even when the file
+  exists (confirmed post-hoc via `ls -la` showing the file with a
+  timestamp matching the run), a fresh `docker exec <host> cat
+  /path` issued within microseconds of the previous exec session
+  terminating can fail with "no such file or directory". Working
+  theory is dockerd exec-session teardown overlapping with the
+  new exec session — the mount-namespace view is briefly
+  inconsistent. Cure: retry up to 3 times with a small backoff
+  (100ms suffices; the race clears within hundreds of
+  microseconds in practice). The orchestrator's daemon teardown
+  uses this pattern; any new code that does back-to-back
+  `docker_exec_async` → drain → `docker_exec(cat ...)` on the
+  same container should do the same. The failure-mode message
+  on retry exhaustion includes the cat command's stderr so a
+  real "file truly never written" bug is distinguishable from
+  a stuck race.
 
 
 

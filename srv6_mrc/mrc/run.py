@@ -612,6 +612,19 @@ def run_flows(flows: list[FlowRun], *,
             # container exit. The daemon writes the report to
             # /dev/shm/srv6-mrc/<src_host>/final_report.json BEFORE
             # exiting; we cat it back here via a second docker exec.
+            #
+            # Retry with backoff: empirically the first cat sometimes
+            # returns rc=1 ("no such file") even though the daemon DID
+            # write the file (confirmed post-hoc via ls -la). The
+            # working theory is a dockerd exec-session teardown race —
+            # the new exec session for `cat` overlaps with dockerd's
+            # internal cleanup of the daemon's exec session and the
+            # mount-namespace view is briefly inconsistent. A small
+            # backoff cures it without masking real "file truly never
+            # written" failures: after 3 attempts we give up and
+            # report the last-attempt stderr so the operator can tell
+            # the race apart from a real daemon-side bug.
+            #
             # Stdout is retained as a fallback for back-compat with
             # any in-container image still on the pre-fix daemon
             # (it would have empty/garbage on-disk).
@@ -619,10 +632,21 @@ def run_flows(flows: list[FlowRun], *,
             file_path = (
                 f"/dev/shm/srv6-mrc/{src_host}/final_report.json"
             )
-            cat_res = docker_exec(
-                src_host, ["cat", file_path], timeout_s=5.0,
-            )
-            if cat_res.rc == 0 and cat_res.stdout.strip():
+            cat_res = None
+            for attempt in range(3):
+                cat_res = docker_exec(
+                    src_host, ["cat", file_path], timeout_s=5.0,
+                )
+                if cat_res.rc == 0 and cat_res.stdout.strip():
+                    break
+                # Brief backoff — see comment above. 100ms is far more
+                # than dockerd's exec teardown typically needs; staying
+                # short keeps total teardown time bounded if the file
+                # really is missing (3 * 100ms == 0.3s max wait).
+                if attempt < 2:
+                    time.sleep(0.1)
+
+            if cat_res and cat_res.rc == 0 and cat_res.stdout.strip():
                 try:
                     record = json.loads(cat_res.stdout)
                 except json.JSONDecodeError as e:
@@ -635,18 +659,24 @@ def run_flows(flows: list[FlowRun], *,
                 # Fall back to stdout for older daemon images.
                 line = out.strip()
                 if not line:
+                    cat_stderr = (
+                        cat_res.stderr.strip()[:200] if cat_res else ""
+                    )
+                    cat_rc = cat_res.rc if cat_res else "?"
                     daemon_failures.append(
                         f"daemon on {src_host}: no final report "
-                        f"(file rc={cat_res.rc}, stdout empty, "
-                        f"daemon rc={proc.returncode})"
+                        f"(file rc={cat_rc} after 3 attempts, "
+                        f"cat stderr={cat_stderr!r}, "
+                        f"stdout empty, daemon rc={proc.returncode})"
                     )
                     continue
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError as e:
+                    cat_rc = cat_res.rc if cat_res else "?"
                     daemon_failures.append(
                         f"daemon on {src_host} bad JSON in stdout "
-                        f"(file rc={cat_res.rc} also failed): {e}: "
+                        f"(file rc={cat_rc} also failed): {e}: "
                         f"stdout={line[:200]!r}"
                     )
                     continue

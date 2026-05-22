@@ -597,6 +597,131 @@ class TestMrcDaemonTeardown(unittest.TestCase):
         self.assertIn("file rc=", stderr_writes)
         self.assertIn("stdout empty", stderr_writes)
 
+    def test_final_report_cat_retries_on_transient_rc1(self):
+        # Lab-observed race: a fresh `docker exec cat` for
+        # /dev/shm/srv6-mrc/<host>/final_report.json sometimes returns
+        # rc=1 ("no such file") even though the daemon DID write the
+        # file (confirmed post-hoc via `ls -la` showing the file with
+        # a timestamp matching the run). Working theory is dockerd
+        # exec-session teardown overlapping with the new exec session;
+        # the file becomes visible on a brief retry. Pin the contract:
+        # orchestrator retries up to 3 times with a small backoff and
+        # merges the record on success WITHOUT surfacing a
+        # daemon_failures warning.
+        flows = self._mrc_flow()
+        # Daemon stdout is intentionally empty — the real lab symptom
+        # is "file present on disk + stdout empty + cat racing the
+        # write". If retry doesn't work, this test falls into the
+        # "no final report" failure path and fails loud.
+        daemon_proc = _FakeDaemonPopen(stdout="")
+
+        cat_attempts = {"count": 0}
+
+        def fake_async(container, argv, *, env=None):
+            if "mrc-daemon" in argv:
+                return daemon_proc
+            return _FakePopen(stdout=_ok_receiver_json())
+
+        def fake_exec(container, argv, *, timeout_s=None, env=None):
+            if argv and argv[0] == "pkill":
+                return mock.Mock(rc=0, stdout="", stderr="",
+                                 cmd=[], elapsed_s=0.01)
+            if argv and argv[0] == "cat":
+                cat_attempts["count"] += 1
+                # Fail first 2 attempts, succeed on the 3rd. The
+                # dockerd race in the lab clears within hundreds of
+                # microseconds; the 100ms backoff is generous.
+                if cat_attempts["count"] < 3:
+                    return mock.Mock(
+                        rc=1, stdout="",
+                        stderr=("cat: can't open '...final_report.json': "
+                                "No such file or directory"),
+                        cmd=[], elapsed_s=0.01,
+                    )
+                return mock.Mock(
+                    rc=0, stdout=_ok_daemon_json(), stderr="",
+                    cmd=[], elapsed_s=0.01,
+                )
+            return mock.Mock(
+                rc=0,
+                stdout=_ok_sender_json("green-host00", "green-host15"),
+                stderr="", cmd=[], elapsed_s=1.0,
+            )
+
+        with mock.patch("srv6_mrc.mrc.run.docker_exec_async",
+                        side_effect=fake_async), \
+             mock.patch("srv6_mrc.mrc.run.docker_exec",
+                        side_effect=fake_exec), \
+             mock.patch("srv6_mrc.mrc.run.time.sleep"), \
+             mock.patch("sys.stderr") as mock_stderr:
+            _senders, _receivers, daemons = run_flows(
+                flows, settle_s=0, idle_timeout_s=1.0,
+                mrc=MrcSpec(),
+            )
+
+        # Retry path succeeded on attempt 3 → record merged, no warning.
+        self.assertEqual(cat_attempts["count"], 3)
+        self.assertEqual(len(daemons), 1)
+        self.assertEqual(daemons[0]["src_host"], "green-host00")
+        stderr_writes = "".join(
+            call.args[0] for call in mock_stderr.write.call_args_list
+        )
+        # No daemon_failures warning emitted — the retry cured the
+        # race silently. This is the value of the retry: avoid
+        # spurious warnings on a known-benign race.
+        self.assertNotIn("no final report", stderr_writes)
+
+    def test_final_report_failure_message_includes_cat_stderr(self):
+        # When retry is exhausted, the failure message MUST include
+        # the cat command's stderr so the operator can tell a real
+        # "file truly never written" failure apart from the transient
+        # race the retry was designed for. Without this, the user is
+        # left guessing whether the daemon crashed, whether the path
+        # is wrong, or whether retry just didn't try hard enough.
+        flows = self._mrc_flow()
+        daemon_proc = _FakeDaemonPopen(stdout="")
+
+        cat_stderr = ("cat: can't open "
+                      "'/dev/shm/srv6-mrc/green-host00/final_report.json': "
+                      "No such file or directory")
+
+        def fake_async(container, argv, *, env=None):
+            if "mrc-daemon" in argv:
+                return daemon_proc
+            return _FakePopen(stdout=_ok_receiver_json())
+
+        def fake_exec(container, argv, *, timeout_s=None, env=None):
+            if argv and argv[0] == "pkill":
+                return mock.Mock(rc=0, stdout="", stderr="",
+                                 cmd=[], elapsed_s=0.01)
+            if argv and argv[0] == "cat":
+                return mock.Mock(
+                    rc=1, stdout="", stderr=cat_stderr,
+                    cmd=[], elapsed_s=0.01,
+                )
+            return mock.Mock(
+                rc=0,
+                stdout=_ok_sender_json("green-host00", "green-host15"),
+                stderr="", cmd=[], elapsed_s=1.0,
+            )
+
+        with mock.patch("srv6_mrc.mrc.run.docker_exec_async",
+                        side_effect=fake_async), \
+             mock.patch("srv6_mrc.mrc.run.docker_exec",
+                        side_effect=fake_exec), \
+             mock.patch("srv6_mrc.mrc.run.time.sleep"), \
+             mock.patch("sys.stderr") as mock_stderr:
+            run_flows(flows, settle_s=0, idle_timeout_s=1.0,
+                      mrc=MrcSpec())
+
+        stderr_writes = "".join(
+            call.args[0] for call in mock_stderr.write.call_args_list
+        )
+        # "3 attempts" surfaces that retry was tried (vs misreading
+        # it as "we only tried once and gave up").
+        self.assertIn("3 attempts", stderr_writes)
+        self.assertIn("No such file or directory", stderr_writes)
+
 
 if __name__ == "__main__":
     unittest.main()
