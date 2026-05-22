@@ -4,6 +4,8 @@ The default 4-plane topology deploys with 4 spines and 8 leafs in each plane (48
 
 Example: *`green-host00`* has 4 uplinks, one to *`leaf00`* in each of the 4 planes.
 
+![Topology](./4p-4x8-topology.png)
+
 The **docker-sonic-vs** is pretty lightweight and takes up only 160MB of memory. That said, the lab has been tested on Ubuntu 22.04 and 24.04 virtual machines with 32 vCPU and 96GB of memory, which appears to be more than sufficient.
 
 ### Pre-requisites
@@ -41,11 +43,10 @@ docker build -f host-image/Dockerfile \
 make deploy
 # equivalent to:
 sudo clab deploy -t topologies/4p-4x8/topology.clab.yaml
-
-# other topologies
-make TOPO=2p-4x8 deploy
-
-make TOPO=4p-8x16 deploy
+```
+Other topologies can be deployed (and configured, etc.) by specifying TOPO=<topology>
+```bash
+make TOPO=2p-4x8 deploy 
 ```
 
 3. Run `make config` to apply sonic *`config_db.json`* and *`frr.conf`* configs to each device (under `topologies/4p-4x8/config/`)
@@ -53,57 +54,37 @@ make TOPO=4p-8x16 deploy
 make config
 # equivalent to:
 scripts/config.sh all
-
-# other topologies
-make TOPO=2p-4x8 config
-
-make TOPO=4p-8x16 config
 ```
 
 It will take a minute or two for the script to run through the
-fabric routers (32 on the default 4p-4x8, 96 on 4p-8x16). The banner
-and output below is from a 4p-8x16 deploy; on 4p-4x8 the numbers and
-topology name change but the structure is the same:
+fabric routers (48 on the default 4p-4x8, 96 on 4p-8x16)
 
 ```bash
 ============================================================
-  sonic-docker-4p-8x16 — 4 planes x (8 spine x 16 leaf) SRv6 CLOS
+  sonic-docker-4p-4x8 — 4 planes x (4 spine x 8 leaf) SRv6 CLOS
 ============================================================
-  Topology:     sonic-docker-4p-8x16 (from topology.clab.yaml)
-  Config dir:   /home/cisco/srv6-ai-fabric/topologies/4p-8x16/config
+  Topology:     sonic-docker-4p-4x8 (from topology.clab.yaml)
+  Config dir:   /home/cisco/srv6-mrc-emulator/topologies/4p-4x8/config
   Routing:      Controller-driven (no BGP, no IGP)
   Tenants:      green (uDT d000 -> Vrf-green on every leaf)
                 yellow (host-based; uDT d001 seg6local on hosts)
 ============================================================
 
-Deploy complete!
+Configuration complete!
 ```
 
-4. Install Green and Yellow Tenant Host Routes (useful for verifying paths, etc.)
+4. Install Green and Yellow Tenant Host Routes (useful for verifying paths/fabric-connectivity, etc.)
 ```bash
 make host-routes
-# equivalent to:
-routes apply -f topologies/4p-4x8/routes/full-mesh.yaml
-
-# other topologies
-make TOPO=2p-4x8 host-routes
-
-make TOPO=4p-8x16 host-routes
 ```
 
 ### Quick test - Tenant Green - Host SRv6 Encap, Egress Leaf SRv6 uDT
 > [!Note]
 > The host-routes script sets metrics such that ping tests will default to fabric plane-0
->
-> The walkthrough below uses `green-host15` as the destination, which
-> only exists on the 4p-8x16 reference design (`make TOPO=4p-8x16
-> deploy && make TOPO=4p-8x16 config && make TOPO=4p-8x16 host-routes`).
-> On the default 4p-4x8 substitute `green-host07` and inner DA
-> `2001:db8:bbbb:7::2`.
 
-1. Run a ping from *`green-host00`* to *`green-host15`*
+1. Run a ping from *`green-host00`* to *`green-host07`*
 ```bash
-docker exec -it green-host00 ping 2001:db8:bbbb:f::2 -i .3
+docker exec -it green-host00 ping 2001:db8:bbbb:7::2 -i .3
 ```
 
 2. In another terminal session run tcpdump on the sonic nodes' interfaces along the path:
@@ -118,45 +99,41 @@ We expect to see encapsulated echo requests and plain ipv6 echo replies (post uD
 $ docker exec -it p0-leaf00 tcpdump -ni Ethernet32
 tcpdump: verbose output suppressed, use -v[v]... for full protocol decode
 listening on Ethernet32, link-type EN10MB (Ethernet), snapshot length 262144 bytes
-16:02:00.574771 IP6 2001:db8:bbbb::2 > fc00:0:f000:e00f:d000::: IP6 2001:db8:bbbb::2 > 2001:db8:bbbb:f::2: ICMP6, echo request, id 68, seq 51, length 64
-16:02:00.576097 IP6 2001:db8:bbbb:f::2 > 2001:db8:bbbb::2: ICMP6, echo reply, id 68, seq 51, length 64
+17:16:39.628230 IP6 2001:db8:bbbb::2 > fc00:0:f003:e007:d000::: IP6 2001:db8:bbbb::2 > 2001:db8:bbbb:7::2: ICMP6, echo request, id 278, seq 11, length 64
+17:16:39.628956 IP6 2001:db8:bbbb:7::2 > 2001:db8:bbbb::2: ICMP6, echo reply, id 278, seq 11, length 64
 ```
 
-3. You can tcpdump along the entire path by following the uSID encapsulation pattern:
+3. You can tcpdump along the entire path by following the uSID encapsulation pattern.
+
+```
+fc00:0:f003:e006:d000::
+└──┬──┘└┬──┘└┬──┘└┬──┘
+   │    │    │    └──── d000  : tenant-ID green leaf07 uDT Ethernet32
+   │    │    └───────── e007  : spine03 uA Ethernet28 toward leaf07
+   │    └────────────── f003  : leaf00 uA Ethernet8 toward spine03 
+   └─────────────────── 0000  : plane 0 block
+```
    
 ```bash
-# p0-leaf00 egress to p0-spine00
-docker exec -it p0-leaf00 tcpdump -ni Ethernet0
+# p0-leaf00 egress to p0-spine03
+docker exec -it p0-leaf00 tcpdump -ni Ethernet8
 
-# p0-spine00 egress to p0-leaf15
-docker exec -it p0-spine00 tcpdump -ni Ethernet60
+# p0-spine03 egress to p0-leaf07
+docker exec -it p0-spine00 tcpdump -ni Ethernet28
 ```
-
 
 ### Quick test - Tenant Yellow - Host SRv6 Encap and Decap
 
-1. Run a ping from *`yellow-host01`* to *`yellow-host14`* 
+1. Run a ping from *`yellow-host01`* to *`yellow-host14`* . Packet capture/tcpdump procedure is the same.
 ```bash
 docker exec -it yellow-host01 ping 2001:db8:cccc:e::2 -i .3 
-```
-
-2. tcpdump sequence:
-```bash
-docker exec -it p0-leaf01 tcpdump -ni Ethernet36
-```
-```bash
-docker exec -it p0-leaf01 tcpdump -ni Ethernet4
-
-docker exec -it p1-spine01 tcpdump -ni Ethernet4
-
-docker exec -it p1-spine01 tcpdump -ni Ethernet56
 ```
 
 For other quick tests see the [spray-tool.md](./spray-tool.md)
 
 
-### srctl command line utility
-*`srctl`* is a simple CLI modeled about K8s `kubectl` an can be used to interact with the MRC emulator
+## srctl command line utility
+*`srctl`* is a simple CLI modeled about K8s `kubectl` and can be used to interact with the MRC emulator
 
 1. Install `srctl` python packages
 ```bash

@@ -35,13 +35,22 @@ Tenants:
 ```
 srv6_mrc/           Python package
   topo.py              fabric constants + addressing helpers (reads topo.yaml)
-  runner.py, policy.py, reorder.py, netem.py, report.py, health.py
+  topology.py          typed Topology accessor (Refactor 1 in progress;
+                       parallel to topo.py during migration)
+  runner.py, policy.py, reorder.py, netem.py, report.py
+  encap.py             shared raw-socket SRv6 outer-packet builder
+                       (used by runner.py and mrc/transport.py)
   cli/spray.py         userspace SRv6 packet generator (CLI: `spray`)
   cli/routes.py        static SRv6 route management   (CLI: `routes`)
+  cli/srctl.py         kubectl-shaped lab CLI         (CLI: `srctl`)
   mrc/
     run.py             scenario orchestrator           (CLI: `run-scenario`)
+    daemon.py          per-host MRC daemon: single SO_REUSEPORT reply-
+                       socket owner + per-flow snapshot writer
     scenario.py        scenario YAML schema + executor (incl. `mrc:` block)
     agent.py           SenderMrcAgent / ReceiverMrcAgent + env-loader
+    transport.py       MrcTransport ABC + Srv6RawTransport +
+                       LoopbackUdpTransport
     ev_state.py        EVStateTable + per-plane state machine
     probe.py           PROBE / PROBE_REPLY / LOSS_REPORT wire format
     probe_clock.py     in-flight probe tracking + timeout sweep

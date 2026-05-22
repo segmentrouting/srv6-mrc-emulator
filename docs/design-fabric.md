@@ -1,14 +1,13 @@
-# 4-Plane SRv6 Fabric (8-spine × 16-leaf × 4 planes)
+# 4-Plane SRv6 Fabric 
 
 A SRv6 (uSID) lab built on top of `docker-sonic-vs` +
 Containerlab. Models a small slice of a hyperscale AI backend fabric: 4
-independent network planes, each an 8 × 16 Clos, with multi-homed tenant
+independent network planes, each a 4 × 8 Clos (or 8 x 16), with multi-homed tenant
 hosts uplinked into every plane.
 
 
-- **96 SONiC switches** (32 spines + 64 leaves)
-- **32 Alpine hosts** (16 green + 16 yellow), each with 4 NIC uplinks
-- **640 veth pairs** (512 fabric + 128 host)
+- **48 SONiC switches** (16 spines + 32 leaves)
+- **16 Alpine hosts** (8 green + 8 yellow), each with 4 NIC uplinks
 - **No BGP, no IGP** — every transit FIB entry is a static route or an SRv6 uA
   SID; the controller installs end-to-end SR policies for tenant traffic.
 
@@ -29,8 +28,7 @@ The lab demonstrates several patterns that recur in hyperscale GPU fabrics:
    "this leaf's uA toward spine S", `e00<L>` always means "this spine's uA
    toward leaf L", `d000`/`d001` are tenant-ID uDT6 SIDs. A controller
    reading any SID list can tell what each label does without per-node state.
-4. **Three SRv6 multi-tenancy models**:
-    - **Network-based** (blue): leaf-encap, leaf-decap. *Removed in this lab.*
+4. **Two SRv6 multi-tenancy models**:
     - **Hybrid** (green): host-encap, leaf-decap into `Vrf-green` via uDT6.
     - **Host-based** (yellow): host-encap, host-decap. Leaves are pure transit;
       yellow hosts run `seg6local End.DT6` on every plane NIC.
@@ -71,37 +69,20 @@ then decap into green at the next hop" encodes as a single uSID-compressed
 IPv6 destination:
 
 ```
-fc00:0002:f003:e00a:d000::
+fc00:0002:f003:e006:d000::
 └──┬───┘ └┬──┘ └┬─┘ └┬─┘
    │      │     │    └─ d000  : tenant-ID green → Vrf-green at egress leaf
-   │      │     └────── e00a  : spine03 uA toward leaf10 (in plane 2)
+   │      │     └────── e006  : spine03 uA toward leaf06 (in plane 2)
    │      └──────────── f003  : leaf uA toward spine03 
    └─────────────────── 0002  : plane 2 block
 ```
-
-
-## Files
-
-| File | Purpose |
-|---|---|
-| `topologies/<name>/topo.yaml` | Declarative single source of truth for one variant (planes, spines, leaves, images, clab name) |
-| `generators/fabric.py` | Parameterized generator: reads `topo.yaml` and emits `topology.clab.yaml` + `config/<node>/{config_db.json,frr.conf}` in the same dir |
-| `topologies/<name>/topology.clab.yaml` | Containerlab topology (generated) |
-| `topologies/<name>/config/<node>/` | Per-node SONiC `config_db.json` and FRR `frr.conf` (generated) |
-| `scripts/config.sh` | Pushes generated configs into running SONiC containers |
-| `srv6_mrc/cli/routes.py` (CLI: `routes`) | Declarative SRv6 host-route manager (kubectl-style: `apply`, `delete`, `list`) |
-| `topologies/<name>/routes/*.yaml` | Ready-made route specs: reference pairs, full mesh, host00 fanout |
-| `srv6_mrc/cli/spray.py` (CLI: `spray`) | Userspace SRv6 packet sprayer (sender + receiver). MRC/SRv6 demo. See `spray-protocol.md`. |
-| `host-image/Dockerfile` | Builds `alpine-srv6-scapy:1.0` (host image: alpine + scapy + pip-installed `srv6_mrc`) |
-| `spray-protocol.md` | Tool writeup: SID lists the sprayer builds, run instructions, manual tcpdump checkpoints |
-
 
 ## Tenant models in this lab
 
 ### Green (hybrid SRv6)
 
 ```
-green-host00 NICs eth1..eth4   (anycast 2001:db8:bbbb:00::2 on all four)
+green-host00 NICs eth1..eth4   (anycast 2001:db8:bbbb:<NN>::2 on all four)
    │ (encap by host or upstream controller; one of 4 NICs picked per packet)
    │  outer dst: fc00:000<P>:f00<S>:e00<L>:d000::      <P> = chosen plane
    ▼
@@ -119,22 +100,18 @@ sees one socket regardless of which plane delivered it.
 ### Yellow (host-based SRv6)
 
 ```
-yellow-host00 NICs eth1..eth4    (inner anycast 2001:db8:cccc:00::2 on
-                                  all 4 NICs + lo nodad — Phase 1a)
+yellow-host00 NICs eth1..eth4    (inner anycast 2001:db8:cccc:<NN>::2 on all four)                        
    │  encap; outer dst: fc00:000<P>:f00<S>:e00<L>:e009:d001::  <P> = chosen plane
    ▼
    ─►  fabric (uA hops)  ─►  egress p<P>-leaf<NN>.Ethernet36 (default VRF)
-                               ─►  yellow-host<NN>.eth(P+1) [anycast cccc:<NN>::2]
+                               ─►  yellow-host<NN>.eth(P+1) [inner 2001:db8:cccc:<NN>::2]
                                     seg6local End.DT6 table 0 → decap →
-                                    table-0 lookup hits anycast 2001:db8:cccc:<NN>::2
+                                    table-0 lookup hits 2001:db8:cccc:<NN>::2
                                     (present on eth1..eth4 + lo, nodad)
 ```
 
 Each yellow host has 4 `seg6local` entries — one per plane — bound to the
-respective plane NIC; that didn't change. What changed in Phase 1a: the
-inner tenant destination is now anycast `cccc:<NN>::2`, present on all 4
-NICs and on `lo` (mirroring green's `bbbb:<NN>::2` plan with `bbbb`→`cccc`).
-The address present on `lo` (nodad) guarantees table-0 lookup resolves
+respective plane NIC. The address present on `lo` (nodad) guarantees table-0 lookup resolves
 locally even when no NIC is the egress interface. So a sprayed flow's
 inner dst is plane-independent; plane identity stays in the outer SID
 list and in which NIC the host's seg6local fires on. The leaf is a pure
@@ -159,21 +136,6 @@ each tenant's decap happens:
   point at the same inner address.
 
 
-## Reducing scale
-
-If your host can't accommodate 96 SONiC nodes, edit
-`topologies/4p-8x16/topo.yaml` (or copy it to
-`topologies/<smaller>/topo.yaml` to keep both):
-
-```yaml
-planes: 2                # 24 SONiC + 16 hosts, 96 veth pairs
-spines_per_plane: 4      # halve again per plane
-leaves_per_plane: 8
-```
-
-Hosts will reduce to the new `leaves_per_plane` count. Re-run
-`make regen` (or `make TOPO=<smaller> regen`) and redeploy.
-
 ## What this lab is *not*
 
 - **Not a performance benchmark.** `docker-sonic-vs` runs a software ASIC; you
@@ -181,26 +143,7 @@ Hosts will reduce to the new `leaves_per_plane` count. Re-run
   and forwarding behavior.
 - **Not a full controller.** No PCEP/BGP-LS/path-computation engine is
   included. The static SIDs and routes give you a substrate; programming
-  end-to-end SR policies is left to whatever controller you wire up
-  (e.g. `jalapeno`, an OpenConfig+gRPC actor, or hand-rolled `vtysh`/iproute2).
-- **Not multi-cluster.** A single cluster lives at `fc00:0000::/30`. The
-  scheme extends naturally — the next cluster would be `fc00:0004::/30`,
-  etc. — but no WAN gear is modeled here.
+  end-to-end SR policies is left to whatever controller you wire up.
 
-## See also
-
-- `./spray-protocol.md` — userspace SRv6 sprayer: round-robin a single flow across
-  all 4 planes to one anycast/loopback dst, count per-NIC arrivals on the
-  receiver. The MRC/SRv6 demo this lab was built for.
-- `./design-mrc.md` — MRC behavior layer on top of the spray substrate:
-  policies, per-flow reorder measurement, fault injection scenarios,
-  orchestration.
-- `./running.md` — how to run MRC unit tests, manual two-host
-  spray, and scenario-driven runs end-to-end.
-- `./results-format.md` — how to read the per-flow ASCII summary
-  and JSON reports `run-scenario` (`srv6_mrc/mrc/run.py`) produces.
-- `./design-appendix.md` — rationale for the major design decisions.
-- `./architecture.md` §2 — the plane-independent inner addressing
-  invariant that makes spray work.
 
 

@@ -11,29 +11,27 @@ between them per command.
 | Name | Planes | Spines/plane | Leaves/plane | Containers | Use case |
 |---|---|---|---|---|---|
 | `2p-4x8` | 2 | 4 | 8 | 16 fabric + 16 hosts | smallest; laptop iteration |
-| `4p-4x8` | 4 | 4 | 8 | 32 fabric + 16 hosts | **default**; mid-size, paper-faithful 4 planes |
-| `4p-8x16` | 4 | 8 | 16 | 96 fabric + 32 hosts | full-scale reference design |
+| `4p-4x8` | 4 | 4 | 8 | 32 fabric + 16 hosts | **default**; mid-size |
+| `4p-8x16` | 4 | 8 | 16 | 96 fabric + 32 hosts | larger-scale |
 
-The 2-plane variant deviates from the MRC paper (which specifies 4 or 8
-planes); use it only for fast smoke-testing of code changes.
 
 ## Creating a new topology variant
 
-The example below creates `4p-4x8`. Substitute your own dimensions as
-needed. The flow has four steps; **only steps 2 and 4 are command-line
-work**, the others are file edits.
+The example below creates a small 2 plane fabric with 2 spines and 4 leafs in each plane (`2p-2x4`). 
+Substitute your own dimensions as needed. The flow has four steps; 
+**only steps 2 and 4 are command-line work**, the others are file edits.
 
 ### 1. Make the directory and `topo.yaml`
 
 ```bash
-mkdir -p topologies/4p-4x8
-cat > topologies/4p-4x8/topo.yaml <<'EOF'
-name: 4p-4x8
-description: 4-plane Clos, 4 spines per plane, 8 leaves per plane (mid-size dev variant)
+mkdir -p topologies/2p-2x4
+cat > topologies/2p-2x4/topo.yaml <<'EOF'
+name: 2p-2x4
+description: 2-plane Clos, 2 spines per plane, 4 leaves per plane (mid-size dev variant)
 
-planes: 4
-spines_per_plane: 4
-leaves_per_plane: 8
+planes: 2
+spines_per_plane: 2
+leaves_per_plane: 4
 
 tenants:
   - green
@@ -44,20 +42,20 @@ images:
   host: alpine-srv6-scapy:1.0
 
 clab:
-  topology_name: sonic-docker-4p-4x8
+  topology_name: sonic-docker-2p-2x4
 EOF
 ```
 
 ### 2. Generate clab + SONiC config
 
 ```bash
-make TOPO=4p-4x8 regen
+make TOPO=2p-2x4 regen
 ```
 
 `make regen` writes:
-- `topologies/4p-4x8/topology.clab.yaml`
-- `topologies/4p-4x8/config/<node>/config_db.json` for every spine and leaf
-- `topologies/4p-4x8/config/<node>/frr.conf` for every spine and leaf
+- `topologies/2p-2x4/topology.clab.yaml`
+- `topologies/2p-2x4/config/<node>/config_db.json` for every spine and leaf
+- `topologies/2p-2x4/config/<node>/frr.conf` for every spine and leaf
 
 The generator uses an embedded SONiC PORT-table template
 (`generators/sonic_vs_port_table.json`) for the per-node
@@ -77,38 +75,30 @@ and can be copied as-is.
 ```bash
 # Routes: full-mesh.yaml is dimension-agnostic (it expands from
 # NUM_LEAVES at apply time):
-mkdir -p topologies/4p-4x8/routes
-cp topologies/2p-4x8/routes/full-mesh.yaml topologies/4p-4x8/routes/
+mkdir -p topologies/2p-2x4/routes
+cp topologies/2p-2x4/routes/full-mesh.yaml topologies/2p-2x4/routes/
 
 # Scenarios: anything that uses a named pair-set (-all-to-all, -ring,
 # -mrc-baseline, -mrc-ev-spray, -ev-spray, etc.) auto-sizes from
 # NUM_LEAVES — copy and they just work:
-mkdir -p topologies/4p-4x8/scenarios
-cp topologies/4p-8x16/scenarios/{green,yellow}-mrc-baseline.yaml \
-   topologies/4p-8x16/scenarios/{green,yellow}-mrc-ev-spray.yaml \
-   topologies/4p-8x16/scenarios/{green,yellow}-allreduce-ring.yaml \
-   topologies/4p-8x16/scenarios/{green,yellow}-all-to-all.yaml \
-   topologies/4p-4x8/scenarios/
+mkdir -p topologies/2p-2x4/scenarios
+cp topologies/4p-4x8/scenarios/{green,yellow}-mrc-baseline.yaml \
+   topologies/4p-4x8/scenarios/{green,yellow}-mrc-ev-spray.yaml \
+   topologies/4p-4x8/scenarios/{green,yellow}-allreduce-ring.yaml \
+   topologies/4p-4x8/scenarios/{green,yellow}-all-to-all.yaml \
+   topologies/2p-2x4/scenarios/
 ```
-
-Scenarios that need editing before copying: anything with explicit
-leaf IDs that may not exist in the smaller fabric, or that uses
-size-suffixed pair-set aliases (`-pairs-8`, `-pairs-4`) instead of
-the auto-sized form (`-pairs`). Prefer the auto-sized aliases
-(`<tenant>-pairs`, `<tenant>-ring`, `<tenant>-all-to-all`) for any
-new scenario — they expand from `NUM_LEAVES` at scenario-load time
-and work unchanged on every topology size.
 
 ### 4. Deploy and use
 
 ```bash
-make TOPO=4p-4x8 deploy
-make TOPO=4p-4x8 config
-make TOPO=4p-4x8 host-routes
-make TOPO=4p-4x8 scenario SCEN=yellow-mrc-baseline
+make TOPO=2p-2x4 deploy
+make TOPO=2p-2x4 config
+make TOPO=2p-2x4 host-routes
+make TOPO=2p-2x4 scenario SCEN=yellow-mrc-baseline
 ```
 
-Tip: `export TOPO=4p-4x8` once at the top of your shell to drop the
+Tip: `export TOPO=2p-2x4` once at the top of your shell to drop the
 `TOPO=` prefix from every subsequent command.
 
 ## What's auto-generated vs hand-maintained
@@ -132,9 +122,9 @@ topologies on the same host as long as you only deploy one at a time.
 
 ```bash
 make TOPO=4p-8x16 destroy   # tear down the current one
-make TOPO=4p-4x8 deploy     # bring up the new one
-make TOPO=4p-4x8 config
-make TOPO=4p-4x8 host-routes
+make TOPO=2p-2x4 deploy     # bring up the new one
+make TOPO=2p-2x4 config
+make TOPO=2p-2x4 host-routes
 ```
 
 The host image is shared across all topologies — no rebuild needed when

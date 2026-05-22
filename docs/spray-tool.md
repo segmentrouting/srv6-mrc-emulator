@@ -16,8 +16,6 @@ docker exec -it yellow-host07 spray --role recv
 docker exec -it yellow-host00 spray --role send --dst-id 7 --rate 1000pps --duration 5s
 ```
 
-The `spray` CLI is pip-installed inside the host image (see `host-image/Dockerfile`); it lives at `/usr/local/bin/spray`. The image also bakes the topology descriptor at `/etc/srv6_mrc/topo.yaml` and exports `SRV6_TOPO` pointing at it. Rebuild the image when the package or topo.yaml changes; no bind mounts are required at runtime.
-
 ---
 
 ## What it sends
@@ -36,19 +34,8 @@ For each packet `i` the sender picks plane `P = i mod 4` and emits:
 +---+---+---+-----------+----------+----------+--------------+-------+
 ```
 
-The 10-byte payload header is `!QBB` (seq u64, plane u8, path u8); the
-`path` byte carries the per-packet spine index when `ev_spray` /
-`health_aware_mrc` rotates the spine, and the receiver uses it for
-per-EV stats. Under plain `round_robin` the `path` byte is 0.
 
-Key MRC invariants this enforces:
-
-- **Inner dst is identical for all 4 planes** — `2001:db8:bbbb:<dst-id>::2` for green. The plane lives ONLY in the outer SID list.
-- **Outer is an SRv6 uSID carrier** (IPv6-in-IPv6); the SID list is encoded in the destination address itself and shifts left at each hop. encap.red semantics, no extension headers.
-- **Egress NIC = plane.** The sender opens one raw socket per plane and pins it with `SO_BINDTODEVICE` to `eth1..eth4`. Without this, the kernel would route all 4 planes out the same NIC (the inner anycast dst is the same on all of them).
-- **Spine entropy via outer-DA rotation, not kernel ECMP.** Under `ev_spray`, the `f<S>` hextet of the outer DA varies per packet so each `(plane, path)` EV traces a distinct leaf→spine path. The runner builds the outer in user space (scapy) on a plane-bound socket; the kernel never gets to choose the spine.
-
-Example outer destination per plane - transit spine=0 (f000), egress leaf=15 (e00f), tenant green ID (d000):
+Example outer destination per plane - transit spine=0 (f000), egress leaf=7 (e007), tenant green ID (d000):
 
 | plane | egress NIC | outer dst                                |
 | ----- | ---------- | ---------------------------------------- |
@@ -60,26 +47,26 @@ Example outer destination per plane - transit spine=0 (f000), egress leaf=15 (e0
 Each hop consumes one uSID by shifting the address left:
 
 ```
-fc00:000P:f000:e00f:d000::      sender emits
-fc00:000P:e00f:d000::            after p<P>-leaf00 (consumed f000)
+fc00:000P:f000:e007:d000::      sender emits
+fc00:000P:e007:d000::            after p<P>-leaf00 (consumed f000)
 fc00:000P:d000::                 after p<P>-spine00 (consumed e00f)
-(plain inner)                    after p<P>-leaf15 uDT6 decap (d000 in Vrf-green)
+(plain inner)                    after p<P>-leaf07 uDT6 decap (d000 in Vrf-green)
 ```
 
 For yellow the SID list is one hextet longer (the extra `e009` is the egress-leaf→host uA), and decap moves to the receiver host's kernel:
 
 | plane | egress NIC | outer dst                                       |
 | ----- | ---------- | ----------------------------------------------- |
-| 0     | eth1       | `fc00:0000:f000:e00f:e009:d001::`               |
-| 1     | eth2       | `fc00:0001:f000:e00f:e009:d001::`               |
-| 2     | eth3       | `fc00:0002:f000:e00f:e009:d001::`               |
-| 3     | eth4       | `fc00:0003:f000:e00f:e009:d001::`               |
+| 0     | eth1       | `fc00:0000:f000:e007:e009:d001::`               |
+| 1     | eth2       | `fc00:0001:f000:e007:e009:d001::`               |
+| 2     | eth3       | `fc00:0002:f000:e007:e009:d001::`               |
+| 3     | eth4       | `fc00:0003:f000:e007:e009:d001::`               |
 
 ```
-fc00:000P:f000:e00f:e009:d001::  sender emits
-fc00:000P:e00f:e009:d001::       after p<P>-leaf00 (consumed f000)
+fc00:000P:f000:e007:e009:d001::  sender emits
+fc00:000P:e007:e009:d001::       after p<P>-leaf00 (consumed f000)
 fc00:000P:e009:d001::            after p<P>-spine00 (consumed e00f)
-fc00:000P:d001::                 after p<P>-leaf15 (consumed e009; egress NOT decapped)
+fc00:000P:d001::                 after p<P>-leaf07 (consumed e009; egress NOT decapped)
 (plain inner)                    after host kernel seg6local End.DT6 (d001) -> lo
 ```
 
@@ -120,63 +107,14 @@ A healthy lab gives:
 
 ## Spot-checking the wire
 
-The tcpdump walkthrough below uses `host15` as the destination, which
-only exists on the 4p-8x16 reference design. To follow along, deploy
-4p-8x16 (`make TOPO=4p-8x16 deploy && make TOPO=4p-8x16 config &&
-make TOPO=4p-8x16 host-routes`). On the default 4p-4x8, substitute
-`host07` for `host15` and adjust the SID-list hextets accordingly
-(spine subscript runs 0..3 instead of 0..7).
-
-Run `spray` at a low rate so you can read tcpdump in another terminal:
+Run `spray` at a low rate (--dst-id 7 is leaf07) so you can read tcpdump in another terminal:
 
 ```bash
 docker exec -it green-host00 spray --role send \
-    --dst-id 15 --rate 5pps --duration 60s
+    --dst-id 7 --rate 5pps --duration 60s
 ```
 
-Then tap any hop along the path. The `(spine0, dst-leaf 15)` example below uses plane 0; substitute `p<P>-...` and `Ethernet<...>` for the other planes.
-
-**Ingress leaf, leaf-side (sees host's outer SID list):**
-```bash
-docker exec -it p0-leaf00 tcpdump -ni Ethernet32 'ip6 proto 41'
-# IP6 ...:bbbb:0000::2 > fc00:0:f000:e00f:d000:: : IP6 ...:bbbb::2 > ...:bbbb:f::2: UDP, length 41
-```
-
-**Ingress leaf → spine (one uSID consumed):**
-```bash
-docker exec -it p0-leaf00 tcpdump -ni Ethernet0 'ip6 proto 41'
-# dst = fc00:0:e00f:d000::
-```
-
-**Spine → egress leaf (another uSID consumed):**
-```bash
-docker exec -it p0-spine00 tcpdump -ni Ethernet60 'ip6 proto 41'
-# dst = fc00:0:d000::
-```
-
-**Egress leaf → receiver host (decapped — no outer SRv6 anymore):**
-```bash
-docker exec -it p0-leaf15 tcpdump -ni Ethernet32 'udp port 9999'
-# IP6 ...:bbbb::2 > ...:bbbb:f::2: UDP, length 41
-```
-
-For yellow the same hops show one extra uSID throughout, and the egress leaf does **not** decap — the host kernel does. Substitute `yellow-host{NN}`, leaf NIC `Ethernet36` (yellow-facing), and use the wider BPF on the host-facing tap:
-
-```bash
-# at the egress leaf -> yellow-host15 link, the outer is still SRv6
-docker exec -it p0-leaf15 tcpdump -ni Ethernet36 'ip6 proto 41'
-# dst = fc00:0:d001::   (only the final uSID left; host kernel will decap)
-```
-
-The receiver itself prints a one-shot diagnostic on the first encapped frame so you can confirm the wire shape without a separate tcpdump:
-
-```
-[first encapped pkt on eth1] outer src=2001:db8:cccc:000::2  dst=fc00:0:d001::
-```
-
----
-
-## Arguments
+## Command Arguments
 
 ```
 --role send|recv              required
@@ -227,8 +165,5 @@ The sender infers its own tenant + id from the container hostname (`green-host00
   `mrc:` block (even an empty one) so the orchestrator pushes
   config to the senders. See `design-mrc.md` for the full table.
 
-For more sophisticated workflows (multi-flow runs, fault injection,
-result aggregation), use `run-scenario` and YAML scenarios. See
-`running.md`.
 
 
