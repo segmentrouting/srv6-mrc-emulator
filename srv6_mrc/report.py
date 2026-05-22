@@ -102,6 +102,30 @@ class FlowRow:
 # --- top-level report -------------------------------------------------------
 
 
+def _short_policy(policy: str, max_w: int = 22) -> str:
+    """Compact a verbose policy label for the ASCII report's policy column.
+
+    The MRC daemon refactor (PR #1) made every health_aware_mrc sender
+    use a passive snapshot-reader policy whose JSON-faithful name is
+    `mrc_snapshot(<tenant>@/dev/shm/srv6-mrc/<src_host>/<tenant>_<dd>.json)`.
+    That string is ~60 chars and breaks column alignment. The tenant
+    and per-flow info is already visible from the row's src/dst hosts,
+    and the full snapshot path is preserved verbatim in the JSON
+    report — so the ASCII renderer drops everything but the policy
+    family name (`mrc_snapshot`). All other policies pass through
+    unchanged unless they exceed max_w, in which case we truncate with
+    an ellipsis to keep the column aligned at all costs.
+    """
+    if policy.startswith("mrc_snapshot("):
+        return "mrc_snapshot"
+    if len(policy) > max_w:
+        # Defensive: any future verbose policy label gets clipped
+        # rather than blowing column alignment. JSON keeps the full
+        # value for forensic use.
+        return policy[: max_w - 1] + "…"
+    return policy
+
+
 def _active_evs_from_mrc(
     mrc: dict | None,
     tenant: str,
@@ -192,6 +216,31 @@ class ScenarioReport:
             return None
         p, s = self.topology_dims
         return p * s
+
+    @property
+    def duration_s(self) -> float | None:
+        """Wall-clock duration the run blocked on.
+
+        Returns the max flow duration across all rows (the run blocks
+        until the longest flow finishes; flows with shorter durations
+        finish earlier and idle). None when there are no flows.
+        """
+        if not self.flows:
+            return None
+        return max(f.duration_s for f in self.flows)
+
+    @property
+    def durations_are_uniform(self) -> bool:
+        """True iff every flow shares the same configured duration.
+
+        Lets render_ascii print "duration: 4s" vs "duration: up to 4s
+        (mixed)" — same convention the orchestrator's --verbose
+        preamble uses.
+        """
+        if not self.flows:
+            return True
+        d0 = self.flows[0].duration_s
+        return all(f.duration_s == d0 for f in self.flows)
 
     # ----- construction ---------------------------------------------------
 
@@ -377,9 +426,30 @@ class ScenarioReport:
         """
         lines: list[str] = []
         lines.append(f"scenario: {self.scenario}")
+        # Show wall-clock duration up front so users know whether to
+        # wait at the prompt or kick off something else in another
+        # shell. Mirrors the orchestrator's --verbose preamble; runs
+        # the same uniform-vs-mixed check so heterogeneous flow sets
+        # are rendered honestly ("up to Xs").
+        if self.duration_s is not None:
+            n = len(self.flows)
+            if self.durations_are_uniform:
+                lines.append(
+                    f"  duration: {self.duration_s:g}s ({n} flow(s))"
+                )
+            else:
+                lines.append(
+                    f"  duration: up to {self.duration_s:g}s "
+                    f"({n} flow(s), mixed durations)"
+                )
         lines.append("=" * 78)
 
-        hdr = (f"  {'flow':<30}  {'policy':<24} "
+        # Policy column width: header and row must match or the right-
+        # hand columns visibly drift. 22 chars is wide enough for every
+        # in-tree policy label after `_short_policy()` collapses the
+        # long mrc_snapshot(<tenant>@<path>) form.
+        pol_w = 22
+        hdr = (f"  {'flow':<30}  {'policy':<{pol_w}} "
                f"{'sent':>6} {'rx':>6} {'loss%':>7} "
                f"{'reord':>6} {'max':>4} {'evs':>7}")
         lines.append(hdr)
@@ -413,7 +483,7 @@ class ScenarioReport:
             else:
                 evs_str = f"{used}/{self.expected_evs}"
             lines.append(
-                f"  {flow_label:<30}  {f.policy:<14} "
+                f"  {flow_label:<30}  {_short_policy(f.policy, pol_w):<{pol_w}} "
                 f"{f.sent:>6} {rx_str:>6} {loss_str:>7} "
                 f"{reord_str:>6} {max_str:>4} {evs_str:>7}"
             )

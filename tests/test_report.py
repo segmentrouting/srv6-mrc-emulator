@@ -1,4 +1,5 @@
 """Tests for srv6_mrc.report — merge logic between sender/receiver records."""
+import json
 import unittest
 
 from srv6_mrc.report import ScenarioReport
@@ -205,6 +206,86 @@ class TestSerialization(unittest.TestCase):
     def test_render_ascii_renders_notes(self):
         rep = ScenarioReport.from_records("x", [_sender()], [])
         self.assertIn("no receiver record", rep.render_ascii())
+
+    def test_render_ascii_shows_duration_at_top(self):
+        # Cosmetic: the report should surface wall-clock duration so
+        # operators don't have to guess how long to wait. Uniform
+        # durations render as "duration: 4s (1 flow(s))".
+        rep = ScenarioReport.from_records("x", [_sender()], [])
+        out = rep.render_ascii()
+        lines = out.splitlines()
+        # Header line is line 0 ("scenario: x"); duration should be
+        # the very next line, before the "=" separator.
+        self.assertEqual(lines[0], "scenario: x")
+        self.assertEqual(lines[1], "  duration: 4s (1 flow(s))")
+        self.assertTrue(lines[2].startswith("="))
+
+    def test_render_ascii_mixed_durations_says_up_to(self):
+        # Heterogeneous flow durations get the "up to … (mixed)" form,
+        # matching the orchestrator's --verbose preamble convention.
+        s1 = _sender(src="green-host00", dst="green-host15")
+        s2_dict = _sender(src="green-host01", dst="green-host14")
+        s2_dict["duration_s"] = 8.0
+        rep = ScenarioReport.from_records("x", [s1, s2_dict], [])
+        out = rep.render_ascii()
+        self.assertIn("duration: up to 8s (2 flow(s), mixed durations)",
+                      out)
+
+    def test_render_ascii_no_flows_omits_duration(self):
+        # Empty scenario (e.g. dry-run merge of nothing) must not blow
+        # up trying to derive a duration from an empty list.
+        rep = ScenarioReport(scenario="empty")
+        out = rep.render_ascii()
+        self.assertNotIn("duration:", out)
+
+    def test_render_ascii_collapses_mrc_snapshot_policy_label(self):
+        # PR #1 introduced policy labels like
+        # `mrc_snapshot(green@/dev/shm/srv6-mrc/<host>/<tenant>_<dd>.json)`
+        # that ran ~60 chars wide and broke column alignment. The
+        # ASCII renderer must collapse those to just `mrc_snapshot`
+        # so the sent/rx/loss columns stay aligned with the header.
+        # JSON output is unaffected (full label preserved).
+        s = _sender(
+            policy=("mrc_snapshot(green@/dev/shm/srv6-mrc/"
+                    "green-host00/green_07.json)"),
+        )
+        rep = ScenarioReport.from_records("x", [s], [])
+        out = rep.render_ascii()
+        # Short form present in ASCII...
+        self.assertIn("mrc_snapshot ", out)
+        # ...long form absent from ASCII...
+        self.assertNotIn("/dev/shm/srv6-mrc", out)
+        # ...but still in the JSON (forensic value).
+        self.assertIn("/dev/shm/srv6-mrc",
+                      json.dumps(rep.to_dict(), default=str))
+
+    def test_render_ascii_header_and_row_columns_align(self):
+        # Regression guard for the pre-PR-1 bug where the header used
+        # `<24` for policy but the row used `<14`, causing the sent/
+        # rx/loss columns to march left of their headers. Pin that
+        # the header and the first row have their "sent" column
+        # starting at the same character offset.
+        s = _sender(policy="round_robin")
+        rep = ScenarioReport.from_records("x", [s], [])
+        out = rep.render_ascii()
+        lines = out.splitlines()
+        # Find header line (contains "policy" and "sent").
+        hdr = next(l for l in lines if " policy " in l and " sent " in l)
+        # Find the first data row (starts with "  green-host00 ").
+        row = next(l for l in lines
+                   if l.startswith("  green-host00 -> green-host15"))
+        # Both lines must have "5000"-style numbers in the same
+        # column band. Take the offset of `sent` in the header and
+        # require the row to have a digit there (no padding mismatch).
+        sent_col = hdr.index("sent")
+        # The sent column is right-justified width 6, so the digit
+        # may appear in any of the 6 positions ending at sent_col+4.
+        self.assertTrue(
+            any(row[sent_col:sent_col + 6].strip().isdigit()
+                for _ in [None]),
+            f"row 'sent' column doesn't align with header. "
+            f"hdr={hdr!r}\nrow={row!r}",
+        )
 
     def test_per_ev_sent_is_forwarded_into_flow_row(self):
         # EV-aware senders (e.g. ev_spray) emit a per_ev_sent map keyed
