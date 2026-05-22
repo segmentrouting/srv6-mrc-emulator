@@ -207,34 +207,38 @@ class TestSerialization(unittest.TestCase):
         rep = ScenarioReport.from_records("x", [_sender()], [])
         self.assertIn("no receiver record", rep.render_ascii())
 
-    def test_render_ascii_shows_duration_at_top(self):
-        # Cosmetic: the report should surface wall-clock duration so
-        # operators don't have to guess how long to wait. Uniform
-        # durations render as "duration: 4s (1 flow(s))".
-        rep = ScenarioReport.from_records("x", [_sender()], [])
-        out = rep.render_ascii()
-        lines = out.splitlines()
-        # Header line is line 0 ("scenario: x"); duration should be
-        # the very next line, before the "=" separator.
-        self.assertEqual(lines[0], "scenario: x")
-        self.assertEqual(lines[1], "  duration: 4s (1 flow(s))")
-        self.assertTrue(lines[2].startswith("="))
-
-    def test_render_ascii_mixed_durations_says_up_to(self):
-        # Heterogeneous flow durations get the "up to … (mixed)" form,
-        # matching the orchestrator's --verbose preamble convention.
+    def test_duration_s_property_returns_max_across_flows(self):
+        # The orchestrator's pre-run preamble (mrc/run.py) reads
+        # ScenarioReport.duration_s to print expected wall-clock
+        # BEFORE the run blocks. Pin the contract: max across flows.
         s1 = _sender(src="green-host00", dst="green-host15")
-        s2_dict = _sender(src="green-host01", dst="green-host14")
-        s2_dict["duration_s"] = 8.0
-        rep = ScenarioReport.from_records("x", [s1, s2_dict], [])
-        out = rep.render_ascii()
-        self.assertIn("duration: up to 8s (2 flow(s), mixed durations)",
-                      out)
+        s2 = _sender(src="green-host01", dst="green-host14")
+        s2["duration_s"] = 8.0
+        rep = ScenarioReport.from_records("x", [s1, s2], [])
+        self.assertEqual(rep.duration_s, 8.0)
+        self.assertFalse(rep.durations_are_uniform)
 
-    def test_render_ascii_no_flows_omits_duration(self):
-        # Empty scenario (e.g. dry-run merge of nothing) must not blow
-        # up trying to derive a duration from an empty list.
+    def test_duration_s_uniform_when_all_flows_match(self):
+        s1 = _sender(src="green-host00", dst="green-host15")
+        s2 = _sender(src="green-host01", dst="green-host14")
+        rep = ScenarioReport.from_records("x", [s1, s2], [])
+        self.assertEqual(rep.duration_s, 4.0)
+        self.assertTrue(rep.durations_are_uniform)
+
+    def test_duration_s_none_when_no_flows(self):
+        # Empty report (e.g. dry-run that produced nothing) must
+        # gracefully return None instead of raising on max(empty).
         rep = ScenarioReport(scenario="empty")
+        self.assertIsNone(rep.duration_s)
+        self.assertTrue(rep.durations_are_uniform)
+
+    def test_render_ascii_does_not_repeat_duration(self):
+        # Duration is printed by the orchestrator's pre-run preamble,
+        # NOT by render_ascii (which runs after the scenario finishes).
+        # Avoid the double-print regression: render_ascii output must
+        # NOT contain the word "duration:" — that would mean both the
+        # preamble and the report are printing it.
+        rep = ScenarioReport.from_records("x", [_sender()], [])
         out = rep.render_ascii()
         self.assertNotIn("duration:", out)
 

@@ -765,20 +765,22 @@ def run_scenario(scenario: Scenario, *,
     receiver_records: list[dict] = []
     daemon_records: list[dict] = []
 
+    # Pre-run preamble — printed in BOTH verbose and non-verbose
+    # modes so the operator always knows how long the run will block
+    # before they decide whether to wait at the prompt. Heterogeneous
+    # flow durations report the max (run blocks until the longest
+    # flow finishes).
+    print(f"scenario: {scenario.name}")
+    if flows:
+        max_dur = max(f.duration_s for f in flows)
+        n_flows = len(flows)
+        if all(f.duration_s == max_dur for f in flows):
+            print(f"  duration: {max_dur:g}s ({n_flows} flow(s))")
+        else:
+            print(f"  duration: up to {max_dur:g}s "
+                  f"({n_flows} flow(s), mixed durations)")
+
     if verbose:
-        print(f"scenario: {scenario.name}")
-        # Show the expected run wall-clock so users know whether to
-        # wait or whether to start poking at the lab in another shell.
-        # When flows have heterogeneous durations we report the max
-        # (the run blocks until the longest flow finishes).
-        if flows:
-            max_dur = max(f.duration_s for f in flows)
-            n_flows = len(flows)
-            if all(f.duration_s == max_dur for f in flows):
-                print(f"  duration: {max_dur:g}s ({n_flows} flow(s))")
-            else:
-                print(f"  duration: up to {max_dur:g}s "
-                      f"({n_flows} flow(s), mixed durations)")
         if scenario.mrc is not None:
             print(f"  mrc: enabled (env={scenario.mrc.to_env_json()})")
         _print_ev_preview(flows, scenario.paths_per_plane)

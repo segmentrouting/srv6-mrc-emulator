@@ -426,22 +426,14 @@ class ScenarioReport:
         """
         lines: list[str] = []
         lines.append(f"scenario: {self.scenario}")
-        # Show wall-clock duration up front so users know whether to
-        # wait at the prompt or kick off something else in another
-        # shell. Mirrors the orchestrator's --verbose preamble; runs
-        # the same uniform-vs-mixed check so heterogeneous flow sets
-        # are rendered honestly ("up to Xs").
-        if self.duration_s is not None:
-            n = len(self.flows)
-            if self.durations_are_uniform:
-                lines.append(
-                    f"  duration: {self.duration_s:g}s ({n} flow(s))"
-                )
-            else:
-                lines.append(
-                    f"  duration: up to {self.duration_s:g}s "
-                    f"({n} flow(s), mixed durations)"
-                )
+        # NOTE: duration is intentionally NOT repeated here — the
+        # orchestrator (srv6_mrc/mrc/run.py) prints it as a pre-run
+        # preamble so the operator sees expected wall-clock BEFORE
+        # the run blocks, not after it returns. The duration_s /
+        # durations_are_uniform properties remain on ScenarioReport
+        # for callers that render reports out of band (e.g. offline
+        # JSON → ASCII conversion) where a pre-run preamble doesn't
+        # exist.
         lines.append("=" * 78)
 
         # Policy column width: header and row must match or the right-
