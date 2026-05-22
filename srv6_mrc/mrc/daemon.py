@@ -76,6 +76,7 @@ Lifecycle
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -103,6 +104,29 @@ from .transport import (
 
 
 log = logging.getLogger(__name__)
+
+
+def _canon_ipv6(addr: str) -> str:
+    """RFC 5952 canonical form, matching `socket.recvfrom`'s peer_addr[0].
+
+    Used to key/lookup `MrcDaemon._demux`. Both `inner_addr()`-produced
+    strings (which zero-pad hextets, e.g. "2001:db8:bbbb:07::2") and
+    kernel-canonical strings (zero-stripped, e.g. "2001:db8:bbbb:7::2")
+    must map to the same key. A scope-id suffix (`%ifname`) on
+    link-local addresses is stripped before parsing — the daemon only
+    ever talks to global addresses, but defensive normalization avoids
+    a future linkylocal-related foot-gun.
+
+    Returns the input string unchanged on parse failure so a malformed
+    `peer_addr` from recvfrom() (shouldn't happen) doesn't crash the
+    dispatcher's hot loop; the lookup just misses and the packet is
+    counted as `unknown peer`.
+    """
+    s = addr.split("%", 1)[0]
+    try:
+        return ipaddress.IPv6Address(s).compressed
+    except (ValueError, ipaddress.AddressValueError):
+        return addr
 
 
 DEFAULT_SNAPSHOT_DIR = "/dev/shm/srv6-mrc"
@@ -217,9 +241,23 @@ class MrcDaemon:
         self.agents: Dict[Tuple[str, int], SenderMrcAgent] = {}
         # Demux key: peer's inner anycast string -> agent. Built once
         # at construction so the dispatcher's hot path is just a dict
-        # lookup. Using the string form (not a parsed IPv6 tuple)
-        # because that's what `socket.recvfrom`'s peer_addr[0] returns
-        # in canonical form already (no normalization gymnastics).
+        # lookup.
+        #
+        # We MUST canonicalize the key on both insert and lookup. Two
+        # different string forms of the same IPv6 address exist:
+        #   - `inner_addr(green, 7)` builds "2001:db8:bbbb:07::2"
+        #     (zero-padded hextet from f"{host_id:02x}").
+        #   - `socket.recvfrom()`'s peer_addr[0] returns the kernel's
+        #     RFC 5952 canonical form "2001:db8:bbbb:7::2" (leading
+        #     zeros within each hextet are suppressed).
+        # Pre-fix, the dict was keyed by the unpadded inner_addr() form
+        # while the dispatcher looked up with the canonical form, so
+        # EVERY probe reply was silently dropped at the "unknown peer"
+        # branch — the bug was invisible because dispatch fell through
+        # to `continue` rather than logging at INFO. Normalizing through
+        # ipaddress.IPv6Address(...).compressed (the same form recvfrom
+        # returns) makes both sides agree. See AGENTS.md gotchas:
+        # "IPv6 string canonicalization" / `_canon_addr` in report.py.
         self._demux: Dict[str, SenderMrcAgent] = {}
 
         for flow in self.flows:
@@ -234,7 +272,7 @@ class MrcDaemon:
             )
             self.agents[(flow.tenant, flow.dst_id)] = agent
             peer_inner = inner_addr(flow.tenant, flow.dst_id)
-            self._demux[peer_inner] = agent
+            self._demux[_canon_ipv6(peer_inner)] = agent
 
     # --- public API ----------------------------------------------------
 
@@ -370,7 +408,15 @@ class MrcDaemon:
             if not payload:
                 continue
             peer_addr = peer[0] if isinstance(peer, tuple) else None
-            agent = self._demux.get(peer_addr) if peer_addr else None
+            # Strip any scope-id suffix ("fe80::1%eth0") so link-local
+            # forms don't break the lookup. Canonicalize through
+            # ipaddress.IPv6Address so the key form matches what
+            # inner_addr() produced at __init__ (both routed through
+            # _canon_ipv6).
+            agent = (
+                self._demux.get(_canon_ipv6(peer_addr))
+                if peer_addr else None
+            )
             if agent is None:
                 log.debug(
                     "mrc.daemon.dispatch: reply from unknown peer %s "

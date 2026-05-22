@@ -31,7 +31,7 @@ from typing import Dict, Tuple
 from unittest import mock
 
 from srv6_mrc.mrc.agent import AgentConfig
-from srv6_mrc.mrc.daemon import DaemonFlow, MrcDaemon
+from srv6_mrc.mrc.daemon import DaemonFlow, MrcDaemon, _canon_ipv6
 from srv6_mrc.mrc.probe import encode_probe_reply
 from srv6_mrc.mrc.transport import LoopbackUdpTransport
 from srv6_mrc.topo import (
@@ -171,7 +171,12 @@ class MrcDaemonDemuxKeysTests(unittest.TestCase):
         # One demux entry per flow. No collisions.
         self.assertEqual(len(d._demux), 3)
         for f in flows:
-            key = inner_addr(f.tenant, f.dst_id)
+            # _demux keys are RFC 5952-canonical, matching what
+            # socket.recvfrom() returns as peer_addr[0]. inner_addr()
+            # produces a zero-padded form ("...:0f::2") that doesn't
+            # match the kernel's canonical form ("...:f::2") for
+            # single-digit hextets — see _canon_ipv6 in daemon.py.
+            key = _canon_ipv6(inner_addr(f.tenant, f.dst_id))
             self.assertIn(key, d._demux,
                           f"flow {f} missing from _demux: keys={list(d._demux)}")
             # And the agent under that key is the same as the one
@@ -198,6 +203,45 @@ class MrcDaemonDemuxKeysTests(unittest.TestCase):
         keys = list(d._demux.keys())
         self.assertEqual(len(keys), len(set(keys)),
                          f"duplicate demux keys: {Counter(keys)}")
+
+    def test_demux_keys_are_rfc5952_canonical(self) -> None:
+        # Regression rail for the silent-drop bug fixed alongside this
+        # test: dispatcher looked up by `peer_addr[0]` (the kernel's
+        # canonical form, e.g. "2001:db8:bbbb:7::2") while keys were
+        # inserted as `inner_addr()` (zero-padded, e.g. "...:07::2").
+        # Every probe reply was dropped at the "unknown peer" branch
+        # and no EV ever recorded a probe success — root cause of the
+        # 2026-05-22 "MRC never demotes" lab report.
+        #
+        # Lock the contract: keys MUST be canonical (no leading zeros
+        # inside hextets). If you ever change the demux key shape, this
+        # test will fail loudly rather than silently regressing.
+        import ipaddress
+        flows = [
+            DaemonFlow(tenant="green", dst_id=d)
+            for d in (0, 1, 7, 9, 10, 15)
+        ]
+        d = MrcDaemon(
+            src_host="green-host00",
+            src_id=0,
+            flows=flows,
+            agent_cfg=FAST_CONFIG,
+            transport=self.sender_xport,
+            snapshot_dir=self.tmpdir,
+        )
+        for key in d._demux.keys():
+            self.assertEqual(
+                key,
+                ipaddress.IPv6Address(key).compressed,
+                f"demux key {key!r} is not RFC 5952-canonical "
+                f"(would not match socket.recvfrom() peer_addr[0])",
+            )
+        # And spot-check the specific case that triggered the bug:
+        # dst_id=7 -> kernel returns "2001:db8:bbbb:7::2", NOT
+        # "2001:db8:bbbb:07::2" — even though inner_addr() builds the
+        # latter. The demux MUST contain the former.
+        self.assertIn("2001:db8:bbbb:7::2", d._demux)
+        self.assertNotIn("2001:db8:bbbb:07::2", d._demux)
 
 
 class MrcDaemonMultiFlowDispatchTests(unittest.TestCase):
