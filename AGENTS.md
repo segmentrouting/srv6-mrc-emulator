@@ -14,9 +14,9 @@ For the human-facing tour: see `README.md` (overview), `docs/quickstart.md`
 
 A 4-plane SRv6 fabric on docker-sonic-vs + Containerlab. The default
 topology is `4p-4x8` (4 planes × 4 spines × 8 leaves per plane = 32
-fabric nodes, plus 16 alpine hosts: 8 green + 8 yellow). The full-scale
-reference design `4p-8x16` (4 planes × 8 spines × 16 leaves = 128 fabric
-nodes + 32 hosts) remains available via `make TOPO=4p-8x16 …` or
+fabric nodes, plus 16 alpine hosts: 8 green + 8 yellow). A larger scale
+design `4p-8x16` (4 planes × 8 spines × 16 leaves = 128 fabric
+nodes + 32 hosts) is available via `make TOPO=4p-8x16 …` or
 `SRV6_TOPO=…/4p-8x16/topo.yaml`. It demonstrates the MRC + SRv6-spray
 model: one logical flow fans out across all 4 planes by varying *only*
 the outer SID list.
@@ -73,9 +73,7 @@ leaves, container images, clab topology name. The generator
 `topology.clab.yaml` + the per-node `config/*` SONiC config snippets in
 the same directory. The `srv6_mrc.topo` runtime module also reads
 it at import time (via the `SRV6_TOPO` env var, defaulting to
-`topologies/4p-4x8/topo.yaml`). The full-scale 4p-8x16 reference
-design remains available via `SRV6_TOPO=…/4p-8x16/topo.yaml` or
-`make TOPO=4p-8x16 …`.
+`topologies/4p-4x8/topo.yaml`). 
 
 **Never hand-edit generated files**:
 - `topologies/<name>/topology.clab.yaml`
@@ -328,8 +326,8 @@ veths, runs `spray` send/recv inside the relevant containers via
 `docker exec`, and merges the JSON output into a `ScenarioReport`.
 
 ```
-run-scenario topologies/4p-8x16/scenarios/green-mrc-baseline.yaml --verbose
-run-scenario topologies/4p-8x16/scenarios/green-mrc-plane-loss.yaml --dry-run
+run-scenario topologies/4p-4x8/scenarios/green-mrc-baseline.yaml --verbose
+run-scenario topologies/4p-4x8/scenarios/green-mrc-plane-loss.yaml --dry-run
 ```
 
 `--dry-run` prints the plan plus the exact `nsenter ... tc qdisc add ...`

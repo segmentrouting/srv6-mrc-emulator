@@ -6,20 +6,19 @@ A research-grade simulator for Multipath Reliable Connection
 dockerized SONiC-VS instances and SRv6 capable Alpine linux containers 
 simulating hosts.
 
-The reference topology is a **4-plane × 8-spine × 16-leaf Clos** carrying
+The reference topology is a **4-plane × 4-spine × 8-leaf Clos** carrying
 two tenants (`green`, `yellow`). This repository also includes a topology 
 generator tool so additional topologies can be added under `topologies/<name>/`.
 
 ## Key Elements
 
 - **Pure-static control plane**: No BGP, no IGP. Every leaf carries its
-  own SRv6 locator + transit SIDs as `static-sids` in FRR
+  own SRv6 locator + transit SIDs as `static-sids` in FRR. [Example leaf config](./topologies/4p-4x8/config/p0-leaf00/frr.conf)
 - **config.sh shell script**: containerlab deploys the topology,  
   `scripts/config.sh` pushes the sonic nodes' config_db.json and FRR configs.
-- **Userspace MRC sender.** `spray` builds per-plane uSID-encapsulated
-  UDP frames in scapy, varies the spine per packet under the
-  `ev_spray` / `health_aware_mrc` policies so each packet traces a
-  distinct `(plane, path)` EV, and the receiver computes per-flow
+- **Userspace MRC traffic simulator** builds uSID-encapsulated
+  UDP frames in scapy and sprays them into the fabric so each packet traces a
+  distinct `(plane, path)` EV. Accompanying MRC receiver computes per-flow
   reorder-distance histograms (the MRC / SRv6 paper's reorder metric)
   plus loss, latency, and PPS. The MRC control plane (probes + loss
   feedback) rides the same SRv6-encapped raw-socket path as the data
@@ -30,11 +29,11 @@ generator tool so additional topologies can be added under `topologies/<name>/`.
   Alternatively the user can simply shutdown fabric interfaces with 
   `docker exec -it <nodename> config interface shutdown <interface>`
 - **Multi-tenancy with two SRv6 patterns.** Both tenants perform
-  host-encap. Green is *leaf-decapped* (uDT6 into `Vrf-green` on
+  *host-encap*. The Green tenant is *leaf-decapped* (uDT6 into `Vrf-green` on
   every leaf; the destination is an anycast `2001:db8:bbbb:<NN>::2`
-  configured on all 4 of the host's NICs). Yellow is *host-decapped*
-  via per-NIC `seg6local End.DT6 table 0` policies on the destination
-  host. 
+  configured on all 4 of the host's NICs) simulating multi-plane 
+  breakout. The Yellow tenant receives SRv6 encapsulated traffic and 
+  performs its own *host-decap* via linux `seg6local End.DT6` policies. 
 
 ## Quickstart
 
@@ -47,6 +46,8 @@ For more detail see design docs under [docs/](./docs/)
 ```
 srv6_mrc/           Python package: topology constants, runtime libs
   topo.py              fabric dimensions + addressing helpers (reads topo.yaml)
+  topology.py          typed Topology accessor (Refactor 1 in progress;
+                       parallel to topo.py during migration)
   runner.py            spray sender/receiver core
   encap.py             shared raw-socket SRv6 outer-packet builder
                        (used by runner.py and mrc/transport.py)
@@ -59,8 +60,11 @@ srv6_mrc/           Python package: topology constants, runtime libs
   cli/
     spray.py           userspace SRv6 packet generator (CLI: `spray`)
     routes.py          static SRv6 route management   (CLI: `routes`)
+    srctl.py           kubectl-shaped lab CLI         (CLI: `srctl`)
   mrc/
     run.py             scenario orchestrator           (CLI: `run-scenario`)
+    daemon.py          per-host MRC daemon: single SO_REUSEPORT reply-
+                       socket owner + per-flow snapshot writer
     scenario.py        scenario YAML schema + executor
     agent.py           SenderMrcAgent + ReceiverMrcAgent
     transport.py       MrcTransport ABC + Srv6RawTransport +
@@ -76,13 +80,13 @@ generators/
                        writes topology.clab.yaml + config/
 
 topologies/
-  4p-4x8/              4 planes × 4 spines × 8 leaves  (default; mid-size dev)
-  4p-8x16/             4 planes × 8 spines × 16 leaves (full-scale reference)
-  2p-4x8/              2 planes × 4 spines × 8 leaves  (smallest variant)
+  4p-4x8/              4 planes × 4 spines × 8 leaves x 16 hosts (8 Green, 8 Yellow) - default topology
+  4p-8x16/             4 planes × 8 spines × 16 leaves x 32 hosts (16 Green, 16 Yellow)
+  2p-4x8/              2 planes × 4 spines × 8 leaves  x 16 hosts
     topo.yaml          single source of truth for this variant
     topology.clab.yaml containerlab topology (generated)
     config/            per-node SONiC + FRR configs   (generated)
-    scenarios/         MRC scenario YAMLs
+    scenarios/         MRC traffic scenario YAMLs
     routes/            route-spec YAMLs for `routes apply`
     README.md          per-topology design notes
 

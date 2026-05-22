@@ -1,6 +1,6 @@
 ## Quickstart 4-Plane Containerlab Topology
 
-The 4-plane topology deploys 96 dockerized sonic-vs routers and 32 light Alpine containers simulating hosts attached to the network. The Alpine containers are divided into tenants *`green`* and *`yellow`*, with one *`green`* and one *`yellow`* attached to each leaf.
+The default 4-plane topology deploys with 4 spines and 8 leafs in each plane (48 dockerized sonic-vs routers total). It also deploys 16 light Alpine containers simulating hosts attached to the network. The Alpine containers are divided into tenants *`green`* and *`yellow`*, with one *`green`* and one *`yellow`* attached to each leaf.
 
 Example: *`green-host00`* has 4 uplinks, one to *`leaf00`* in each of the 4 planes.
 
