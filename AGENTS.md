@@ -809,6 +809,19 @@ host-side / orchestrator-side cure.
   on hosts that are also senders, before any accounting. Egress
   capture is unavoidable (promiscuous sockets) but trivially
   filterable once you know your own address.
+- **`docker exec` stdout is unreliable for large payloads at
+  container exit.** Dockerd's stdout multiplex stream silently
+  drops trailing frames if the container's monitor goroutine
+  observes exit before draining the stream. Symptom on
+  `green-all-to-all` (8 hosts): 7 daemons produced empty stdout,
+  1 produced stdout truncated at ~16 KiB (`Expecting ':' delimiter
+  at char 16390`) — frame-aligned, not arbitrary truncation. Any
+  in-container long-lived process whose final output exceeds a
+  few KiB must write the payload to a file (e.g. `/dev/shm/...`)
+  and have the orchestrator retrieve it via a second `docker exec
+  cat`. The MRC daemon does this for `final_report.json`; the
+  orchestrator falls back to stdout only for back-compat with
+  pre-fix daemon images.
 
 
 

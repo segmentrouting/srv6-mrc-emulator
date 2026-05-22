@@ -396,6 +396,33 @@ class MrcDaemonFinalReportTests(unittest.TestCase):
         self.assertIn("probe_clock", per_flow)
         self.assertIn("loss_fusion", per_flow)
 
+    def test_write_final_report_file_persists_to_disk(self) -> None:
+        # The orchestrator retrieves the daemon's final report via
+        # `docker exec <host> cat /dev/shm/srv6-mrc/<host>/final_report.json`
+        # because docker exec stdout silently drops trailing frames
+        # at container exit for large payloads. The daemon MUST
+        # write the file before exiting; this test pins that contract.
+        self.receiver.start()
+        self.daemon.start()
+        time.sleep(FAST_CONFIG.probe_interval_ms * 4 / 1000.0)
+        self.daemon.stop(timeout_s=1.0)
+
+        path = self.daemon.write_final_report_file()
+        # File exists at the path the orchestrator expects.
+        self.assertTrue(path.exists(),
+                        f"final_report.json missing at {path}")
+        self.assertEqual(path.name, "final_report.json")
+        # Path is under the per-host snapshot dir (mirrors the
+        # `/dev/shm/srv6-mrc/<host>/final_report.json` shape in
+        # the lab; here `<host>` is the tmpdir-based dir).
+        self.assertEqual(path.parent, self.daemon.snapshot_dir)
+        # Content is valid JSON with the same shape as final_report().
+        with open(path) as f:
+            on_disk = json.load(f)
+        self.assertEqual(on_disk["src_host"], "green-host00")
+        self.assertIn("flows", on_disk)
+        self.assertIn("green/15", on_disk["flows"])
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

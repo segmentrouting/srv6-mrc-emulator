@@ -604,7 +604,29 @@ def cmd_mrc_daemon(args, tenant: str, my_id: int) -> int:
     finally:
         daemon.stop(timeout_s=2.0)
 
-    # Final report: print JSON to stdout for the orchestrator to merge.
+    # Final report.
+    #
+    # File first, stdout second. The file is the orchestrator's
+    # authoritative read path because `docker exec` stdout silently
+    # truncates large payloads at container exit (dockerd's stdout
+    # multiplex stream drops trailing frames if the container's
+    # monitor goroutine sees exit before drain). We've observed
+    # 7-of-8 daemons producing empty stdout and 1 producing stdout
+    # truncated at ~16 KiB on a single `green-all-to-all` run.
+    # Stdout is retained so that a human running `spray --role
+    # mrc-daemon` interactively still sees the JSON. See
+    # daemon.FINAL_REPORT_FILENAME for the full rationale.
+    try:
+        path = daemon.write_final_report_file()
+        sys.stderr.write(
+            f"spray.py mrc-daemon: wrote final report to {path}\n"
+        )
+        sys.stderr.flush()
+    except Exception as e:
+        print(f"spray.py: final_report file write failed: {e}",
+              file=sys.stderr)
+        # Don't return early — still try stdout dump as last resort.
+
     try:
         report = daemon.final_report()
     except Exception as e:

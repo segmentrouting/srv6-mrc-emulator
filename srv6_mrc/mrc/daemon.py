@@ -107,6 +107,17 @@ log = logging.getLogger(__name__)
 
 DEFAULT_SNAPSHOT_DIR = "/dev/shm/srv6-mrc"
 
+# Filename used by `write_final_report_file()` for the on-exit dump.
+# Reading this back from disk is the orchestrator's authoritative path
+# for retrieving the daemon's final report — `docker exec` stdout is
+# unreliable for payloads of this size (dockerd's stdout multiplex
+# stream drops trailing frames if the container exits before drain;
+# we've observed 7-of-8 daemons producing empty stdout and 1 producing
+# stdout truncated at ~16 KiB on a `green-all-to-all` run). The file
+# is the source of truth; stdout is kept as a fallback for humans who
+# run `spray --role mrc-daemon` directly.
+FINAL_REPORT_FILENAME = "final_report.json"
+
 
 @dataclass(frozen=True)
 class DaemonFlow:
@@ -441,6 +452,28 @@ class MrcDaemon:
 
     def _snapshot_path(self, tenant: str, dst_id: int) -> Path:
         return self.snapshot_dir / f"{tenant}_{dst_id:02d}.json"
+
+    def final_report_path(self) -> Path:
+        """Path of the on-exit final-report file.
+
+        See FINAL_REPORT_FILENAME for why the file (not stdout) is
+        the source of truth the orchestrator reads back.
+        """
+        return self.snapshot_dir / FINAL_REPORT_FILENAME
+
+    def write_final_report_file(self) -> Path:
+        """Compute final_report() and atomically write it to disk.
+
+        Returns the path written. The orchestrator retrieves this
+        file via `docker exec <host> cat <path>` after teardown —
+        far more reliable than draining the daemon's stdout through
+        the dockerd exec multiplex stream, which silently drops
+        trailing frames at container exit (see FINAL_REPORT_FILENAME).
+        """
+        self._ensure_snapshot_dir()
+        path = self.final_report_path()
+        self._atomic_write_json(path, self.final_report())
+        return path
 
     def _ensure_snapshot_dir(self) -> None:
         try:

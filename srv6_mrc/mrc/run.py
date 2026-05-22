@@ -605,19 +605,53 @@ def run_flows(flows: list[FlowRun], *,
                 )
                 # Don't continue: try to parse stdout anyway, the
                 # daemon may have flushed before exiting nonzero.
-            line = out.strip()
-            if not line:
-                daemon_failures.append(
-                    f"daemon on {src_host}: empty stdout (rc={proc.returncode})"
-                )
-                continue
-            try:
-                daemon_records.append(json.loads(line))
-            except json.JSONDecodeError as e:
-                daemon_failures.append(
-                    f"daemon on {src_host} bad JSON: {e}: "
-                    f"stdout={line[:200]!r}"
-                )
+
+            # File-based retrieval (authoritative). `docker exec` stdout
+            # is unreliable for the daemon's final report — dockerd's
+            # stdout multiplex stream silently drops trailing frames at
+            # container exit. The daemon writes the report to
+            # /dev/shm/srv6-mrc/<src_host>/final_report.json BEFORE
+            # exiting; we cat it back here via a second docker exec.
+            # Stdout is retained as a fallback for back-compat with
+            # any in-container image still on the pre-fix daemon
+            # (it would have empty/garbage on-disk).
+            record: dict | None = None
+            file_path = (
+                f"/dev/shm/srv6-mrc/{src_host}/final_report.json"
+            )
+            cat_res = docker_exec(
+                src_host, ["cat", file_path], timeout_s=5.0,
+            )
+            if cat_res.rc == 0 and cat_res.stdout.strip():
+                try:
+                    record = json.loads(cat_res.stdout)
+                except json.JSONDecodeError as e:
+                    daemon_failures.append(
+                        f"daemon on {src_host} bad JSON in {file_path}: "
+                        f"{e}: stdout={cat_res.stdout[:200]!r}"
+                    )
+
+            if record is None:
+                # Fall back to stdout for older daemon images.
+                line = out.strip()
+                if not line:
+                    daemon_failures.append(
+                        f"daemon on {src_host}: no final report "
+                        f"(file rc={cat_res.rc}, stdout empty, "
+                        f"daemon rc={proc.returncode})"
+                    )
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as e:
+                    daemon_failures.append(
+                        f"daemon on {src_host} bad JSON in stdout "
+                        f"(file rc={cat_res.rc} also failed): {e}: "
+                        f"stdout={line[:200]!r}"
+                    )
+                    continue
+
+            daemon_records.append(record)
 
     # Wait for all receivers to self-exit on idle-timeout, then collect.
     receiver_records: list[dict] = []

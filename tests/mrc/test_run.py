@@ -399,6 +399,14 @@ class TestMrcDaemonTeardown(unittest.TestCase):
             if argv and argv[0] == "pkill":
                 return mock.Mock(rc=0, stdout="", stderr="",
                                  cmd=[], elapsed_s=0.01)
+            if argv and argv[0] == "cat":
+                # File-based final-report retrieval (the new path).
+                # Return the same JSON the fake daemon would have
+                # written to /dev/shm/srv6-mrc/<host>/final_report.json.
+                return mock.Mock(
+                    rc=0, stdout=_ok_daemon_json(), stderr="",
+                    cmd=[], elapsed_s=0.01,
+                )
             return mock.Mock(
                 rc=0,
                 stdout=_ok_sender_json("green-host00", "green-host15"),
@@ -430,6 +438,164 @@ class TestMrcDaemonTeardown(unittest.TestCase):
         self.assertIn("spray", argv)
         # Daemon report parsed and merged.
         self.assertEqual(len(daemons), 1)
+
+    def test_final_report_read_from_file_not_stdout(self):
+        # Pins the new file-primary handoff: `docker exec` stdout for
+        # the daemon is unreliable for large payloads (dockerd's stdout
+        # multiplex stream silently drops trailing frames at container
+        # exit — observed as 7-of-8 empty + 1 truncated-at-16KiB on
+        # green-all-to-all). The daemon writes final_report.json to
+        # /dev/shm before exiting; the orchestrator cats it back. This
+        # test forces stdout to be empty (simulating dockerd dropping
+        # everything) and the file to be valid — the report must still
+        # come through.
+        flows = self._mrc_flow()
+        # Daemon Popen returns EMPTY stdout — the failure mode we're
+        # actually seeing in the lab.
+        daemon_proc = _FakeDaemonPopen(stdout="")
+
+        cat_call_args = []
+
+        def fake_async(container, argv, *, env=None):
+            if "mrc-daemon" in argv:
+                return daemon_proc
+            return _FakePopen(stdout=_ok_receiver_json())
+
+        def fake_exec(container, argv, *, timeout_s=None, env=None):
+            if argv and argv[0] == "pkill":
+                return mock.Mock(rc=0, stdout="", stderr="",
+                                 cmd=[], elapsed_s=0.01)
+            if argv and argv[0] == "cat":
+                cat_call_args.append((container, tuple(argv)))
+                return mock.Mock(
+                    rc=0, stdout=_ok_daemon_json(), stderr="",
+                    cmd=[], elapsed_s=0.01,
+                )
+            return mock.Mock(
+                rc=0,
+                stdout=_ok_sender_json("green-host00", "green-host15"),
+                stderr="", cmd=[], elapsed_s=1.0,
+            )
+
+        with mock.patch("srv6_mrc.mrc.run.docker_exec_async",
+                        side_effect=fake_async), \
+             mock.patch("srv6_mrc.mrc.run.docker_exec",
+                        side_effect=fake_exec), \
+             mock.patch("srv6_mrc.mrc.run.time.sleep"):
+            _senders, _receivers, daemons = run_flows(
+                flows, settle_s=0, idle_timeout_s=1.0,
+                mrc=MrcSpec(),
+            )
+
+        # Orchestrator cat'd the expected file path.
+        self.assertEqual(len(cat_call_args), 1,
+                         f"expected exactly one cat call, got "
+                         f"{cat_call_args}")
+        host, argv = cat_call_args[0]
+        self.assertEqual(host, "green-host00")
+        self.assertEqual(
+            argv,
+            ("cat", "/dev/shm/srv6-mrc/green-host00/final_report.json"),
+        )
+        # Despite empty stdout, the daemon record came through via
+        # the file path.
+        self.assertEqual(len(daemons), 1)
+        self.assertEqual(daemons[0]["src_host"], "green-host00")
+
+    def test_final_report_falls_back_to_stdout_when_file_missing(self):
+        # Back-compat: if a stale daemon image is running that doesn't
+        # write final_report.json (cat returns rc!=0), the orchestrator
+        # falls back to parsing the daemon's stdout. Otherwise rolling
+        # the new orchestrator into a half-updated lab would brick
+        # every existing container until `make image && make deploy`.
+        flows = self._mrc_flow()
+        # Stdout has the full daemon JSON (old behavior).
+        daemon_proc = _FakeDaemonPopen(stdout=_ok_daemon_json())
+
+        def fake_async(container, argv, *, env=None):
+            if "mrc-daemon" in argv:
+                return daemon_proc
+            return _FakePopen(stdout=_ok_receiver_json())
+
+        def fake_exec(container, argv, *, timeout_s=None, env=None):
+            if argv and argv[0] == "pkill":
+                return mock.Mock(rc=0, stdout="", stderr="",
+                                 cmd=[], elapsed_s=0.01)
+            if argv and argv[0] == "cat":
+                # Simulate old daemon image: file doesn't exist.
+                return mock.Mock(
+                    rc=1, stdout="",
+                    stderr="cat: can't open ...: No such file or directory",
+                    cmd=[], elapsed_s=0.01,
+                )
+            return mock.Mock(
+                rc=0,
+                stdout=_ok_sender_json("green-host00", "green-host15"),
+                stderr="", cmd=[], elapsed_s=1.0,
+            )
+
+        with mock.patch("srv6_mrc.mrc.run.docker_exec_async",
+                        side_effect=fake_async), \
+             mock.patch("srv6_mrc.mrc.run.docker_exec",
+                        side_effect=fake_exec), \
+             mock.patch("srv6_mrc.mrc.run.time.sleep"):
+            _senders, _receivers, daemons = run_flows(
+                flows, settle_s=0, idle_timeout_s=1.0,
+                mrc=MrcSpec(),
+            )
+
+        # Fall-back path produced the record from stdout.
+        self.assertEqual(len(daemons), 1)
+        self.assertEqual(daemons[0]["src_host"], "green-host00")
+
+    def test_final_report_missing_everywhere_is_reported_as_failure(self):
+        # Both paths fail (no file, empty stdout). The orchestrator
+        # MUST emit a daemon_failures entry (not silently drop) and
+        # the failure message must mention BOTH paths so the operator
+        # knows it's not just a stdout-drain issue.
+        flows = self._mrc_flow()
+        daemon_proc = _FakeDaemonPopen(stdout="")
+
+        def fake_async(container, argv, *, env=None):
+            if "mrc-daemon" in argv:
+                return daemon_proc
+            return _FakePopen(stdout=_ok_receiver_json())
+
+        def fake_exec(container, argv, *, timeout_s=None, env=None):
+            if argv and argv[0] == "pkill":
+                return mock.Mock(rc=0, stdout="", stderr="",
+                                 cmd=[], elapsed_s=0.01)
+            if argv and argv[0] == "cat":
+                return mock.Mock(
+                    rc=1, stdout="", stderr="not found",
+                    cmd=[], elapsed_s=0.01,
+                )
+            return mock.Mock(
+                rc=0,
+                stdout=_ok_sender_json("green-host00", "green-host15"),
+                stderr="", cmd=[], elapsed_s=1.0,
+            )
+
+        with mock.patch("srv6_mrc.mrc.run.docker_exec_async",
+                        side_effect=fake_async), \
+             mock.patch("srv6_mrc.mrc.run.docker_exec",
+                        side_effect=fake_exec), \
+             mock.patch("srv6_mrc.mrc.run.time.sleep"), \
+             mock.patch("sys.stderr") as mock_stderr:
+            _senders, _receivers, daemons = run_flows(
+                flows, settle_s=0, idle_timeout_s=1.0,
+                mrc=MrcSpec(),
+            )
+
+        self.assertEqual(len(daemons), 0)
+        # The diagnostic message went to stderr and mentions BOTH
+        # the file rc and the stdout state.
+        stderr_writes = "".join(
+            call.args[0] for call in mock_stderr.write.call_args_list
+        )
+        self.assertIn("green-host00", stderr_writes)
+        self.assertIn("file rc=", stderr_writes)
+        self.assertIn("stdout empty", stderr_writes)
 
 
 if __name__ == "__main__":
