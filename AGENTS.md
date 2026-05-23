@@ -923,6 +923,53 @@ host-side / orchestrator-side cure.
   would otherwise look arbitrary.
 - Don't add emojis to files or output unless asked.
 
+## Knowledge graph (graphify)
+
+A graphify-built knowledge graph of the repo lives under
+`graphify-out/` (gitignored). Useful for "where does X connect to Y"
+questions, finding code↔design-doc bridges, and auditing the
+god-node neighbourhood (`EVStateTable`, `SenderMrcAgent`,
+`ReceiverMrcAgent`, `MrcDaemon`, `Topology`, etc.) before refactors.
+
+- `graphify-out/graph.html` — interactive node-level viz, open in
+  any browser.
+- `graphify-out/GRAPH_REPORT.md` — god nodes, surprising
+  connections, suggested questions.
+- `graphify-out/graph.json` — raw graph (consumed by
+  `graphify query "..."` for BFS/DFS traversal and by the MCP
+  server if wired up).
+
+Pruned artefacts the current graph deliberately collapses (every
+rebuild must redo this, or the graph drowns in template noise):
+
+1. `topologies/<topo>/config/<node>/config_db.json` — the AST
+   extractor walks every JSON key. Each per-node dir is collapsed
+   to one synthetic vertex (label = node name, e.g. `p0-leaf00`),
+   with a `Topology <name>` root vertex containing them via
+   `contains` edges. Saves ~44k noise nodes on a 4p-4x8 + 4p-8x16
+   pair.
+2. `generators/sonic_vs_port_table.json` — config-generator
+   template, same key-explosion pattern. Collapsed to a single
+   `sonic_vs_port_table.json (template)` vertex. ~225 noise
+   nodes.
+
+Both pruned subgraphs were verified to have **zero bridge edges**
+to the MRC code subgraph before collapse, so no signal was lost.
+
+If you regenerate the graph and add new JSON data templates under
+`generators/` or new topology variants under `topologies/`, apply
+the same prune (see `graphify-out/cost.json` for the prior run's
+manifest; the prune logic itself was ad-hoc Python over
+`graph.json`, not yet codified — TODO: ship a
+`scripts/graphify_prune.py` so the cleanup is repeatable).
+
+The graph's audit trail (EXTRACTED vs INFERRED edges) is
+trustworthy with one known caveat: the AST extractor emits
+`confidence=INFERRED, confidence_score=0.5, relation=uses` for
+plain class references that should be EXTRACTED. Filter these out
+when reading "INFERRED edge count" warnings — only edges with
+`confidence_score >= 0.55` are genuine LLM-reasoned guesses.
+
 ## Quick-start verification
 
 After any change touching addressing / SID shape / routing:
