@@ -43,7 +43,7 @@ flows:
   - pairs: yellow-all-to-all
     policy: health_aware_mrc
     rate: 20pps
-    duration: 60s
+    duration: 30s
 
 faults: []
 

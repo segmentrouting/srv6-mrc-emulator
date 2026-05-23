@@ -34,7 +34,7 @@ description: |
 flows:
   - pairs: yellow-pairs
     policy: round_robin
-    rate: 1000pps
+    rate: 500pps
     duration: 5s
 
 faults: []

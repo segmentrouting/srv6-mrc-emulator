@@ -32,7 +32,7 @@ flows:
   - pairs: green-pairs-8
     policy: health_aware_mrc
     rate: 100pps
-    duration: 60s
+    duration: 30s
 
 faults: []
 

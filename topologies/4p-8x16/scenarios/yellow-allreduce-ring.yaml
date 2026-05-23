@@ -53,7 +53,7 @@ flows:
   - pairs: yellow-ring
     policy: health_aware_mrc
     rate: 100pps
-    duration: 60s
+    duration: 30s
 
 faults: []
 

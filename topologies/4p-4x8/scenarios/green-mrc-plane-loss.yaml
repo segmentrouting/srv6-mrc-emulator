@@ -27,7 +27,7 @@ flows:
       - { tenant: green, src: 0, dst: 7 }
     policy: health_aware_mrc
     rate: 500pps
-    duration: 8s
+    duration: 10s
 
 faults:
   - kind: netem

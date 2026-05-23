@@ -43,8 +43,8 @@ flows:
   - pairs: yellow-all-to-all
     #policy: ev_spray
     policy: health_aware_mrc
-    rate: 20pps
-    duration: 60s
+    rate: 10pps
+    duration: 30s
 
 faults: []
 
