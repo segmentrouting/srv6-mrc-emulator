@@ -56,9 +56,18 @@ import socket
 from abc import ABC, abstractmethod
 from typing import Dict, Optional, Tuple
 
-from ..encap import build_outer_packet, open_raw_send_socket
+from ..encap import (
+    PAYLOAD_OFFSET,
+    UDP_HEADER_LEN,
+    build_outer_packet,
+    build_outer_template,
+    open_raw_send_socket,
+    udp6_checksum_inplace,
+)
 from ..topo import (
+    NUM_LEAVES,
     NUM_PLANES,
+    NUM_SPINES,
     PLANE_NICS,
     SPRAY_PROBE_PORT,
     SPRAY_REPORT_PORT,
@@ -202,6 +211,23 @@ class Srv6RawTransport(MrcTransport):
                 bind_addr="::", bind_port=SPRAY_PROBE_PORT,
             )
 
+        # Reply-template cache: keyed by (plane, path, dst_leaf), value is
+        # a pre-built bytearray with outer+inner+UDP headers populated and
+        # zero-filled payload + zero UDP checksum. The per-reply hot path
+        # clones this, splices the 28B payload at [PAYLOAD_OFFSET:], and
+        # runs `udp6_checksum_inplace` — eliminating ~2-3ms of scapy build
+        # per reply. Eagerly pre-warmed for receivers (is_sender=False)
+        # because that's where the bottleneck lives (the agent's
+        # probe-RX loop must reply at probe-emit rate); senders skip the
+        # warm-up since they only build replies in the rare loss-report
+        # echo path. Cache miss falls back to scapy via `send_probe_reply`.
+        self._reply_templates: Dict[
+            Tuple[int, int, int], Tuple[bytes, str]
+        ] = {}
+        self._fast_path_misses: int = 0
+        if not is_sender:
+            self._prewarm_reply_templates()
+
     # --- send_* ---
 
     def send_probe(self, *, plane, path, dst_leaf, payload):
@@ -211,11 +237,39 @@ class Srv6RawTransport(MrcTransport):
         )
 
     def send_probe_reply(self, *, plane, path, dst_leaf, payload):
-        # Replies go to the sender's report-listener port.
-        self._send_encapped(
-            plane=plane, path=path, dst_leaf=dst_leaf, payload=payload,
-            sport=SPRAY_PROBE_PORT, dport=SPRAY_REPORT_PORT,
-        )
+        # Replies go to the sender's report-listener port. Hot path: use
+        # the pre-built byte template for (plane, path, dst_leaf), splice
+        # the payload, fix the UDP6 checksum, then raw sendto. Falls back
+        # to the scapy slow path on cache miss (logged once); receivers
+        # pre-warm the full grid in __init__ so misses should be zero in
+        # practice, but a malformed dst_leaf or fresh-peer race must not
+        # crash the loop.
+        key = (plane, path, dst_leaf)
+        cached = self._reply_templates.get(key)
+        if cached is None:
+            self._fast_path_misses += 1
+            if self._fast_path_misses == 1:
+                log.warning(
+                    "Srv6RawTransport: reply-template cache miss "
+                    "(plane=%d path=%d dst_leaf=%d); falling back to "
+                    "scapy slow path. Further misses will be silent.",
+                    plane, path, dst_leaf,
+                )
+            self._send_encapped(
+                plane=plane, path=path, dst_leaf=dst_leaf, payload=payload,
+                sport=SPRAY_PROBE_PORT, dport=SPRAY_REPORT_PORT,
+            )
+            return
+
+        template_bytes, outer_dst = cached
+        # Slice the template + splice payload in one allocation. The
+        # template is held immutable (bytes) so concurrent callers on
+        # the same key cannot corrupt each other.
+        pkt = bytearray(template_bytes)
+        payload_len = len(payload)
+        pkt[PAYLOAD_OFFSET:PAYLOAD_OFFSET + payload_len] = payload
+        udp6_checksum_inplace(pkt, UDP_HEADER_LEN + payload_len)
+        self._raw_sockets[plane].sendto(bytes(pkt), (outer_dst, 0, 0, 0))
 
     def send_loss_report(self, *, plane, path, dst_leaf, payload):
         # LOSS_REPORTs also go to the sender's report-listener port,
@@ -261,6 +315,58 @@ class Srv6RawTransport(MrcTransport):
                 "Srv6RawTransport(is_sender=True) has no probe socket"
             )
         return self._probe_sock
+
+    # --- fast-path template cache ---
+
+    def _prewarm_reply_templates(self) -> None:
+        """Build a reply-byte template for every (plane, path, peer_leaf).
+
+        Run once at receiver __init__. Cost is one scapy outer-build per
+        template — for 4p-4x8 that's 4*4*8=128 builds (~250ms), for
+        4p-8x16 it's 4*8*16=512 (~1s), for N=32 it's 4*8*32=1024 (~2s).
+        Accepted as one-time receiver startup cost; the alternative is
+        a synchronous scapy build on every reply at 530+ replies/sec
+        per receiver, which is the bug we're fixing.
+
+        Skip building a template where dst_leaf == self.my_id (a host
+        doesn't probe itself, so no reply will ever be needed).
+        """
+        own_src_underlay_by_plane = self._src_underlay_by_plane
+        own_src_inner = self._src_inner
+        # Reply sport/dport are fixed by the protocol contract
+        # (PROBE arrived on SPRAY_PROBE_PORT; reply goes to
+        # SPRAY_REPORT_PORT on the sender's report listener).
+        sport = SPRAY_PROBE_PORT
+        dport = SPRAY_REPORT_PORT
+        built = 0
+        for plane in range(NUM_PLANES):
+            src_underlay = own_src_underlay_by_plane[plane]
+            for path in range(NUM_SPINES):
+                for dst_leaf in range(NUM_LEAVES):
+                    if dst_leaf == self.my_id:
+                        continue
+                    outer_dst = usid_outer_dst(
+                        self.tenant,
+                        plane=plane, spine=path, dst_leaf=dst_leaf,
+                    )
+                    dst_inner = inner_addr(self.tenant, dst_leaf)
+                    tpl = build_outer_template(
+                        src_underlay=src_underlay,
+                        dst_outer=outer_dst,
+                        src_inner=own_src_inner,
+                        dst_inner=dst_inner,
+                        sport=sport, dport=dport,
+                    )
+                    self._reply_templates[(plane, path, dst_leaf)] = (
+                        bytes(tpl), outer_dst,
+                    )
+                    built += 1
+        log.info(
+            "Srv6RawTransport: pre-warmed %d reply templates "
+            "(tenant=%s my_id=%d planes=%d spines=%d leaves=%d)",
+            built, self.tenant, self.my_id,
+            NUM_PLANES, NUM_SPINES, NUM_LEAVES,
+        )
 
     # --- lifecycle ---
 
