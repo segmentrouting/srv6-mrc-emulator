@@ -81,6 +81,11 @@ _MAGIC_LOSS_REPORT = 0xA7
 _PROBE_FMT = "!BBHBBQQHHH"
 _PROBE_SIZE = struct.calcsize(_PROBE_FMT)   # 28 bytes
 
+# Public alias for byte-template consumers (e.g. Srv6RawTransport's
+# reply-template pre-warm). PROBE and PROBE_REPLY share the same struct
+# layout, so this is also the PROBE_REPLY payload length.
+PROBE_REPLY_PAYLOAD_LEN = _PROBE_SIZE
+
 # LOSS_REPORT header: magic, version, window_id, num_records, _rsv
 _LOSS_HDR_FMT = "!BBHHH"
 _LOSS_HDR_SIZE = struct.calcsize(_LOSS_HDR_FMT)  # 8 bytes

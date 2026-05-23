@@ -58,12 +58,12 @@ from typing import Dict, Optional, Tuple
 
 from ..encap import (
     PAYLOAD_OFFSET,
-    UDP_HEADER_LEN,
     build_outer_packet,
     build_outer_template,
     open_raw_send_socket,
     udp6_checksum_inplace,
 )
+from .probe import PROBE_REPLY_PAYLOAD_LEN
 from ..topo import (
     NUM_LEAVES,
     NUM_PLANES,
@@ -268,7 +268,7 @@ class Srv6RawTransport(MrcTransport):
         pkt = bytearray(template_bytes)
         payload_len = len(payload)
         pkt[PAYLOAD_OFFSET:PAYLOAD_OFFSET + payload_len] = payload
-        udp6_checksum_inplace(pkt, UDP_HEADER_LEN + payload_len)
+        udp6_checksum_inplace(pkt, payload_len=payload_len)
         self._raw_sockets[plane].sendto(bytes(pkt), (outer_dst, 0, 0, 0))
 
     def send_loss_report(self, *, plane, path, dst_leaf, payload):
@@ -356,6 +356,7 @@ class Srv6RawTransport(MrcTransport):
                         src_inner=own_src_inner,
                         dst_inner=dst_inner,
                         sport=sport, dport=dport,
+                        payload_len=PROBE_REPLY_PAYLOAD_LEN,
                     )
                     self._reply_templates[(plane, path, dst_leaf)] = (
                         bytes(tpl), outer_dst,
