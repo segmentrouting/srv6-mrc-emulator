@@ -589,6 +589,49 @@ make test
   2026-05-23 alongside the demux IPv6 canonicalization fix; the
   two together account for the entire "EV demoted by daemon but
   sender keeps spraying through it" failure mode.
+  **Inner EV-records shape (verified 2026-05-23 lab snapshot)**:
+  `.ev_state.tenants["<tenant>"]` is a **list** of per-EV dicts
+  `{plane, path, state, consecutive_probe_timeouts,
+   consecutive_probe_successes, consecutive_loss_demote_windows,
+   last_loss_ratio, rtt_p50_ns, rtt_p99_ns, transitions,
+   demotes_suppressed_by_floor, weight}`. NOT a dict keyed by
+  `"P<p>:S<s>"`. Top-level also includes `config:
+  {probe_fail_threshold, probe_recover_threshold, loss_threshold,
+   loss_demote_consecutive, min_active_evs}`, `num_planes`,
+  `num_paths`. `rtt_p50_ns` can be `null` on EVs that never
+  registered a successful probe — guard with `// 0` in jq.
+- **Every byte-template / manual-checksum helper call site must
+  be exercised through the public transport API end-to-end, not
+  just in isolation.** Unit-level tests for `build_outer_template`
+  and `udp6_checksum_inplace` (`tests/test_encap_template.py`)
+  pass arguments by name with the right values — they're
+  validating the algorithm, not the call sites that consume it.
+  The 2026-05-23 lab crash was caused by:
+    1. `_prewarm_reply_templates` calling `build_outer_template(
+       src_underlay=..., dst_outer=..., src_inner=..., dst_inner=...,
+       sport=..., dport=...)` without the required `payload_len=`
+       kwarg — receiver crashed at startup, every flow showed
+       `rx=0`.
+    2. `send_probe_reply` calling `udp6_checksum_inplace(pkt,
+       UDP_HEADER_LEN + payload_len)` — positional arg into a
+       `*, payload_len` kw-only parameter, AND wrong value
+       (function wants UDP payload length, not UDP header+payload).
+       Hidden behind bug #1; would have silently corrupted every
+       reply's UDP6 checksum once bug #1 was fixed.
+  Both passed the unit suite because no test built an
+  `Srv6RawTransport(is_sender=False)` end-to-end and asserted the
+  reply bytes match the scapy slow path. Regression tests now in
+  `tests/test_mrc_transport.py::ReceiverPrewarmStartupTests` and
+  `::FastPathByteIdentityTests` (the byte-identity test mocks
+  raw sockets, so it runs without CAP_NET_RAW, but is scapy-gated;
+  the prewarm test that needs scapy is too — laptop without scapy
+  catches the **sender** side of the same family via
+  `test_sender_init_skips_prewarm`). **When adding ANY new
+  byte-template path (e.g. probe-emit fast-path on the sender
+  side, which is the current top hypothesis for the "every host
+  is both sender AND receiver" investigation), follow the same
+  pattern: byte-identity against the scapy slow path is the only
+  honest oracle for "is the checksum right".**
 
 ## Open investigations (not yet root-caused)
 
@@ -666,33 +709,110 @@ remaining live EVs cluster on a couple of planes by chance.
   `ev_state` defaults; fixed in `d37d70e` (skip-on-no-pairing) and
   `5093246` (raise loss thresholds above straggle floor). 16/16 EVs
   on healthy fabric across green and yellow baselines confirmed.
+- **2026-05-23**: Hypothesis #5 (receiver probe-RX scapy build
+  budget) fixed in `200465f` (fast-path byte template + manual
+  UDP6 checksum, ~10-20µs per reply vs ~2-3ms scapy build). Two
+  follow-up bugs in the receiver-side prewarm path fixed in
+  `4c01f7a` (missing `payload_len=` kwarg + wrong positional arg
+  to `udp6_checksum_inplace`). After all three commits, the lab
+  picture is **half-better**:
+  - `green-all-to-all` (4p-4x8, 56 flows × 30s): **0.00% loss
+    on all 56 flows, 16/16 EVs on 55/56 flows**, per-plane
+    balance tight (3650-4334), one transient demote on
+    `green-host05 -> host07` (15/16, p1-spine00 unused).
+  - `yellow-all-to-all` (4p-4x8, 56 flows × 30s): **~0.3% loss
+    average, 8-9/16 EVs per flow held only by `min_active_evs`
+    floor**, per-plane spread 2× (2544-5417 between planes 1/2
+    vs 0/3). The 8/16 number is the floor, not real health.
+  - **Snapshot diagnostic** (after lab returned the 8/16 numbers):
+    `docker exec yellow-host00 cat
+    /dev/shm/srv6-mrc/yellow-host00/yellow_01.json | jq '.ev_state.tenants.yellow'`
+    shows **every EV has `consecutive_probe_successes: 0` and
+    `consecutive_probe_timeouts: 758-761`**. Half-good half-bad
+    only because `demotes_suppressed_by_floor: 758` kept 8 EVs
+    in `good` arbitrarily. Same snapshot on green showed the
+    same shape — 0 successes, 5-341 timeouts, `rtt_p50_ns:
+    113-138ms` on the EVs that DID have RTT history. Green's
+    report looked clean because `mrc_snapshot` falls back to
+    uniform weight 0.125 across the 8 floor-protected EVs,
+    masking the underlying probe failure.
+  - **Smoking gun**: `DEFAULT_PROBE_TIMEOUT_MS = 100`, but
+    measured `rtt_p50` on green is **113-138ms** — every probe
+    is timing out by construction because the timeout is shorter
+    than the actual fabric RTT under load. The "fast-path"
+    reply build (10-20µs) means the receiver is no longer the
+    bottleneck. The new suspect is **probe EMIT** (sender side):
+    `_send_encapped` still uses scapy `build_outer_packet` (~2-3ms
+    per probe). At 7 dst per host × 16 EVs/round × 5 rounds/sec
+    = 560 scapy builds/sec/host, the emit threads are GIL-bound
+    and `mrc-reply-rx` is starved.
 
-**Next diagnostic step (tomorrow morning, 2 minutes of lab time)**:
-4×8 grid scan to count packets per (plane, spine) during a 60s
-`yellow-allreduce-ring` run:
+**Resolved sub-bugs (kept for the trail)**:
+- `200465f`: fast-path probe reply via byte template + manual UDP6
+  checksum. Replaces scapy in `Srv6RawTransport.send_probe_reply`.
+- `4c01f7a`: fix receiver-startup crash (missing `payload_len=` in
+  `_prewarm_reply_templates`) + wrong positional arg to
+  `udp6_checksum_inplace` (would have produced wrong UDP csums
+  silently if bug #1 hadn't crashed the receiver first). Adds
+  laptop regression tests including byte-identity-vs-scapy.
+
+**Current top hypothesis (2026-05-23)**:
+Probe **emit** path (sender, scapy `build_outer_packet`) is now the
+binding bottleneck — same shape as the original receiver bug, just
+the other direction. Fix is symmetrical: add a probe-emit template
+cache to `Srv6RawTransport`. Pre-build per `(plane, path, dst_leaf)`
+at sender `__init__` when `is_sender=True`. Splice 28-byte probe
+payload at `PAYLOAD_OFFSET`, fix UDP checksum, send. Expected to
+drop emit cost from ~2-3ms to ~10-20µs and free the GIL for
+`mrc-reply-rx` to drain replies on time. Byte-identity regression
+test pattern already exists in
+`tests/test_mrc_transport.py::FastPathByteIdentityTests` —
+mirror it for the sender side.
+
+**Secondary hypothesis if probe-emit fast-path is not enough**:
+Per-flow `SenderMrcAgent` (one per dst per src host) duplicates
+probe work. With 7 destinations per host in all-to-all, each host
+runs 7 emit threads. AGENTS.md notes "Per-host MRC agent with IPC"
+as future work (`daemon.py:65` comment). The daemon already
+collapsed the **reply RX socket** to one per host; collapsing
+the **emit thread** to one per host (probe to anycast inner_dst,
+all 16 receivers reply, demux replies to the right per-dst
+EVStateTable by inbound peer src) would cut emit load 7× per host
+at all-to-all scale.
+
+**Lab snapshot diagnostic commands (use these from here on)**:
 
 ```bash
-for p in 0 1 2 3; do
-  for s in 00 01 02 03 04 05 06 07; do
-    n=$(timeout 5 docker exec p${p}-spine${s} tcpdump -nni Ethernet0 \
-        'ip6 and udp' 2>/dev/null | wc -l)
-    printf "p%d-spine%s: %s pkts\n" $p $s $n
-  done
-done
+# Per-EV state from one snapshot file (the // 0 guard handles
+# null rtt_p50_ns on EVs that never had a successful probe):
+docker exec <src_host> cat \
+  /dev/shm/srv6-mrc/<src_host>/<tenant>_<dd>.json \
+  | jq '.ev_state.tenants["<tenant>"] | map({
+        p: .plane, s: .path, st: .state,
+        ok: .consecutive_probe_successes,
+        to: .consecutive_probe_timeouts,
+        rtt_ms: ((.rtt_p50_ns // 0)/1000000 | floor),
+        w: .weight, sup: .demotes_suppressed_by_floor
+      })'
+
+# UDP / IPv6 kernel stats — confirm whether replies are being
+# delivered to userspace at all (Udp6RcvbufErrors must be 0;
+# if Ip6InDelivers >> Udp6InDatagrams, replies are arriving as
+# IPv6 but never becoming UDP):
+docker exec <src_host> sh -c 'cat /proc/net/snmp6 | grep -E \
+  "Ip6InDelivers|Ip6InDiscards|Udp6InDatagrams|Udp6RcvbufErrors"'
+
+# Snapshot envelope shape (in case it changes again — current
+# is {captured_ns, dst_id, ev_state, src_host, src_id, tenant}
+# with .ev_state.tenants["<tenant>"] as a list of per-EV dicts):
+docker exec <src_host> cat \
+  /dev/shm/srv6-mrc/<src_host>/<tenant>_<dd>.json | jq 'keys'
 ```
 
-Three possible outcomes branch the investigation cleanly:
-
-1. **All 32 cells roughly equal** → data is well-distributed
-   across EVs. The 16/32 demotion is purely a probe/reply path
-   bug (hypotheses 3, 4, 5 above remain in play; the ICMP-9999
-   issue gets promoted back to suspect).
-2. **~16 of 32 cells near zero** → data path itself isn't using
-   half the EVs. Probe loss on those cells is a *consequence*
-   not a cause. Root cause is in `select_spines_for_addrs` or
-   in how `EvSpray` / `health_aware_mrc` rotates outer DAs.
-3. **Skewed but not binary** → look at the actual distribution
-   shape; hypothesis-set depends on which cells are cold.
+The previous AGENTS.md note said EV records were keyed
+dict-style under `.ev_state.evs`; the current shape is an
+**array** under `.ev_state.tenants["<tenant>"]`. If you see
+`null (null) has no keys` from jq, that's the symptom.
 
 ### Spurious "orphan flow" report warnings on collective scenarios
 
