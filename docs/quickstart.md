@@ -133,7 +133,8 @@ For other quick tests see the [spray-tool.md](./spray-tool.md)
 
 
 ## srctl command line utility
-*`srctl`* is a simple CLI modeled about K8s `kubectl` and can be used to interact with the MRC emulator
+*`srctl`* is a simple CLI modeled after K8s `kubectl` and can be used to interact with the MRC-SRv6 emulator. 
+`srctl's ` primary use is to run MRC traffic scenarios over the deployed topology.
 
 1. Install `srctl` python packages
 ```bash
@@ -150,16 +151,16 @@ If ~/.local/bin isn't in your PATH:
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 ```
 
-```bash
-srctl get hosts
-```
-
 3. `srctl` help
 ```bash
 srctl --help
 ```
 
-4. `srctl get evs` <src-host> <dst-host>
+```bash
+srctl get {topology,hosts,evs}
+```
+
+Example: `srctl get evs` <src-host> <dst-host>
 ```bash
 srctl get evs green-host00 green-host07
 ```
@@ -175,12 +176,12 @@ PLANE  PATH  EV     SID
 
 ### srctl run - running MRC traffic scenarios:
 
-# List available scenarios for the active topology:
+1. List available scenarios for the active topology:
 ```bash
 srctl run --list
 ```
 
-Example output
+Partial output
 ```bash
 $ srctl run --list
 green-all-to-all         # models all-to-all collective for tenant green
@@ -194,20 +195,19 @@ yellow-mrc-baseline
 yellow-mrc-ev-spray
 ```
 
-# Run one (just the scenario stem name, no .yaml):
+2. Run one (just the scenario stem name, no .yaml):
 ```bash
 srctl run yellow-mrc-baseline
 ```
 
-# Or with options:
+3. Or with options:
 ```bash
 srctl run yellow-allreduce-ring --verbose
 ```
 ```bash
 srctl run green-mrc-baseline --dry-run
 ```
-It auto-discovers scenarios under topologies/<active>/scenarios/ (where "active" is determined by _active_topo_dir() — likely the most-recently-deployed clab topology, or SRV6_TOPO env). If you have multiple topologies and want to be explicit, set TOPO=4p-4x8 srctl run … if it honors that, or check srctl get topology to see which one srctl thinks is active.
-Equivalent to: make TOPO=4p-4x8 scenario SCEN=yellow-mrc-baseline. Both call the same underlying srv6_mrc.mrc.run.main.
+`srctl` auto-discovers scenarios under topologies/<active>/scenarios/ (where "active" is determined by _active_topo_dir(). If you have multiple topologies and want to be explicit, set TOPO=4p-4x8 srctl run … if it honors that, or check srctl get topology to see which one srctl thinks is active.
 
 Quick sanity check to verify it sees your new topology:
 ```bash
@@ -217,7 +217,7 @@ srctl run --list
 
 >[!Note]
 > When running any traffic scenario the MRC emulator sprays SRv6 encapsulated traffic across all available EVs (paths).
-> You should be able to run tcpdump on any spine interface in fabric and see some encapsulated traffic
+> You should be able to run tcpdump on any spine interface in the fabric and see some encapsulated traffic
 
 ```bash
 docker exec -it p0-spine02 tcpdump -ni Ethernet8
@@ -227,7 +227,37 @@ docker exec -it p2-spine01 tcpdump -ni Ethernet20
 # etc
 ```
 
-### MRC traffic generation scenarios using 'make'
+### MRC traffic re-balance on failure
+
+To see MRC rebalance on probe failure, shutdown a fabric interface prior to or while running one of the **mrc** scenarios:
+
+>[!Note]
+> docker-sonic-vs loses its interface ipv6 address after the shutdown procedure below. Until we have a workaround it is recommended to document the interface ip so you can re-add it after bringing the interface back up. Sorry about that.
+
+1. Shutdown an interface - this example should produce a rebalance of the host00 to host15 flow away from the `plane-1-spine00` EV path
+```bash
+# get ipv6 address first
+docker exec -it p1-spine00 ip addr show Ethernet0 | grep /127
+
+# shutdown a link
+docker exec -it p1-spine00 config interface shutdown Ethernet0
+```
+
+2. Run any of the *ev-spray* or collective scenarios (all-to-all, allreduce-ring, etc.) 
+```bash
+srctl run green-mrc-ev-spray
+# etc.
+```
+
+3. You can run tcpdumps as before
+4. Bring the interface back up and re-apply its ip
+```bash
+docker exec -it p1-spine00 config interface startup Ethernet0
+
+docker exec -it p1-spine00 ip addr add <ip/mask> dev Ethernet0
+```
+
+### MRC traffic generation scenarios using `make`
 
 1. Basic EV spray, no MRC state or failure detection
 ```bash
@@ -236,7 +266,7 @@ make scenario SCEN=green-ev-spray
 make scenario SCEN=yellow-ev-spray
 ```
 
-1. Basic MRC scenarios
+2. Basic MRC scenarios
 ```bash
 # Green MRC scenarios (all use health_aware_mrc)
 make scenario SCEN=green-mrc-baseline        # 4 EVs/pair, 5s clean — sanity: MRC is no-op
@@ -247,23 +277,6 @@ make scenario SCEN=green-mrc-ev-spray        # 32 EVs/pair, 60s — manually shu
 # Yellow MRC scenarios
 make scenario SCEN=yellow-mrc-baseline       # same as green, host-decap data path
 make scenario SCEN=yellow-mrc-ev-spray       # same as green-mrc-ev-spray, host-decap
-```
-
-3. MRC traffic re-balance on failure
-
-To see MRC rebalance on probe failure shutdown a fabric interface prior to or while running one of the **mrc-ev-spray** scenarios:
-
-*`make scenario SCEN=<color>-mrc-ev-spray`* 
-
- - Shutdown an interface - this example should produce a rebalance of the host00 to host15 flow away from the `plane-1-spine00` EV path
-```bash
-# shutdown a link
-docker exec -it p1-spine00 config interface shutdown Ethernet0
-```
-
- - Run the MRC traffic scenario
-```bash
-make scenario SCEN=yellow-mrc-ev-spray 
 ```
 
  - Run tcpdumps anywhere in the fabric to see SRv6 encapsulated MRC (UDP port 9999) or probe (UDP port 9998) traffic:

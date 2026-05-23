@@ -1,19 +1,23 @@
 # srv6-mrc-emulator
 
 A research-grade simulator for Multipath Reliable Connection
-(MRC) layered on top of a static SRv6 uSID dataplane. The simulator uses 
-[containerlab](https://containerlab.dev/) to deploy a multiplane fabric of
+(MRC) layered on top of a static SRv6 uSID dataplane. 
+
+The simulator uses [containerlab](https://containerlab.dev/) to deploy a multiplane fabric of
 dockerized SONiC-VS instances and SRv6 capable Alpine linux containers 
 simulating hosts.
 
 The reference topology is a **4-plane × 4-spine × 8-leaf Clos** carrying
-two tenants (`green`, `yellow`). This repository also includes a topology 
+two tenants (`green`, `yellow`) with 8 *hosts* each. 
+
+This repository also includes a topology 
 generator tool so additional topologies can be added under `topologies/<name>/`.
 
 ## Key Elements
 
 - **Pure-static control plane**: No BGP, no IGP. Every leaf carries its
-  own SRv6 locator + transit SIDs as `static-sids` in FRR. [Example leaf config](./topologies/4p-4x8/config/p0-leaf00/frr.conf)
+  own SRv6 locator + transit SIDs as `static-sids` in FRR. 
+  [Example leaf config](./topologies/4p-4x8/config/p0-leaf00/frr.conf)
 - **config.sh shell script**: containerlab deploys the topology,  
   `scripts/config.sh` pushes the sonic nodes' config_db.json and FRR configs.
 - **Userspace MRC traffic simulator** builds uSID-encapsulated
