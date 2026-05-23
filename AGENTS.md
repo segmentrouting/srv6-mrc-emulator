@@ -537,6 +537,58 @@ make test
   see `_infer_srv6_topo_from_argv()` in each. The Makefile sets it
   inline on every target that runs srv6_mrc Python (`host-routes`,
   `scenario`). If you add a new entrypoint, do the same.
+- **`config interface shutdown/startup` on docker-sonic-vs strips the L3
+  IPv6 address binding.** `docker exec <node> config interface shutdown
+  EthernetN` toggles admin state in CONFIG_DB; the matching `startup`
+  reverses admin state but *does not always re-install* the
+  `INTERFACE|EthernetN|<addr>/127` L3 binding. The port returns to
+  `up/up` administratively with only its link-local — any packet that
+  needs to reach the peer's underlay (`2001:db8:fab:N::/127`) is
+  silently blackholed. The smoking-gun MRC symptom is
+  `cps=0, cpt>>3, transitions=1` on the EVs whose **reply** path
+  egresses that port (probes go one direction, the reply needs the
+  reverse-direction egress); meanwhile the data plane shows 0% loss
+  because the policy correctly steers around the demoted EVs. **For
+  repeatable fault injection in MRC tests use one of:**
+    - `docker exec <node> ip link set EthernetN down` and `... up`
+      (touches netdev only, CONFIG_DB and L3 bindings persist;
+      simplest cable-yank semantics — verify it works cleanly with
+      docker-sonic-vs SAI/orchagent before adopting broadly),
+    - `sudo nsenter -t $(docker inspect -f '{{.State.Pid}}' <node>)
+      -n tc qdisc add dev EthernetN root netem loss 100%` then
+      `... tc qdisc del dev EthernetN root` (what `srctl scenario`
+      plane-loss already uses; zero-touch on container), or
+    - `ip -6 addr del/add` on the address itself (most explicit but
+      requires remembering the per-port subnet:
+      `Ethernet0=2001:db8:fab::/127`, `Ethernet4=2001:db8:fab:1::/127`,
+      etc — error-prone for non-zero ports).
+  **To recover from an already-stripped binding**: `make config`
+  re-pushes CONFIG_DB and auto-repairs (`scripts/config.sh` already
+  does verify+repair on `seg6local` rules; the L3 address binding
+  comes back along with it). The MRC stack itself handles this
+  correctly — the "stuck demotion" was a lab-hygiene artifact, not
+  an MRC bug. Found 2026-05-23 during validation of the demux/policy
+  fixes.
+- **MRC daemon writes snapshots in a wrapped envelope; readers must
+  unwrap.** `MrcDaemon._publish_snapshot` writes
+  `{"src_host":..., "tenant":..., "dst_id":..., "captured_ns":...,
+   "ev_state": <EVStateTable.snapshot()>}` — the actual snapshot
+  payload lives under the `ev_state` key, with traceability metadata
+  at the top level. The `MrcSnapshot` policy
+  (`policy.py::_wgrid_from_snapshot`) and `report.py::_active_evs_from_mrc`
+  both accept the wrapped shape; if you add a new consumer, do the
+  same (look for `ev_state` and unwrap before reading `num_planes`
+  etc.). Pre-fix, the policy read `data["num_planes"]` directly,
+  hit `KeyError`, swallowed it at the caller as `refresh_errors +=
+  1`, and the policy kept its cold-start uniform grid **forever** —
+  the sender never honored any demotion. Unit tests in
+  `tests/test_mrc_snapshot_policy.py::_make_snapshot` write the flat
+  shape directly via `EVStateTable.snapshot()`, predating the daemon
+  wrapper; new tests should follow `test_daemon_wrapped_snapshot_accepted`
+  and use the wrapper to model the real I/O contract. Found
+  2026-05-23 alongside the demux IPv6 canonicalization fix; the
+  two together account for the entire "EV demoted by daemon but
+  sender keeps spraying through it" failure mode.
 
 ## Open investigations (not yet root-caused)
 
