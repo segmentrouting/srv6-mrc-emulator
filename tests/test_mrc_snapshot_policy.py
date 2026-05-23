@@ -398,6 +398,62 @@ class TestMrcSnapshotValidation(unittest.TestCase):
             finally:
                 p.stop()
 
+    def test_daemon_wrapped_snapshot_accepted(self):
+        # Regression rail: the MRC daemon (mrc/daemon.py:_publish_snapshot)
+        # wraps EVStateTable.snapshot() under an "ev_state" key alongside
+        # traceability metadata (src_host, dst_id, captured_ns, etc).
+        # Pre-fix, MrcSnapshot._wgrid_from_snapshot read num_planes off
+        # the top-level dict and raised KeyError, swallowed at the
+        # caller as refresh_errors -- the policy then kept its uniform
+        # cold-start grid forever and never honored demotions. This
+        # test pins the wrapper-shape acceptance.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ev.json")
+            table = EVStateTable(
+                tenants=("green",), num_planes=NUM_PLANES,
+                num_paths=NUM_SPINES,
+                cfg=EVStateConfig(min_active_evs=1),
+            )
+            # Demote a specific EV so we can prove the policy reads it.
+            for _ in range(table._cfg.probe_fail_threshold):
+                table.record_probe_result("green", plane=0, path=0,
+                                          success=False)
+            inner = table.snapshot()
+            # Daemon's exact wrapper shape (see daemon.py:488-495).
+            wrapped = {
+                "src_host": "green-host00",
+                "src_id": 0,
+                "tenant": "green",
+                "dst_id": 7,
+                "captured_ns": 123_456_789,
+                "ev_state": inner,
+            }
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(wrapped, f)
+            os.rename(tmp, path)
+            p = policy.MrcSnapshot(
+                snapshot_path=path,
+                tenant="green",
+                paths_per_plane=NUM_SPINES,
+            )
+            try:
+                # Refresh should LOAD, not error. The pre-fix bug was
+                # refresh_errors += 1 here.
+                self.assertEqual(p.refresh_errors, 0,
+                                 f"refresh_errors={p.refresh_errors} — "
+                                 f"policy rejected daemon's wrapper shape")
+                self.assertGreaterEqual(p.refresh_loaded, 1)
+                # EV (0,0) demoted -> weight 0; sibling EVs non-zero.
+                self.assertEqual(p._wgrid[0][0], 0.0,
+                                 "demoted EV(0,0) should have weight 0 "
+                                 "in the loaded grid")
+                self.assertGreater(p._wgrid[0][1], 0.0,
+                                   "sibling EV(0,1) should still carry "
+                                   "weight")
+            finally:
+                p.stop()
+
 
 class TestParsePolicyIntegration(unittest.TestCase):
     """parse_policy() builds an MrcSnapshot from the CLI form."""

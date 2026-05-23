@@ -680,11 +680,36 @@ class MrcSnapshot:
     def _wgrid_from_snapshot(self, data: dict) -> tuple[tuple[float, ...], ...]:
         """Convert an EVStateTable.snapshot() dict to a wgrid tuple.
 
+        Accepts either:
+          * the flat `EVStateTable.snapshot()` shape (legacy / test
+            fixtures), or
+          * the daemon's wrapped shape
+            `{"src_host":..., "tenant":..., "ev_state": <flat>, ...}`
+            (what `MrcDaemon._publish_snapshot` actually writes —
+            see daemon.py:494).
+
         Validates dimensions against this policy's topology so a
         misaddressed snapshot file (e.g. wrong tenant or stale
         topology) raises ValueError rather than silently producing
         an undersized grid.
+
+        Why both shapes are supported: the daemon wraps for traceability
+        (src_host, dst_id, captured_ns) so a reader can sanity-check the
+        file matches what it expected. Unit tests in
+        `test_mrc_snapshot_policy.py` write the flat shape directly via
+        `EVStateTable.snapshot()` and predate the daemon wrapper. Rather
+        than churn the test fixtures, accept both — silently unwrap when
+        the wrapper is present. The pre-fix code only accepted the flat
+        shape, so every refresh against a real daemon snapshot raised
+        KeyError("num_planes") and was swallowed at the caller as a
+        transient `refresh_errors` increment. The policy then kept its
+        cold-start uniform grid forever and the sender never honored
+        demotions — the exact symptom of the 2026-05-23 lab run where
+        EV(0,0) was correctly demoted by the daemon but data still
+        sprayed through it.
         """
+        if isinstance(data.get("ev_state"), dict):
+            data = data["ev_state"]
         n_planes = int(data["num_planes"])
         n_paths = int(data["num_paths"])
         if n_planes != self._n_planes or n_paths != self._n_spines:
