@@ -149,6 +149,22 @@ class MrcTransport(ABC):
         """Close all sockets the transport owns. Idempotent."""
         # Default no-op; concrete impls override.
 
+    def stats(self) -> Dict[str, int]:
+        """Return transport-level diagnostic counters.
+
+        Default is empty; concrete impls expose fast-path miss counts,
+        etc. Stable keys (treat as a public diagnostic surface, like
+        EVStateTable.snapshot()):
+          - ``probe_fast_path_misses``: PROBE sends that fell through
+            to scapy because the template cache had no entry for
+            ``(plane, path, dst_leaf)``. Should be 0 in steady state on
+            a sender.
+          - ``reply_fast_path_misses``: same, for PROBE_REPLY on a
+            receiver. (Named to avoid collision with the sender side.)
+        Keys not produced by an impl simply won't be present.
+        """
+        return {}
+
 
 # --- lab impl --------------------------------------------------------------
 
@@ -459,6 +475,19 @@ class Srv6RawTransport(MrcTransport):
         )
 
     # --- lifecycle ---
+
+    def stats(self) -> Dict[str, int]:
+        """Expose fast-path miss counters for diagnostics.
+
+        These are reset at construction and monotonically increase.
+        Non-zero values point at template-cache holes — e.g. probes
+        for a `(plane, path, dst_leaf)` triple the pre-warm didn't
+        cover, or a fresh-peer race before pre-warm completed.
+        """
+        return {
+            "probe_fast_path_misses": self._probe_fast_path_misses,
+            "reply_fast_path_misses": self._fast_path_misses,
+        }
 
     def close(self) -> None:
         for s in list(self._raw_sockets.values()):

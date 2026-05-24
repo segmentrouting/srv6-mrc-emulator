@@ -223,6 +223,14 @@ class MrcDaemonLifecycleTests(unittest.TestCase):
         self.assertEqual(len(ev["tenants"]["green"]),
                          NUM_PLANES * NUM_SPINES)
 
+        # transport_stats is daemon-wide; LoopbackUdpTransport returns
+        # an empty dict (the base-class default). Srv6RawTransport
+        # exposes probe_fast_path_misses + reply_fast_path_misses; the
+        # key must always be present so jq consumers don't need a
+        # `// {}` guard at every call site.
+        self.assertIn("transport_stats", payload)
+        self.assertIsInstance(payload["transport_stats"], dict)
+
     def test_snapshot_refreshes_on_cadence(self) -> None:
         """Two snapshots taken ~2*probe_interval_ms apart have distinct
         captured_ns values (publisher actually re-runs)."""

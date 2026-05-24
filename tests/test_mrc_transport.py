@@ -340,6 +340,50 @@ class SenderPrewarmStartupTests(unittest.TestCase):
         self.assertEqual(len(t._probe_templates), 0)
 
 
+class TransportStatsTests(unittest.TestCase):
+    """`MrcTransport.stats()` is the public diagnostic surface for
+    fast-path miss counters. Consumed by `MrcDaemon._publish_all_snapshots`
+    so per-host jq diagnostics can spot template-cache holes without
+    code changes / log scraping. See AGENTS.md "Universal probe
+    failure" investigation log.
+    """
+
+    def test_base_class_default_returns_empty_dict(self) -> None:
+        """The ABC's default `stats()` returns an empty dict so test
+        fakes and LoopbackUdpTransport don't have to override."""
+        from srv6_mrc.mrc.transport import LoopbackUdpTransport
+
+        # LoopbackUdpTransport doesn't override stats(); it should
+        # inherit the base-class empty-dict default.
+        t = LoopbackUdpTransport.__new__(LoopbackUdpTransport)
+        self.assertEqual(t.stats(), {})
+
+    @unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")
+    def test_srv6_raw_transport_exposes_fast_path_misses(self) -> None:
+        """`Srv6RawTransport.stats()` exposes both probe + reply
+        fast-path miss counters; both should be 0 at construction."""
+        with mock.patch(
+            "srv6_mrc.mrc.transport.open_raw_send_socket",
+            side_effect=_fake_raw_send_socket,
+        ), mock.patch(
+            "srv6_mrc.mrc.transport._open_udp_listener",
+            side_effect=_fake_udp_listener,
+        ):
+            t = transport.Srv6RawTransport(
+                tenant="green", my_id=0, is_sender=True,
+            )
+        self.addCleanup(_close_transport, t)
+        stats = t.stats()
+        self.assertEqual(stats["probe_fast_path_misses"], 0)
+        self.assertEqual(stats["reply_fast_path_misses"], 0)
+
+        # Forcing a cache miss increments the right counter.
+        t._probe_templates.clear()
+        t._probe_fast_path_misses += 1  # simulate one miss
+        self.assertEqual(t.stats()["probe_fast_path_misses"], 1)
+        self.assertEqual(t.stats()["reply_fast_path_misses"], 0)
+
+
 @unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")
 class ProbeFastPathByteIdentityTests(unittest.TestCase):
     """`send_probe` fast path produces bytes identical to scapy.

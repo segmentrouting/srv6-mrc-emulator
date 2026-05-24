@@ -484,7 +484,9 @@ class MrcDaemon:
                 continue
             # Wrap with daemon-context metadata so a reader can sanity
             # check it's the right file (paranoia against cross-flow
-            # mixups during development).
+            # mixups during development). transport_stats is daemon-
+            # wide (all flows share self.transport), included here so
+            # any single snapshot file is self-contained for jq.
             payload = {
                 "src_host": self.src_host,
                 "src_id": self.src_id,
@@ -492,6 +494,7 @@ class MrcDaemon:
                 "dst_id": dst_id,
                 "captured_ns": self.clock_ns(),
                 "ev_state": snap,
+                "transport_stats": self.transport.stats(),
             }
             path = self._snapshot_path(tenant, dst_id)
             self._atomic_write_json(path, payload)
