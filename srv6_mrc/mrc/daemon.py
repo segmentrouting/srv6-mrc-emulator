@@ -81,11 +81,29 @@ import json
 import logging
 import os
 import socket
+import struct
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+# SIOCINQ (FIONREAD) ioctl probes the kernel UDP recv-buf depth at
+# recv()-time so we can localize whether replies are stacking up in
+# the kernel between our recvfrom() calls (sender-RX starvation) or
+# arriving cleanly (then the seconds are upstream — on the wire, in
+# the receiver, or in the kernel's tx path back to us). Mirror the
+# guard pattern from `srv6_mrc/mrc/agent.py:81-93`: macOS dev laptops
+# without `termios.FIONREAD` degrade to a no-op so unit tests run on
+# any OS. Lab containers are linux/alpine so this is always available.
+try:
+    import fcntl  # type: ignore[import-untyped]
+    import termios  # type: ignore[import-untyped]
+    _SIOCINQ = getattr(termios, "FIONREAD", None)
+    _HAVE_SIOCINQ = _SIOCINQ is not None
+except ImportError:
+    _HAVE_SIOCINQ = False
+    _SIOCINQ = None
 
 from ..topo import (
     NUM_PLANES,
@@ -293,6 +311,48 @@ class MrcDaemon:
             "replies_dispatched_loss": 0,    # routed to _handle_loss_report
         }
 
+        # Sender reply-RX instrumentation. Symmetric to the receiver's
+        # probe_rx_gap_buckets / probe_rx_backlog_buckets (see
+        # agent.py:832-845): localizes whether the multi-second
+        # reply-latency tail observed in cycle 7 lives in the kernel's
+        # reply path TO the sender (replies sitting in the UDP recvbuf
+        # while we're GIL-blocked by emit/sweep/window threads) or
+        # upstream of recvfrom() (wire / receiver / kernel TX).
+        #
+        # dispatch_rx_gap_buckets: monotonic_ns gap between successive
+        # recvfrom() returns on the shared reply socket. Heavy lt_100ms+
+        # tail means we ARE the queue — dispatch thread is starved.
+        # Mostly lt_1ms means recvfrom is idle and the seconds vanish
+        # before they reach us.
+        #
+        # dispatch_rx_backlog_buckets: SIOCINQ BYTES queued on the
+        # reply socket AFTER the recvfrom that just returned. Bucketed
+        # on RAW BYTES (not record count) because the shared reply
+        # socket carries BOTH probe replies (0xA6, ~28B) AND loss
+        # reports (0xA7, variable / larger) — dividing by any fixed
+        # record size would mis-bin loss reports against probe
+        # replies. Buckets: inq_0 (caught up), le_512 (~<18 probe
+        # replies queued), le_4k (a probe round backlog), le_32k
+        # (heavy), gt_32k (very heavy / near rcvbuf limit).
+        #
+        # Single-writer (dispatcher thread) — int += 1 is GIL-atomic
+        # for the read-modify-write pattern, same justification as
+        # `_dispatch_counters` above.
+        self._dispatch_rx_gap_buckets: Dict[str, int] = {
+            "lt_1ms": 0,
+            "lt_10ms": 0,
+            "lt_100ms": 0,
+            "lt_1s": 0,
+            "ge_1s": 0,
+        }
+        self._dispatch_rx_backlog_buckets: Dict[str, int] = {
+            "inq_0": 0,
+            "le_512": 0,
+            "le_4k": 0,
+            "le_32k": 0,
+            "gt_32k": 0,
+        }
+
         for flow in self.flows:
             agent = SenderMrcAgent(
                 tenant=flow.tenant,
@@ -431,6 +491,13 @@ class MrcDaemon:
         except RuntimeError as e:
             log.error("mrc.daemon.dispatch: %s", e)
             return
+        # Instrumentation state. last_recv_ns measures inter-recv gap;
+        # inq_buf is a reusable 4-byte scratch for the SIOCINQ ioctl
+        # (saves one allocation per packet on the hot path). On macOS
+        # where _HAVE_SIOCINQ is False, backlog buckets stay at zero
+        # everywhere and we do not call fcntl.ioctl at all.
+        last_recv_ns: Optional[int] = None
+        inq_buf = bytearray(4) if _HAVE_SIOCINQ else None
         while not self._stop.is_set():
             try:
                 payload, peer = sock.recvfrom(DEFAULT_RECV_BUFSIZE)
@@ -440,6 +507,46 @@ class MrcDaemon:
                 return  # socket closed during stop()
             if not payload:
                 continue
+            now_ns = time.monotonic_ns()
+            # Gap from previous recv. Skip on first iteration — a
+            # cold-start "gap" from process boot isn't a meaningful
+            # bucket value.
+            if last_recv_ns is not None:
+                gap_ns = now_ns - last_recv_ns
+                if gap_ns < 1_000_000:
+                    self._dispatch_rx_gap_buckets["lt_1ms"] += 1
+                elif gap_ns < 10_000_000:
+                    self._dispatch_rx_gap_buckets["lt_10ms"] += 1
+                elif gap_ns < 100_000_000:
+                    self._dispatch_rx_gap_buckets["lt_100ms"] += 1
+                elif gap_ns < 1_000_000_000:
+                    self._dispatch_rx_gap_buckets["lt_1s"] += 1
+                else:
+                    self._dispatch_rx_gap_buckets["ge_1s"] += 1
+            last_recv_ns = now_ns
+            # SIOCINQ AFTER recvfrom returns: bytes still queued in the
+            # kernel for this socket. Best-effort — ioctl can fail in
+            # odd kernel states; on failure we silently skip the bucket
+            # update for this packet (matching agent.py's pattern).
+            if _HAVE_SIOCINQ and inq_buf is not None:
+                try:
+                    fcntl.ioctl(sock.fileno(), _SIOCINQ, inq_buf, True)
+                    inq_bytes = struct.unpack("i", bytes(inq_buf))[0]
+                except (OSError, AttributeError):
+                    # AttributeError covers test fakes lacking fileno();
+                    # OSError covers real-socket ioctl failures.
+                    inq_bytes = -1
+                if inq_bytes >= 0:
+                    if inq_bytes == 0:
+                        self._dispatch_rx_backlog_buckets["inq_0"] += 1
+                    elif inq_bytes <= 512:
+                        self._dispatch_rx_backlog_buckets["le_512"] += 1
+                    elif inq_bytes <= 4096:
+                        self._dispatch_rx_backlog_buckets["le_4k"] += 1
+                    elif inq_bytes <= 32768:
+                        self._dispatch_rx_backlog_buckets["le_32k"] += 1
+                    else:
+                        self._dispatch_rx_backlog_buckets["gt_32k"] += 1
             self._dispatch_counters["replies_received"] += 1
             peer_addr = peer[0] if isinstance(peer, tuple) else None
             # Strip any scope-id suffix ("fe80::1%eth0") so link-local
@@ -534,6 +641,9 @@ class MrcDaemon:
                 "ev_state": snap,
                 "transport_stats": self.transport.stats(),
                 "dispatch_stats": dict(self._dispatch_counters),
+                "dispatch_rx_gap_buckets": dict(self._dispatch_rx_gap_buckets),
+                "dispatch_rx_backlog_buckets":
+                    dict(self._dispatch_rx_backlog_buckets),
                 "probe_reply_stats": dict(agent.probe_reply_stats),
                 "reply_latency_buckets": dict(agent.reply_latency_buckets),
             }

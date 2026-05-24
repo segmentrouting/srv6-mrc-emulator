@@ -267,6 +267,29 @@ class MrcDaemonLifecycleTests(unittest.TestCase):
             self.assertIsInstance(rlb[key], int)
             self.assertGreaterEqual(rlb[key], 0)
 
+        # dispatch_rx_gap_buckets / dispatch_rx_backlog_buckets are
+        # the sender-RX counterpart to the receiver's
+        # probe_rx_gap_buckets / probe_rx_backlog_buckets. Lock both
+        # 5-key schemas so lab jq queries can rely on them without
+        # `// 0` guarding.
+        self.assertIn("dispatch_rx_gap_buckets", payload)
+        gb = payload["dispatch_rx_gap_buckets"]
+        self.assertIsInstance(gb, dict)
+        for key in ("lt_1ms", "lt_10ms", "lt_100ms", "lt_1s", "ge_1s"):
+            self.assertIn(key, gb,
+                          f"missing dispatch_rx_gap_buckets key {key}")
+            self.assertIsInstance(gb[key], int)
+            self.assertGreaterEqual(gb[key], 0)
+
+        self.assertIn("dispatch_rx_backlog_buckets", payload)
+        bb = payload["dispatch_rx_backlog_buckets"]
+        self.assertIsInstance(bb, dict)
+        for key in ("inq_0", "le_512", "le_4k", "le_32k", "gt_32k"):
+            self.assertIn(key, bb,
+                          f"missing dispatch_rx_backlog_buckets key {key}")
+            self.assertIsInstance(bb[key], int)
+            self.assertGreaterEqual(bb[key], 0)
+
     def test_snapshot_refreshes_on_cadence(self) -> None:
         """Two snapshots taken ~2*probe_interval_ms apart have distinct
         captured_ns values (publisher actually re-runs)."""
@@ -507,6 +530,148 @@ class MrcDaemonFinalReportTests(unittest.TestCase):
         self.assertEqual(on_disk["src_host"], "green-host00")
         self.assertIn("flows", on_disk)
         self.assertIn("green/15", on_disk["flows"])
+
+
+class MrcDaemonDispatchRxBucketsTests(unittest.TestCase):
+    """The dispatcher records (a) inter-recvfrom gap and (b) SIOCINQ
+    backlog buckets per packet so the lab can localize whether the
+    multi-second reply-latency tail observed in cycle 7 lives in the
+    sender's recv path (we're starved) or upstream (wire/receiver).
+
+    The targeted assertion is the post-condition: after pushing N
+    replies through a loopback-backed daemon, bucket counts sum to
+    expected values regardless of which buckets win. macOS without
+    termios.FIONREAD degrades to backlog all-zero (no-op) and gap
+    still populated; we model that explicitly by monkeypatching
+    `daemon._HAVE_SIOCINQ`.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="mrc-daemon-rx-bkt-")
+        self.sender_report_port = PORTS.take(1)
+        self.receiver_probe_port = PORTS.take(1)
+        self.sender_xport, self.receiver_xport = _build_loopback_pair(
+            sender_report_port=self.sender_report_port,
+            receiver_probe_port=self.receiver_probe_port,
+        )
+        self.daemon = MrcDaemon(
+            src_host="green-host00",
+            src_id=0,
+            flows=[DaemonFlow(tenant="green", dst_id=15)],
+            agent_cfg=FAST_CONFIG,
+            transport=self.sender_xport,
+            snapshot_dir=self.tmpdir,
+        )
+        only_agent = next(iter(self.daemon.agents.values()))
+        self.daemon._demux = {"::1": only_agent}
+        # Outbound sender used to push synthetic replies into the
+        # daemon's reply socket. Bound to ::1 so peer_addr will
+        # match _demux's "::1" key.
+        self.injector = socket.socket(
+            socket.AF_INET6, socket.SOCK_DGRAM, 0)
+        self.injector.bind(("::1", 0))
+
+    def tearDown(self) -> None:
+        try:
+            self.injector.close()
+        except OSError:
+            pass
+        try:
+            self.daemon.stop(timeout_s=0.5)
+        finally:
+            try:
+                self.receiver_xport.close()
+            except Exception:
+                pass
+            try:
+                snap_subdir = Path(self.tmpdir) / "green-host00"
+                if snap_subdir.is_dir():
+                    for f in os.listdir(snap_subdir):
+                        os.unlink(snap_subdir / f)
+                    os.rmdir(snap_subdir)
+                os.rmdir(self.tmpdir)
+            except OSError:
+                pass
+
+    def _inject(self, n: int, *, magic: int = 0xA6) -> None:
+        # Minimum probe-reply length is checked by decode_probe_reply,
+        # but the dispatcher buckets BEFORE decode. We send 28-byte
+        # payloads anyway so the magic-byte branch routes consistently
+        # — the agent's _handle_probe_reply will count decode_failed,
+        # which we don't care about here.
+        body = bytes([magic]) + b"\x00" * 27
+        for _ in range(n):
+            self.injector.sendto(
+                body, ("::1", self.sender_report_port))
+
+    def test_buckets_populate_and_sum_to_n(self) -> None:
+        self.daemon.start()
+        N = 20
+        self._inject(N)
+        ds = self.daemon._dispatch_counters
+        self.assertTrue(
+            _wait_for(lambda: ds["replies_received"] >= N, timeout_s=1.5),
+            f"dispatcher only received {ds['replies_received']}/{N}",
+        )
+        # Gap bucket skips the first recv (no prior baseline), so
+        # gap-bucket sum is N-1. Backlog bucket fires on every recv
+        # (no skip), so sum is N — BUT only if FIONREAD is available;
+        # mirror the runtime check.
+        from srv6_mrc.mrc import daemon as daemon_mod
+        gap_total = sum(self.daemon._dispatch_rx_gap_buckets.values())
+        self.assertEqual(
+            gap_total, ds["replies_received"] - 1,
+            f"gap bucket sum {gap_total} != recv-1 "
+            f"({ds['replies_received']-1})",
+        )
+        backlog_total = sum(
+            self.daemon._dispatch_rx_backlog_buckets.values())
+        if daemon_mod._HAVE_SIOCINQ:
+            self.assertEqual(
+                backlog_total, ds["replies_received"],
+                f"backlog bucket sum {backlog_total} != recv "
+                f"({ds['replies_received']})",
+            )
+        else:
+            self.assertEqual(
+                backlog_total, 0,
+                "FIONREAD unavailable: backlog buckets must stay zero",
+            )
+
+    def test_macos_degradation_backlog_zero_gap_populated(self) -> None:
+        # Force the macOS no-op path even on Linux CI so the contract
+        # is exercised on every platform. Patching the module-level
+        # flag is sufficient — `_dispatch_loop` reads it once per
+        # iteration via the import-time `_HAVE_SIOCINQ` name.
+        from srv6_mrc.mrc import daemon as daemon_mod
+        saved_have = daemon_mod._HAVE_SIOCINQ
+        saved_inq = daemon_mod._SIOCINQ
+        daemon_mod._HAVE_SIOCINQ = False
+        daemon_mod._SIOCINQ = None
+        try:
+            self.daemon.start()
+            N = 12
+            self._inject(N)
+            ds = self.daemon._dispatch_counters
+            self.assertTrue(
+                _wait_for(
+                    lambda: ds["replies_received"] >= N, timeout_s=1.5),
+                f"dispatcher only received {ds['replies_received']}/{N}",
+            )
+            # Gap path is OS-independent — must still bucket.
+            self.assertEqual(
+                sum(self.daemon._dispatch_rx_gap_buckets.values()),
+                ds["replies_received"] - 1,
+            )
+            # Backlog must be all-zero on the degraded path.
+            self.assertEqual(
+                sum(self.daemon._dispatch_rx_backlog_buckets.values()),
+                0,
+                "macOS-degraded path must not populate backlog buckets",
+            )
+        finally:
+            daemon_mod._HAVE_SIOCINQ = saved_have
+            daemon_mod._SIOCINQ = saved_inq
 
 
 if __name__ == "__main__":  # pragma: no cover
