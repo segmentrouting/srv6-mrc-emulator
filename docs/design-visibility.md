@@ -513,3 +513,90 @@ agent should resist scope creep:
 - **Topology auto-discovery via clab inspect.** The scraper reads
   `topo.yaml` (same as `spray`), not `containerlab inspect`. Keeps
   one source of truth.
+
+---
+
+## PR 1 status (2026-05-24)
+
+PR 1 lands the scraper itself: `contrib/visibility-poc/scraper/scraper.py`
+(~1060 lines) plus 30 unit tests under
+`tests/contrib/visibility_poc/`. Full suite is now 580 tests, ~2.8s,
+no lab required.
+
+### Implemented in PR 1
+
+- `parse_ip_link_stats(output)` — positional, header-driven; tolerant
+  of iproute2 ≥5.x adding a `missed` column on RX. Returns
+  `IfaceCounters` or `None` on malformed input.
+- `parse_snmp6(output)` — line-oriented, malformed lines silently
+  skipped. Returns full dict; scraper publishes the subset in
+  `SNMP6_EXPOSED_KEYS`.
+- `parse_mrc_snapshot(payload: dict)` — decodes the wrapped envelope
+  from `MrcDaemon._publish_snapshot`, including the new
+  `reply_latency_buckets` block introduced in commit `813abcf`. Pure
+  function over a parsed dict so it can be tested without docker.
+- `docker_exec_with_retry(host, argv, *, attempts=3, backoff_s=0.1)` —
+  the AGENTS.md SO_REUSEPORT-cascade cure. Retries only on rc=1;
+  non-retryable failures raise `DockerExecError` immediately;
+  exhaustion includes stderr in the message.
+- `discover_targets(topo_yaml_path)` — reads `Topology.from_yaml()` and
+  emits `(iface_targets, host_targets)`. Leaf `Ethernet0` per plane +
+  host `eth1..eth<planes>`.
+- `run_scrape_loop()` — `ThreadPoolExecutor(max_workers=16)`, 1s fast
+  cadence (iface + snmp6), 5s slow cadence (MRC snapshots, larger
+  payloads). Accepts `iterations` parameter for tests.
+- `main()` — argparse front end with `--topo-yaml`, `--port`,
+  `--interval`, `--slow-interval`, `--workers`, `--log-level`. Smoke-
+  tests docker presence (rc=3 on missing) and prometheus_client
+  availability (rc=2) before opening the HTTP server.
+
+### Metrics surface (all Gauges; scrape-replace semantics)
+
+- `srv6_iface_{rx,tx}_{bytes,packets,errors,dropped}` labeled
+  `(plane, tier, node, iface)` — per-NIC counters.
+- `srv6_host_<snmp6_key>` labeled `(host, tenant)` — 11 keys from
+  `SNMP6_EXPOSED_KEYS`.
+- `srv6_flow_ev_state` (0/1/2/3 enum), `_weight`, `_rtt_p50_seconds`,
+  `_consecutive_probe_{successes,timeouts}`,
+  `_demotes_suppressed_by_floor` labeled
+  `(host, tenant, dst_id, plane, path)`.
+- `srv6_flow_active_evs`, `srv6_flow_snapshot_captured_ns` labeled
+  `(host, tenant, dst_id)`.
+- `srv6_flow_probe_reply_{received,decode_failed,no_match,matched}_total`
+  per flow.
+- `srv6_flow_reply_latency_{lt_50ms,lt_200ms,lt_1s,lt_5s,ge_5s}_total`
+  per flow (the no_match-localization signal from `813abcf`).
+- `srv6_dispatch_replies_{received,no_peer,unknown_magic,dispatched_probe,dispatched_loss}_total`
+  per host (daemon-wide; last write per tick wins).
+- `srv6_scraper_scrape_duration_seconds`, `srv6_scraper_targets`,
+  `srv6_scrape_up`, `srv6_scraper_exec_failures_total` — self-metrics.
+
+### Design deltas vs `docs/design-visibility.md §6`
+
+- **Counter → Gauge.** Every nominally-monotonic counter is a Gauge
+  exposing the current absolute value. Reason: `prometheus_client`
+  Counter is `.inc(delta)` only and refuses to go backwards on
+  container restart; scrape-replace via Gauge is cleaner and
+  `rate()` works identically.
+- **`reply_latency_buckets` as 5 separate gauges**, not a Prom
+  Histogram. The daemon already pre-bucketed; we forward counts.
+- **`dispatch_stats` emitted once per host** (not per flow). The
+  daemon publishes the same numbers in every snapshot file on a
+  given host; last-write-wins is correct.
+
+### Deferred to PR 2+
+
+- **Spine NIC scraping.** `tier="spine"` is a valid label value but
+  no spine targets are emitted. Adding
+  `planes × spines_per_plane × leaves_per_plane` targets
+  (`4 × 8 × 16 = 512` on 4p-8x16) would blow past the 1s cadence
+  ceiling; sizing/cadence analysis is a PR 2 prerequisite.
+- **Image build** (Dockerfile lives in `contrib/visibility-poc/scraper/`
+  but isn't validated end-to-end).
+- **Containerlab integration.** `generators/fabric.py` patching, the
+  `visibility.yaml.fragment`, and `make deploy` wiring all live in
+  PR 2.
+- **Grafana provisioning YAMLs** (`provisioning/datasources/*.yaml`,
+  `provisioning/dashboards/*.yaml`).
+- **`nsenter` scrape path** for sub-second cadence at 4p-8x16 scale
+  if `docker exec` cadence overhead becomes binding.

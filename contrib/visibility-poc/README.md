@@ -1,8 +1,9 @@
-# visibility-poc — skeleton
+# visibility-poc — PR 1 (scraper)
 
-**Status: design-only skeleton. Nothing here runs against the lab
-today. See `docs/design-visibility.md` for the architecture this
-fills in.**
+**Status: PR 1 landed — the scraper itself is implemented and unit-
+tested. The clab fragment, image build, Grafana provisioning, and
+`generators/fabric.py` integration are still PR 2+. See
+`docs/design-visibility.md` "PR 1 status" for the boundary.**
 
 This directory is the staging area for the live visibility /
 Grafana dashboard work. It is intentionally outside `srv6_mrc/`,
@@ -49,6 +50,20 @@ contrib/visibility-poc/
 
 ## Dev-test path (without the full lab)
 
+### Unit tests (no docker required)
+
+```
+PYTHONPATH=. python3 -m unittest discover -s tests/contrib -t .
+```
+
+30 tests covering: ip-link-stats parser (alpine + modern iproute2),
+/proc/net/snmp6 parser, MRC snapshot envelope decoder (incl. the
+`reply_latency_buckets` block from commit `813abcf`),
+`docker_exec_with_retry` retry/timeout semantics, and `discover_targets`
+against `topologies/4p-4x8/topo.yaml`. ~12 ms.
+
+### Stub docker smoke test
+
 You can iterate on the scraper alone against a stub docker
 environment by:
 
@@ -79,14 +94,19 @@ for the full integrated end-to-end test.
 |---------------------------------------|----------|
 | Architecture decision (docker exec)   | Done     |
 | Metric naming scheme                  | Done     |
-| Scraper Python skeleton + retry helper| Stubbed  |
-| Per-source parsing logic              | Stubbed  |
-| Dockerfile + image build              | Not done |
+| Scraper Python implementation         | Done (PR 1) |
+| Per-source parsing logic              | Done (PR 1, 30 unit tests) |
+| `docker_exec_with_retry` helper       | Done (PR 1) |
+| `discover_targets` from topo.yaml     | Done (PR 1, leaf+host; spine deferred) |
+| `reply_latency_buckets` exposure      | Done (PR 1, 5 gauges) |
+| `dispatch_stats` exposure (per host)  | Done (PR 1) |
+| Dockerfile + image build              | Not done (PR 2) |
 | Prometheus config template            | Done (template) |
 | Grafana dashboard JSON                | Stubbed (headline panel only) |
-| Grafana provisioning YAML             | Not done |
-| `generators/fabric.py` integration    | Not done |
-| Makefile target                       | Not done |
+| Grafana provisioning YAML             | Not done (PR 2) |
+| `generators/fabric.py` integration    | Not done (PR 2) |
+| Makefile target                       | Not done (PR 2) |
+| Spine NIC scraping                    | Deferred (PR 2 — sizing analysis needed) |
 
 ## Hard constraints inherited from AGENTS.md
 
