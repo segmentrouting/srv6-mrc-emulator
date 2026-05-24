@@ -244,14 +244,18 @@ class ReceiverPrewarmStartupTests(unittest.TestCase):
         # Minimum byte length: 40 outer + 40 inner + 8 UDP + 28 payload.
         self.assertEqual(len(tpl), 40 + 40 + 8 + 28)
 
+    @unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")
     def test_sender_init_skips_prewarm(self) -> None:
-        """is_sender=True must NOT trigger the prewarm work.
+        """is_sender=True must NOT pre-warm the REPLY template cache.
 
         Senders only build replies in the rare loss-report echo path;
-        eagerly building NUM_PLANES * NUM_SPINES * NUM_LEAVES templates
-        on every spray invocation would be wasted work and (more
-        importantly) would hide bugs in the sender-only code path
-        behind the receiver's exception surface.
+        the reply cache stays empty on senders. (As of the 2026-05-24
+        probe-emit fast-path commit, senders DO pre-warm a separate
+        PROBE template cache — see TestSenderProbePrewarm below.)
+
+        Scapy-gated because sender __init__ now invokes
+        `_prewarm_probe_templates`, which calls
+        `build_outer_template` -> scapy.
         """
         with mock.patch(
             "srv6_mrc.mrc.transport.open_raw_send_socket",
@@ -265,6 +269,156 @@ class ReceiverPrewarmStartupTests(unittest.TestCase):
             )
         self.addCleanup(_close_transport, t)
         self.assertEqual(len(t._reply_templates), 0)
+
+
+class SenderPrewarmStartupTests(unittest.TestCase):
+    """Sender-side `Srv6RawTransport` must pre-warm the probe template
+    cache. Mirrors `ReceiverPrewarmStartupTests` for the symmetrical
+    fast-path emit shipped to fix the probe-emit GIL contention
+    diagnosed in the "Universal probe failure" investigation.
+
+    Receiver and sender pre-warms are mutually exclusive: a transport
+    either replies to probes (receiver) or emits probes (sender),
+    never both at once. The OTHER side's cache should be empty so
+    bugs in one role can't be hidden behind the other's logic.
+    """
+
+    @unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")
+    def test_sender_init_populates_probe_template_cache(self) -> None:
+        from srv6_mrc.topo import NUM_LEAVES, NUM_PLANES, NUM_SPINES
+
+        with mock.patch(
+            "srv6_mrc.mrc.transport.open_raw_send_socket",
+            side_effect=_fake_raw_send_socket,
+        ), mock.patch(
+            "srv6_mrc.mrc.transport._open_udp_listener",
+            side_effect=_fake_udp_listener,
+        ):
+            t = transport.Srv6RawTransport(
+                tenant="green", my_id=0, is_sender=True,
+            )
+        self.addCleanup(_close_transport, t)
+
+        # Same grid shape as the receiver-side reply pre-warm: one
+        # template per (plane, path, dst_leaf) excluding self.
+        self.assertGreaterEqual(
+            len(t._probe_templates),
+            NUM_PLANES * NUM_SPINES,
+            f"probe pre-warm cache too small; "
+            f"got {len(t._probe_templates)}",
+        )
+        self.assertLessEqual(
+            len(t._probe_templates),
+            NUM_PLANES * NUM_SPINES * NUM_LEAVES,
+            "probe pre-warm cache larger than full grid",
+        )
+
+        any_key = next(iter(t._probe_templates))
+        tpl, outer_dst = t._probe_templates[any_key]
+        self.assertIsInstance(tpl, bytes)
+        self.assertIsInstance(outer_dst, str)
+        # Same payload length as reply (PROBE and PROBE_REPLY share
+        # the 28B struct layout):
+        self.assertEqual(len(tpl), 40 + 40 + 8 + 28)
+
+    @unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")
+    def test_receiver_init_has_empty_probe_cache(self) -> None:
+        """Receivers don't emit probes; the probe cache must stay
+        empty so a stray sender-side codepath running on a receiver
+        crashes loudly instead of silently using a stale template."""
+        with mock.patch(
+            "srv6_mrc.mrc.transport.open_raw_send_socket",
+            side_effect=_fake_raw_send_socket,
+        ), mock.patch(
+            "srv6_mrc.mrc.transport._open_udp_listener",
+            side_effect=_fake_udp_listener,
+        ):
+            t = transport.Srv6RawTransport(
+                tenant="green", my_id=0, is_sender=False,
+            )
+        self.addCleanup(_close_transport, t)
+        self.assertEqual(len(t._probe_templates), 0)
+
+
+@unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")
+class ProbeFastPathByteIdentityTests(unittest.TestCase):
+    """`send_probe` fast path produces bytes identical to scapy.
+
+    Mirrors `FastPathByteIdentityTests` (which covers send_probe_reply)
+    for the sender-side fast-path emit. Pattern is identical: deliberately
+    pop the cached template to force the slow path, capture its bytes,
+    restore the template, capture the fast-path bytes, assert equality.
+
+    The byte-identity oracle is the only honest check for "is the UDP6
+    checksum right" — bugs at this layer are invisible to unit tests
+    of the helpers in isolation (see AGENTS.md gotcha: "Every
+    byte-template / manual-checksum helper call site must be exercised
+    through the public transport API end-to-end").
+    """
+
+    def test_fast_path_bytes_match_slow_path_for_sample(self) -> None:
+        plane = 1
+        path = 2
+        dst_leaf = 3
+        payload = bytes(range(28))
+
+        with mock.patch(
+            "srv6_mrc.mrc.transport.open_raw_send_socket",
+            side_effect=_fake_raw_send_socket,
+        ), mock.patch(
+            "srv6_mrc.mrc.transport._open_udp_listener",
+            side_effect=_fake_udp_listener,
+        ):
+            t = transport.Srv6RawTransport(
+                tenant="green", my_id=0, is_sender=True,
+            )
+            self.addCleanup(_close_transport, t)
+
+            cache_key = (plane, path, dst_leaf)
+            self.assertIn(
+                cache_key, t._probe_templates,
+                "sender pre-warm should have built this probe template",
+            )
+            saved = t._probe_templates.pop(cache_key)
+
+            slow_bytes: list[bytes] = []
+            slow_dst: list = []
+
+            def slow_sendto(buf, dst):
+                slow_bytes.append(bytes(buf))
+                slow_dst.append(dst)
+
+            t._raw_sockets[plane].sendto = slow_sendto  # type: ignore[assignment]
+            t.send_probe(
+                plane=plane, path=path, dst_leaf=dst_leaf, payload=payload,
+            )
+            self.assertEqual(len(slow_bytes), 1)
+
+            t._probe_templates[cache_key] = saved
+            fast_bytes: list[bytes] = []
+            fast_dst: list = []
+
+            def fast_sendto(buf, dst):
+                fast_bytes.append(bytes(buf))
+                fast_dst.append(dst)
+
+            t._raw_sockets[plane].sendto = fast_sendto  # type: ignore[assignment]
+            t.send_probe(
+                plane=plane, path=path, dst_leaf=dst_leaf, payload=payload,
+            )
+            self.assertEqual(len(fast_bytes), 1)
+
+        self.assertEqual(
+            fast_bytes[0], slow_bytes[0],
+            "probe fast-path bytes diverge from scapy slow-path bytes — "
+            "likely a header field or UDP6 checksum bug",
+        )
+        self.assertEqual(fast_dst[0], slow_dst[0])
+
+        self.assertEqual(
+            t._probe_fast_path_misses, 1,
+            "exactly one miss expected (the deliberate pop above)",
+        )
 
 
 @unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")

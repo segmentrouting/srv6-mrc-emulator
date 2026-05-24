@@ -224,17 +224,55 @@ class Srv6RawTransport(MrcTransport):
         self._reply_templates: Dict[
             Tuple[int, int, int], Tuple[bytes, str]
         ] = {}
+        # Probe-template cache: symmetric to _reply_templates but for the
+        # sender's emit hot path. PROBE and PROBE_REPLY share the same
+        # 28B payload struct, so templates differ only in UDP ports
+        # (probe: SPRAY_PROBE_PORT both sides; reply: PROBE_PORT ->
+        # REPORT_PORT). Pre-warmed for senders (is_sender=True) to fix
+        # the all-to-all probe-emit GIL contention diagnosed in the
+        # "Universal probe failure" investigation: at 7 dst x 16 EVs x
+        # 5 rounds/sec = 560 scapy builds/sec/host, the emit threads
+        # were starving the reply-RX loop. The fast path drops emit
+        # cost from ~2-3ms to ~10-20us per probe.
+        self._probe_templates: Dict[
+            Tuple[int, int, int], Tuple[bytes, str]
+        ] = {}
         self._fast_path_misses: int = 0
+        self._probe_fast_path_misses: int = 0
         if not is_sender:
             self._prewarm_reply_templates()
+        else:
+            self._prewarm_probe_templates()
 
     # --- send_* ---
 
     def send_probe(self, *, plane, path, dst_leaf, payload):
-        self._send_encapped(
-            plane=plane, path=path, dst_leaf=dst_leaf, payload=payload,
-            sport=SPRAY_PROBE_PORT, dport=SPRAY_PROBE_PORT,
-        )
+        # Hot path: byte-template cache + manual UDP6 checksum. Mirrors
+        # send_probe_reply's fast path. Falls back to scapy on cache
+        # miss (one-shot warn, then silent).
+        key = (plane, path, dst_leaf)
+        cached = self._probe_templates.get(key)
+        if cached is None:
+            self._probe_fast_path_misses += 1
+            if self._probe_fast_path_misses == 1:
+                log.warning(
+                    "Srv6RawTransport: probe-template cache miss "
+                    "(plane=%d path=%d dst_leaf=%d); falling back to "
+                    "scapy slow path. Further misses will be silent.",
+                    plane, path, dst_leaf,
+                )
+            self._send_encapped(
+                plane=plane, path=path, dst_leaf=dst_leaf, payload=payload,
+                sport=SPRAY_PROBE_PORT, dport=SPRAY_PROBE_PORT,
+            )
+            return
+
+        template_bytes, outer_dst = cached
+        pkt = bytearray(template_bytes)
+        payload_len = len(payload)
+        pkt[PAYLOAD_OFFSET:PAYLOAD_OFFSET + payload_len] = payload
+        udp6_checksum_inplace(pkt, payload_len=payload_len)
+        self._raw_sockets[plane].sendto(bytes(pkt), (outer_dst, 0, 0, 0))
 
     def send_probe_reply(self, *, plane, path, dst_leaf, payload):
         # Replies go to the sender's report-listener port. Hot path: use
@@ -364,6 +402,57 @@ class Srv6RawTransport(MrcTransport):
                     built += 1
         log.info(
             "Srv6RawTransport: pre-warmed %d reply templates "
+            "(tenant=%s my_id=%d planes=%d spines=%d leaves=%d)",
+            built, self.tenant, self.my_id,
+            NUM_PLANES, NUM_SPINES, NUM_LEAVES,
+        )
+
+    def _prewarm_probe_templates(self) -> None:
+        """Build a probe-byte template for every (plane, path, peer_leaf).
+
+        Symmetric to `_prewarm_reply_templates`; the only differences
+        are UDP sport/dport (probe: SPRAY_PROBE_PORT both ends) and the
+        payload-length constant (`PROBE_REPLY_PAYLOAD_LEN` since PROBE
+        and PROBE_REPLY share the same 28B struct layout). Same skip
+        rule: no template where dst_leaf == self.my_id (a host doesn't
+        probe itself).
+
+        Run once at sender __init__. Cost matches the receiver-side
+        warm-up (4*S*L scapy builds, ~250ms-2s depending on topology).
+        Justified by the probe-emit GIL contention that this fast path
+        eliminates: see send_probe and the AGENTS.md "Universal probe
+        failure" investigation for the motivation.
+        """
+        own_src_underlay_by_plane = self._src_underlay_by_plane
+        own_src_inner = self._src_inner
+        sport = SPRAY_PROBE_PORT
+        dport = SPRAY_PROBE_PORT
+        built = 0
+        for plane in range(NUM_PLANES):
+            src_underlay = own_src_underlay_by_plane[plane]
+            for path in range(NUM_SPINES):
+                for dst_leaf in range(NUM_LEAVES):
+                    if dst_leaf == self.my_id:
+                        continue
+                    outer_dst = usid_outer_dst(
+                        self.tenant,
+                        plane=plane, spine=path, dst_leaf=dst_leaf,
+                    )
+                    dst_inner = inner_addr(self.tenant, dst_leaf)
+                    tpl = build_outer_template(
+                        src_underlay=src_underlay,
+                        dst_outer=outer_dst,
+                        src_inner=own_src_inner,
+                        dst_inner=dst_inner,
+                        sport=sport, dport=dport,
+                        payload_len=PROBE_REPLY_PAYLOAD_LEN,
+                    )
+                    self._probe_templates[(plane, path, dst_leaf)] = (
+                        bytes(tpl), outer_dst,
+                    )
+                    built += 1
+        log.info(
+            "Srv6RawTransport: pre-warmed %d probe templates "
             "(tenant=%s my_id=%d planes=%d spines=%d leaves=%d)",
             built, self.tenant, self.my_id,
             NUM_PLANES, NUM_SPINES, NUM_LEAVES,
