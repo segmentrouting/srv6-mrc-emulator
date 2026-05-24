@@ -162,7 +162,47 @@ the `srv6_mrc.topo` ↔ `spray` reference-pairs map in sync.
     exists to prevent. Per-EV state attribution (planned for Phase
     1b step 3) depends on the sender owning the spine choice.
 
-## Phase status (where the codebase is right now)
+## Roadmap
+
+### Live visibility / Grafana dashboard (planned)
+
+Currently the per-plane balance story — the headline of this demo —
+is observable only by `jq`-ing post-run JSON reports. A live
+dashboard would make spray balance, MRC EV demotion, and fault-
+injection effects observable in real time during a scenario run.
+
+Sketch:
+
+- One Prometheus + Grafana container pair stood up by `make deploy`
+  alongside the fabric (declared in `topology.clab.yaml`, not
+  side-channel docker-compose, so `make destroy` tears them down).
+- A scraper sidecar polls fabric nodes via `ip -stats link show
+  <iface>` (per-interface bps/pps for the per-plane balance graph)
+  and hosts via `cat /proc/net/snmp6` (Udp6RcvbufErrors etc. — the
+  diagnostic counters we keep grepping by hand every lab cycle).
+- For tighter scrape intervals than `docker exec` can sustain
+  (~50-100ms per exec × ~50 containers on 4p-4x8), use `nsenter`
+  from a privileged container in the host PID namespace instead.
+- The scraper must apply the same retry-on-rc=1 pattern documented
+  for `docker exec cat` (see "RESOLVED: SO_REUSEPORT cascade"
+  gotcha list).
+- Exposed via a fixed port on the topology host so users can hit
+  `http://<topology-host>:3000` directly.
+
+Headline panels:
+- Per-plane TX bps + pps on a chosen leaf NIC set
+- Per-flow EV active count (live read of `/dev/shm/srv6-mrc/.../
+  *.json` snapshots, same shape `report.py` consumes)
+- Probe success rate / RTT p50 per EV over time
+- Fault-injection markers (tc netem add/del events) as
+  annotations
+
+Not started. Don't block probe/scenario correctness work on this —
+it's a parallel vertical with no code-path overlap.
+
+---
+
+
 
 - **Phase 1a (plane-aware MRC):** done, validated in lab for BOTH
   tenants (green + yellow). Plane-level loss detection via receiver

@@ -1,0 +1,30 @@
+# Prometheus config for the SRv6 MRC visibility stack.
+#
+# Bind-mounted into srv6-prometheus by the containerlab fragment.
+# In-memory + 1h retention via the command-line flag on the
+# container (--storage.tsdb.retention.time=1h --storage.tsdb.path=
+# /prometheus). This file only declares scrape jobs.
+
+global:
+  scrape_interval: 1s            # matches the scraper's fast cadence
+  scrape_timeout:  900ms         # under the 1s interval
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: srv6-scraper
+    static_configs:
+      - targets:
+          # Container name on the `visibility` docker network.
+          # Containerlab assigns this name from the node key in
+          # topology.clab.yaml; see visibility.yaml.fragment.
+          - srv6-scraper:9100
+    metric_relabel_configs: []
+    # Honor labels emitted by the scraper itself (plane, tier,
+    # host, tenant, dst_id, etc.). No relabeling here keeps the
+    # design doc's metric naming authoritative.
+
+  # Self-scrape — gives Grafana an `up{job="prometheus"}` to alert
+  # on if Prometheus itself ever loses its mind.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

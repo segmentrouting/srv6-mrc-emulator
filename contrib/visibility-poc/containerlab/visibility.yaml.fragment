@@ -1,0 +1,86 @@
+# Visibility stack — containerlab fragment.
+#
+# DESIGN-ONLY skeleton. This file is NOT itself a deployable
+# containerlab topology. Either:
+#
+#   (a) `generators/fabric.py` merges this block into the generated
+#       `topologies/<name>/topology.clab.yaml` when `topo.yaml`
+#       contains `visibility: {enabled: true, ...}`  (RECOMMENDED;
+#       see docs/design-visibility.md §9), or
+#
+#   (b) An operator hand-merges this block under `topology.nodes:`
+#       and `topology.networks:` in the generated clab YAML. NOT
+#       recommended — generated files are not supposed to be hand-
+#       edited (see AGENTS.md "Never hand-edit generated files").
+#
+# The fragment assumes:
+#  - The docker daemon socket is at /var/run/docker.sock on the
+#    topology host (containerlab's default assumption).
+#  - The topology's `topo.yaml` is reachable at the relative path
+#    `topo.yaml` (same as the host containers' bind already does).
+#  - srv6-scraper:1.0 has been built locally via
+#    `make visibility-image`.
+#
+# Ports exposed on the topology host:
+#  - 3000 (Grafana)
+#  - 9090 (Prometheus, optional; remove the publish if you don't
+#    want it exposed)
+
+# ---- merge under `topology.nodes:` ----------------------------------------
+
+    srv6-scraper:
+      kind: linux
+      image: srv6-scraper:1.0
+      # The scraper needs to docker-exec into fabric and host
+      # containers, so it must reach the docker daemon. Easiest
+      # path: bind-mount the docker socket. The image installs
+      # `docker-cli` (no daemon), so this is read+write to the
+      # socket only.
+      binds:
+        - /var/run/docker.sock:/var/run/docker.sock
+        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro
+      # The scraper does NOT need fabric reachability; Prometheus
+      # scrapes it on the `visibility` network by name. Put it on
+      # the management network so it can resolve container short
+      # names for `docker exec`.
+      mgmt-ipv4: 172.20.18.250
+
+    srv6-prometheus:
+      kind: linux
+      image: prom/prometheus:v2.55.0
+      mgmt-ipv4: 172.20.18.251
+      binds:
+        - visibility/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      ports:
+        - "9090:9090"
+      # In-memory + 1h retention. Wipe on every `make destroy`.
+      cmd: >
+        --config.file=/etc/prometheus/prometheus.yml
+        --storage.tsdb.path=/prometheus
+        --storage.tsdb.retention.time=1h
+        --web.listen-address=:9090
+
+    srv6-grafana:
+      kind: linux
+      image: grafana/grafana:11.2.0
+      mgmt-ipv4: 172.20.18.252
+      env:
+        GF_AUTH_ANONYMOUS_ENABLED: "true"
+        GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+        GF_AUTH_DISABLE_LOGIN_FORM: "true"
+        GF_USERS_DEFAULT_THEME: "dark"
+      binds:
+        - visibility/grafana/provisioning:/etc/grafana/provisioning:ro
+        - visibility/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      ports:
+        - "3000:3000"
+
+# ---- The fabric `mgmt` network already covers reachability
+#      between these three and the lab containers via container
+#      short names. No additional `topology.networks:` block is
+#      needed for v1.
+#
+#      If multi-tenancy of the visibility stack becomes a
+#      requirement, add a dedicated user-defined bridge here and
+#      attach all three nodes to it; the scraper still needs the
+#      `mgmt` net for `docker exec` reachability.

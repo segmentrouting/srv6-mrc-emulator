@@ -1,0 +1,170 @@
+{
+  "__comment": "Headline Grafana dashboard for the SRv6 MRC visibility stack. Per-plane TX pps is THE demo visual — see docs/design-visibility.md §7. Other panels are stubs; queries are written to match the design doc's metric names but not yet validated against a live Prometheus. Provisioned into Grafana via /etc/grafana/provisioning/dashboards/.",
+  "annotations": {
+    "list": [
+      {
+        "__comment": "Stub annotation source. v2 will POST fault-injection events from srv6_mrc/mrc/run.py to the Grafana annotation API. See design-visibility.md §11.",
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "__comment": "HEADLINE PANEL — per-plane TX pps, summed across leaves matched by $leaf. This is the demo visual.",
+      "title": "Per-plane TX pps (leaves)",
+      "type": "timeseries",
+      "id": 1,
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "sum by (plane) (rate(srv6_iface_tx_packets_total{tier=\"leaf\",node=~\"$leaf\"}[10s]))",
+          "legendFormat": "plane {{plane}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "plane 0"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
+          {"matcher": {"id": "byName", "options": "plane 1"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+          {"matcher": {"id": "byName", "options": "plane 2"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "yellow"}}]},
+          {"matcher": {"id": "byName", "options": "plane 3"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]}
+        ]
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
+    },
+    {
+      "__comment": "Secondary: per-flow active EV count. Stubbed query.",
+      "title": "Per-flow active EVs",
+      "type": "timeseries",
+      "id": 2,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 10},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "srv6_mrc_flow_active_evs{host=~\"$host\"}",
+          "legendFormat": "{{host}} -> dst{{dst_id}} ({{tenant}})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "__comment": "Secondary: probe RTT p50 per EV over time. Stubbed query.",
+      "title": "EV probe RTT p50",
+      "type": "timeseries",
+      "id": 3,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 10},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "srv6_mrc_ev_rtt_p50_seconds{host=~\"$host\",dst_id=~\"$dst_id\"}",
+          "legendFormat": "p{{plane}}s{{path}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "__comment": "Diagnostics: UDP6 receive-buffer errors. Should be 0 — see AGENTS.md gotcha.",
+      "title": "Udp6 rcvbuf errors (rate)",
+      "type": "timeseries",
+      "id": 4,
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 18},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "rate(srv6_host_udp6_rcvbuf_errors_total[1m])",
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "__comment": "Diagnostics: scraper own scrape-duration vs cadence floor.",
+      "title": "Scraper scrape duration",
+      "type": "timeseries",
+      "id": 5,
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 18},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "srv6_scraper_scrape_duration_seconds",
+          "legendFormat": "{{source}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    }
+  ],
+  "refresh": "1s",
+  "schemaVersion": 39,
+  "tags": ["srv6", "mrc", "visibility"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {"selected": false, "text": "Prometheus", "value": "Prometheus"},
+        "hide": 0
+      },
+      {
+        "name": "leaf",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": "label_values(srv6_iface_tx_packets_total{tier=\"leaf\"}, node)",
+        "regex": "",
+        "current": {"text": "All", "value": ".*"},
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2
+      },
+      {
+        "name": "host",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": "label_values(srv6_mrc_flow_active_evs, host)",
+        "current": {"text": "All", "value": ".*"},
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2
+      },
+      {
+        "name": "dst_id",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": "label_values(srv6_mrc_flow_active_evs, dst_id)",
+        "current": {"text": "All", "value": ".*"},
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2
+      }
+    ]
+  },
+  "time": {"from": "now-5m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "SRv6 MRC — Per-plane balance",
+  "uid": "srv6-per-plane-balance",
+  "version": 1,
+  "weekStart": ""
+}
