@@ -307,6 +307,21 @@ class SenderMrcAgent:
             "no_match": 0,         # probe_clock.match_reply -> None
             "matched": 0,          # recorded a success in EVStateTable
         }
+        # Histogram of observed reply latency (now_ns - reply.tx_ns)
+        # measured BEFORE match_reply. Diagnoses the 2026-05-24
+        # multi-flow no_match smoking gun: if `lt_5s` / `ge_5s` are
+        # heavy while `lt_50ms` is thin, replies are arriving long
+        # after their outstanding probe was swept (fabric / kernel
+        # backlog). If `lt_50ms` is heavy but `no_match` still high,
+        # the bug is in match_reply itself (req_id collision, tx_ns
+        # mismatch). Single-writer same as probe_reply_stats.
+        self.reply_latency_buckets: Dict[str, int] = {
+            "lt_50ms": 0,
+            "lt_200ms": 0,
+            "lt_1s": 0,
+            "lt_5s": 0,
+            "ge_5s": 0,
+        }
         self.probe_clock = ProbeClock(
             num_planes=NUM_PLANES,
             num_paths=NUM_SPINES,
@@ -595,6 +610,17 @@ class SenderMrcAgent:
             log.debug("mrc.probe: bad reply: %s", e)
             return
         now_ns = self.clock_ns()
+        latency_ns = now_ns - reply.tx_ns
+        if latency_ns < 50_000_000:
+            self.reply_latency_buckets["lt_50ms"] += 1
+        elif latency_ns < 200_000_000:
+            self.reply_latency_buckets["lt_200ms"] += 1
+        elif latency_ns < 1_000_000_000:
+            self.reply_latency_buckets["lt_1s"] += 1
+        elif latency_ns < 5_000_000_000:
+            self.reply_latency_buckets["lt_5s"] += 1
+        else:
+            self.reply_latency_buckets["ge_5s"] += 1
         rtt_ns = self.probe_clock.match_reply(
             req_id=reply.req_id,
             plane=reply.plane_id,

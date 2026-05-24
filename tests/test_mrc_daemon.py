@@ -257,6 +257,16 @@ class MrcDaemonLifecycleTests(unittest.TestCase):
             self.assertIsInstance(prs[key], int)
             self.assertGreaterEqual(prs[key], 0)
 
+        # reply_latency_buckets diagnoses arrival-time of replies
+        # relative to their outstanding probe entries' sweep deadline.
+        self.assertIn("reply_latency_buckets", payload)
+        rlb = payload["reply_latency_buckets"]
+        self.assertIsInstance(rlb, dict)
+        for key in ("lt_50ms", "lt_200ms", "lt_1s", "lt_5s", "ge_5s"):
+            self.assertIn(key, rlb, f"missing reply_latency_buckets key {key}")
+            self.assertIsInstance(rlb[key], int)
+            self.assertGreaterEqual(rlb[key], 0)
+
     def test_snapshot_refreshes_on_cadence(self) -> None:
         """Two snapshots taken ~2*probe_interval_ms apart have distinct
         captured_ns values (publisher actually re-runs)."""
@@ -386,6 +396,25 @@ class MrcDaemonReplyDispatchTests(unittest.TestCase):
                            "no reply matched an outstanding probe")
         self.assertEqual(prs["decode_failed"], 0,
                          "decode_probe_reply failed on a valid payload")
+
+        # Reply latency on a loopback transport must land in the
+        # fastest bucket. If a future change accidentally swaps
+        # clocks (monotonic vs realtime) or stops echoing tx_ns,
+        # this asserts catch it before the lab does. Bucketing
+        # happens post-decode, so bucket sum == received - decode_failed.
+        rlb = agent.reply_latency_buckets
+        total_bucketed = sum(rlb.values())
+        self.assertEqual(
+            total_bucketed, prs["received"] - prs["decode_failed"],
+            "bucket sum must equal post-decode reply count",
+        )
+        self.assertGreater(rlb["lt_50ms"], 0,
+                           "loopback replies must land in lt_50ms bucket")
+        for slow in ("lt_1s", "lt_5s", "ge_5s"):
+            self.assertEqual(
+                rlb[slow], 0,
+                f"loopback replies should never bucket as {slow}",
+            )
 
 
 class MrcDaemonFinalReportTests(unittest.TestCase):

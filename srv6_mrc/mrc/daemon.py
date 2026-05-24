@@ -535,6 +535,7 @@ class MrcDaemon:
                 "transport_stats": self.transport.stats(),
                 "dispatch_stats": dict(self._dispatch_counters),
                 "probe_reply_stats": dict(agent.probe_reply_stats),
+                "reply_latency_buckets": dict(agent.reply_latency_buckets),
             }
             path = self._snapshot_path(tenant, dst_id)
             self._atomic_write_json(path, payload)
