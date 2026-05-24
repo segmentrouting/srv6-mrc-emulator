@@ -44,6 +44,7 @@ import re
 import sys
 import time
 from dataclasses import asdict, is_dataclass
+from pathlib import Path
 
 from srv6_mrc.runner import (
     FlowEndpoint, run_receiver, run_sender, detect_self_id,
@@ -483,6 +484,25 @@ def cmd_recv(args, tenant: str, my_id: int) -> int:
         )
     finally:
         if mrc_agent is not None:
+            # Snapshot receiver-side diagnostic counters BEFORE stop()
+            # tears the loops down — the buckets are populated by the
+            # probe-rx thread which we're about to join.
+            mrc_snap = mrc_agent.diagnostic_snapshot()
+            report["mrc_receiver"] = mrc_snap
+            # Also drop a sidecar file under the daemon's snapshot
+            # dir so the lab diagnostic workflow can grep it the
+            # same way it greps daemon snapshots. Best-effort —
+            # the orchestrator's stdout-merge path is authoritative.
+            try:
+                snap_dir = Path("/dev/shm/srv6-mrc") / f"{tenant}-host{my_id:02d}"
+                snap_dir.mkdir(parents=True, exist_ok=True)
+                snap_path = snap_dir / f"receiver_{tenant}.json"
+                tmp = snap_path.with_suffix(".json.tmp")
+                with open(tmp, "w") as f:
+                    json.dump(mrc_snap, f)
+                tmp.replace(snap_path)
+            except OSError:
+                pass
             mrc_agent.stop(timeout_s=1.0)
 
     if args.json:

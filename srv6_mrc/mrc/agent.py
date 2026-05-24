@@ -83,8 +83,22 @@ from __future__ import annotations
 import logging
 import random
 import socket
+import struct
 import threading
 import time
+
+try:
+    import fcntl  # type: ignore[import-untyped]
+    import termios  # type: ignore[import-untyped]
+    _SIOCINQ = getattr(termios, "FIONREAD", None)
+    _HAVE_SIOCINQ = _SIOCINQ is not None
+except ImportError:
+    # Non-Linux dev laptops without fcntl/termios — degrade to
+    # "queue depth always reported as 0" rather than crashing.
+    # Lab containers are alpine/linux so this is always available
+    # there.
+    _HAVE_SIOCINQ = False
+    _SIOCINQ = None
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -785,6 +799,51 @@ class ReceiverMrcAgent:
             )
         self.transport = transport
 
+        # Receiver-side probe-RX instrumentation. Counterpart to the
+        # sender's probe_reply_stats / reply_latency_buckets. The
+        # 2026-05-24 lab cycle proved replies arrive multi-seconds
+        # late at the sender; the question now is whether the
+        # receiver's single-threaded _probe_rx_loop is the queue
+        # location (slow per-probe processing) or whether the kernel
+        # holds replies after they're emitted. These counters
+        # localize it definitively.
+        #
+        # probe_rx_stats: same shape as probe_reply_stats — total
+        # recv()s, decode_failed, replied OK, reply_send_failed.
+        #
+        # probe_rx_backlog_buckets: SIOCINQ at recv()-time bucketed
+        # by number of probe-sized (28B) records still queued in the
+        # kernel after the one we just read. inq_0 means we were
+        # caught up; inq_gt_64 means we were >64 probes behind.
+        #
+        # probe_rx_gap_buckets: time between successive recv() returns.
+        # Heavy tail (lt_100ms+) means per-probe handling cost is
+        # dominating; mostly lt_1ms means the receiver is idle and
+        # the bottleneck is elsewhere (sender recv() starvation,
+        # kernel TX queue, etc.).
+        #
+        # Single-writer (probe-rx thread) so plain int += 1 is safe.
+        self.probe_rx_stats: Dict[str, int] = {
+            "recv_count": 0,
+            "decode_failed": 0,
+            "replied": 0,
+            "reply_send_failed": 0,
+        }
+        self.probe_rx_backlog_buckets: Dict[str, int] = {
+            "inq_0": 0,
+            "inq_le_4": 0,
+            "inq_le_16": 0,
+            "inq_le_64": 0,
+            "inq_gt_64": 0,
+        }
+        self.probe_rx_gap_buckets: Dict[str, int] = {
+            "lt_1ms": 0,
+            "lt_10ms": 0,
+            "lt_100ms": 0,
+            "lt_1s": 0,
+            "ge_1s": 0,
+        }
+
     # --- public API ----------------------------------------------------
 
     def start(self) -> None:
@@ -808,6 +867,18 @@ class ReceiverMrcAgent:
         """Hook for the data-RX path."""
         self.loss_table.record(flow_key, plane=plane, path=path, seq=seq)
 
+    def diagnostic_snapshot(self) -> Dict[str, Dict[str, int]]:
+        """Per-agent diagnostic counters for the orchestrator / lab.
+
+        Returned as a plain dict (copies of the live counters) so
+        the caller can JSON-encode without aliasing live state.
+        """
+        return {
+            "probe_rx_stats": dict(self.probe_rx_stats),
+            "probe_rx_backlog_buckets": dict(self.probe_rx_backlog_buckets),
+            "probe_rx_gap_buckets": dict(self.probe_rx_gap_buckets),
+        }
+
     def known_senders(self) -> Tuple[Tuple[int, int], ...]:
         """Test/diagnostic accessor for the sender cache."""
         with self._senders_lock:
@@ -828,6 +899,15 @@ class ReceiverMrcAgent:
         except RuntimeError as e:
             log.error("mrc.recv: %s", e)
             return
+        # Instrumentation state. last_recv_ns lets us measure the gap
+        # between successive recvfrom() returns — heavy tail means
+        # per-probe handling cost dominates; mostly lt_1ms means
+        # the receiver is idle and the bottleneck is elsewhere.
+        last_recv_ns: Optional[int] = None
+        # Reused 4-byte buffer for SIOCINQ ioctl. Saves an allocation
+        # per probe on the hot path. _HAVE_SIOCINQ is False on macOS
+        # dev laptops without termios.FIONREAD; we silently no-op there.
+        inq_buf = bytearray(4) if _HAVE_SIOCINQ else None
         while not self._stop.is_set():
             try:
                 payload, _peer = sock.recvfrom(DEFAULT_RECV_BUFSIZE)
@@ -835,9 +915,51 @@ class ReceiverMrcAgent:
                 continue
             except OSError:
                 return
+            now_ns = self.clock_ns()
+            self.probe_rx_stats["recv_count"] += 1
+            # Gap from previous recv. Skip on first iteration (no
+            # baseline) — that's a non-event, not a 0ms gap.
+            if last_recv_ns is not None:
+                gap_ns = now_ns - last_recv_ns
+                if gap_ns < 1_000_000:
+                    self.probe_rx_gap_buckets["lt_1ms"] += 1
+                elif gap_ns < 10_000_000:
+                    self.probe_rx_gap_buckets["lt_10ms"] += 1
+                elif gap_ns < 100_000_000:
+                    self.probe_rx_gap_buckets["lt_100ms"] += 1
+                elif gap_ns < 1_000_000_000:
+                    self.probe_rx_gap_buckets["lt_1s"] += 1
+                else:
+                    self.probe_rx_gap_buckets["ge_1s"] += 1
+            last_recv_ns = now_ns
+            # SIOCINQ tells us how many bytes are still queued in
+            # the kernel for this socket AFTER the recvfrom that
+            # just returned. Divide by 28B (PROBE wire size) for
+            # the number of probes we're behind. Best-effort:
+            # ioctl can fail in odd kernel states; on failure we
+            # silently skip the bucket update for this probe.
+            if _HAVE_SIOCINQ and inq_buf is not None:
+                try:
+                    fcntl.ioctl(sock.fileno(), _SIOCINQ, inq_buf, True)
+                    inq_bytes = struct.unpack("i", bytes(inq_buf))[0]
+                except OSError:
+                    inq_bytes = -1
+                if inq_bytes >= 0:
+                    inq_probes = inq_bytes // 28
+                    if inq_probes == 0:
+                        self.probe_rx_backlog_buckets["inq_0"] += 1
+                    elif inq_probes <= 4:
+                        self.probe_rx_backlog_buckets["inq_le_4"] += 1
+                    elif inq_probes <= 16:
+                        self.probe_rx_backlog_buckets["inq_le_16"] += 1
+                    elif inq_probes <= 64:
+                        self.probe_rx_backlog_buckets["inq_le_64"] += 1
+                    else:
+                        self.probe_rx_backlog_buckets["inq_gt_64"] += 1
             try:
                 probe = decode_probe(payload)
             except ProbeDecodeError as e:
+                self.probe_rx_stats["decode_failed"] += 1
                 log.debug("mrc.recv: bad probe: %s", e)
                 continue
             self._learn_sender(
@@ -863,7 +985,9 @@ class ReceiverMrcAgent:
                     plane=probe.plane_id, path=probe.path_id,
                     dst_leaf=probe.src_id, payload=reply_payload,
                 )
+                self.probe_rx_stats["replied"] += 1
             except OSError as e:
+                self.probe_rx_stats["reply_send_failed"] += 1
                 log.debug("mrc.recv: reply send failed: %s", e)
 
     def _report_emit_loop(self) -> None:
