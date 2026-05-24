@@ -478,6 +478,14 @@ class EVStateTable:
                         "last_loss_ratio": round(rec.last_loss_ratio, 6),
                         "rtt_p50_ns": self.rtt_p50_ns(tenant, plane, path),
                         "rtt_p99_ns": self.rtt_p99_ns(tenant, plane, path),
+                        # Number of successful-probe RTT samples currently
+                        # in the ring (max = rtt_ring_size, default 64).
+                        # Diagnostic: distinguishes "EV never had a
+                        # successful probe" (samples=0, p50_ns is None)
+                        # from "EV had successes earlier but current
+                        # streak got reset to 0" (samples>0, p50_ns set,
+                        # consecutive_probe_successes=0).
+                        "rtt_samples": len(rec.rtt_ring_ns),
                         "transitions": rec.transitions,
                         "demotes_suppressed_by_floor":
                             rec.demotes_suppressed_by_floor,
