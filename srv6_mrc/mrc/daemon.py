@@ -220,20 +220,33 @@ class MrcDaemon:
         self.transport = transport
 
         # Per-flow state. Construction order:
-        #   tenants set -> EVStateTable per tenant (an EVStateTable
-        #   handles all flows for one tenant; per-flow MRC bookkeeping
-        #   like ProbeClock + LossFusionStats lives on SenderMrcAgent).
-        # In V1 we have one tenant most of the time, but allowing
-        # mixed-tenant flows costs nothing.
-        tenants = sorted({f.tenant for f in self.flows})
-        self.tables: Dict[str, EVStateTable] = {
-            t: EVStateTable(
+        #   one EVStateTable per (tenant, dst_id) flow, NOT per tenant.
+        #
+        # Why per-flow: probe outcomes against the same EV from
+        # different destinations would otherwise race destructively
+        # in a shared counter. With 7 flows on a host all writing to
+        # one (tenant, plane, path) record, every successful probe
+        # from flow A would be erased by the next millisecond's
+        # timeout from flow B's sweep, leaving consecutive_probe_
+        # successes pegged at 0 even when probes were succeeding
+        # (rtt_ring populated but the state-machine counter
+        # trampled). This matches the MRC paper's per-endpoint-pair
+        # EV model: host00 has 16 EVs to host01, a separate 16 to
+        # host02, etc. Each pair is independently monitored.
+        #
+        # Memory: 16 EV records x N flows is small (N=7 on 4p-4x8
+        # all-to-all = 112 records per host per tenant). The
+        # snapshot already publishes per-(tenant, dst_id), so the
+        # on-disk file layout is unchanged; only the in-memory
+        # dict key changes from `tenant` to `(tenant, dst_id)`.
+        self.tables: Dict[Tuple[str, int], EVStateTable] = {
+            (flow.tenant, flow.dst_id): EVStateTable(
                 num_planes=NUM_PLANES,
                 num_paths=NUM_SPINES,
-                tenants=(t,),
+                tenants=(flow.tenant,),
                 cfg=ev_cfg,
             )
-            for t in tenants
+            for flow in self.flows
         }
 
         # Per-flow agent. `transport=self.transport` shares the daemon's
@@ -265,7 +278,7 @@ class MrcDaemon:
                 tenant=flow.tenant,
                 src_id=src_id,
                 dst_id=flow.dst_id,
-                table=self.tables[flow.tenant],
+                table=self.tables[(flow.tenant, flow.dst_id)],
                 config=agent_cfg,
                 transport=self.transport,  # shared!
                 clock_ns=clock_ns,

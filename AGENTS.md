@@ -814,6 +814,47 @@ dict-style under `.ev_state.evs`; the current shape is an
 **array** under `.ev_state.tenants["<tenant>"]`. If you see
 `null (null) has no keys` from jq, that's the symptom.
 
+**2026-05-24 — multi-flow EV-counter trampling root cause**:
+After `35f68f9` (probe-emit fast path) and `42965d4` (snapshot
+visibility), lab cycle on `4p-4x8 green-all-to-all` showed
+fast-path emit firing on every probe (`probe_fast_path_misses=0`)
+and probes round-tripping into the RTT ring (`rtt_samples=24-29`
+per EV), yet `consecutive_probe_successes=0` and
+`consecutive_probe_timeouts≈156-216` on every EV — meaning the
+state machine never observed a clean success.
+
+Root cause: `MrcDaemon` constructed **one `EVStateTable` per
+tenant** shared across all 7 per-flow `SenderMrcAgent` instances
+on a sender host. The EV state machine's "consecutive success" /
+"consecutive timeout" counters were designed for single-flow
+semantics — flow A's success bumps `successes=1, timeouts=0`,
+then flow B's timeout milliseconds later in the same shared
+record bumps `timeouts=1, successes=0`. With 7 flows × 5
+rounds/sec × 16 EVs = 560 events/sec/host racing into one
+counter pair, `consecutive_probe_successes` stayed pegged at 0
+unless 7 flows succeeded in lockstep. The `rtt_ring` path didn't
+reset the counter, which is why `rtt_samples` looked healthy.
+
+This contradicted the MRC paper's model anyway: each endpoint
+maintains its own per-peer EV grid (host00 → host01 is one set
+of 16 EVs, host00 → host02 is a separate 16). Per-tenant
+sharing conflated unrelated paths.
+
+Fix (`daemon.py:222`, this entry): construct one `EVStateTable`
+per `(tenant, dst_id)` flow. Each `SenderMrcAgent` gets its
+own table, no shared writers. Memory cost is trivial (16 EV
+records × N flows). Snapshot already publishes per
+`(tenant, dst_id)` so the on-disk file layout is unchanged;
+only the in-memory dict key changes from `tenant` to
+`(tenant, dst_id)`. Regression test:
+`test_mrc_daemon_multiflow.py::test_one_ev_state_table_per_flow_not_per_tenant`
+locks the contract — duplicate-table aliasing across flows will
+fail loudly.
+
+If you ever see `consecutive_probe_successes` stuck at 0 across
+all flows while `rtt_samples > 0`, look for a new shared-writer
+hazard against an EV record.
+
 ### Spurious "orphan flow" report warnings on collective scenarios
 
 Every host in the ring scenario gets an "orphan flow" warning where

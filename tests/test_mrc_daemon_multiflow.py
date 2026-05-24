@@ -204,6 +204,53 @@ class MrcDaemonDemuxKeysTests(unittest.TestCase):
         self.assertEqual(len(keys), len(set(keys)),
                          f"duplicate demux keys: {Counter(keys)}")
 
+    def test_one_ev_state_table_per_flow_not_per_tenant(self) -> None:
+        """Each (tenant, dst_id) flow gets its own EVStateTable.
+
+        Pre-fix the daemon allocated one EVStateTable per tenant and
+        shared it across all flows. Under multi-flow, every probe
+        outcome from flow A raced against flow B's outcomes on the
+        same (plane, path) record. The "consecutive successes" /
+        "consecutive timeouts" counters in the table can't survive
+        7 producers writing concurrently: one flow's success
+        immediately reset by the next flow's timeout, leaving
+        consecutive_probe_successes pegged at 0 even though the
+        RTT ring was populating correctly.
+
+        Per the MRC paper, each endpoint maintains its own EV grid
+        per peer endpoint. Lock that contract: distinct tables per
+        (tenant, dst_id), and each agent must hold the one matching
+        its own (tenant, dst_id).
+        """
+        flows = [
+            DaemonFlow(tenant="green", dst_id=d) for d in (1, 2, 3, 7)
+        ]
+        d = MrcDaemon(
+            src_host="green-host00",
+            src_id=0,
+            flows=flows,
+            agent_cfg=FAST_CONFIG,
+            transport=self.sender_xport,
+            snapshot_dir=self.tmpdir,
+        )
+        # 4 tables, one per (tenant, dst_id), all distinct objects.
+        self.assertEqual(len(d.tables), 4)
+        self.assertEqual(
+            sorted(d.tables.keys()),
+            [("green", 1), ("green", 2), ("green", 3), ("green", 7)],
+        )
+        seen_ids = {id(t) for t in d.tables.values()}
+        self.assertEqual(len(seen_ids), 4,
+                         "EVStateTables were aliased across flows")
+
+        # Each agent points at its own table (not its neighbor's).
+        for f in flows:
+            agent = d.agents[(f.tenant, f.dst_id)]
+            self.assertIs(
+                agent.table, d.tables[(f.tenant, f.dst_id)],
+                f"flow {f} agent table is not its own per-flow table",
+            )
+
     def test_demux_keys_are_rfc5952_canonical(self) -> None:
         # Regression rail for the silent-drop bug fixed alongside this
         # test: dispatcher looked up by `peer_addr[0]` (the kernel's
