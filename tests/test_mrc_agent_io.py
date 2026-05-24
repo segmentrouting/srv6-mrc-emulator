@@ -625,5 +625,149 @@ class ProbeEmitBucketsTests(unittest.TestCase):
             )
 
 
+
+
+class ReplyHandlerBucketsTests(unittest.TestCase):
+    """Internal timing of _handle_probe_reply.
+
+    On loopback (no fabric, no scapy) the handler is pure-Python:
+    decode + clock_ns + bucket + probe_clock.match_reply + (maybe)
+    record_probe_result. End-to-end this is microseconds. We pin
+    that fast-path so a future regression that puts I/O / lock
+    contention into the handler shows up here as buckets sliding
+    into lt_10ms+.
+    """
+
+    def setUp(self) -> None:
+        sender_report_port = PORTS.take(1)
+        receiver_probe_port = PORTS.take(1)
+        self.table = EVStateTable(
+            tenants=("green",), num_planes=NUM_PLANES, num_paths=NUM_SPINES,
+        )
+        sender_xport, receiver_xport = _build_loopback_pair(
+            sender_report_port=sender_report_port,
+            receiver_probe_port=receiver_probe_port,
+        )
+        self.sender = SenderMrcAgent(
+            tenant="green",
+            src_id=0,
+            dst_id=15,
+            table=self.table,
+            config=FAST_CONFIG,
+            transport=sender_xport,
+        )
+        self.receiver = ReceiverMrcAgent(
+            tenant="green",
+            my_id=15,
+            config=FAST_CONFIG,
+            transport=receiver_xport,
+        )
+
+    def tearDown(self) -> None:
+        self.sender.stop(timeout_s=0.5)
+        self.receiver.stop(timeout_s=0.5)
+
+    def test_loopback_replies_bucket_into_sub_millisecond(self) -> None:
+        self.receiver.start()
+        self.sender.start()
+
+        def saw_matched() -> bool:
+            return self.sender.probe_reply_stats["matched"] >= 4
+
+        self.assertTrue(_wait_for(saw_matched, timeout_s=1.5),
+                        f"never saw 4 matched replies; "
+                        f"stats={dict(self.sender.probe_reply_stats)}")
+
+        rhb = self.sender.reply_handler_buckets
+        matched = self.sender.probe_reply_stats["matched"]
+        fast = rhb["lt_10us"] + rhb["lt_100us"] + rhb["lt_1ms"]
+        slow = rhb["lt_10ms"] + rhb["lt_100ms"] + rhb["ge_100ms"]
+        self.assertGreaterEqual(
+            fast, matched,
+            f"expected sub-ms reply handler on loopback; "
+            f"buckets={dict(rhb)} matched={matched}",
+        )
+        self.assertEqual(
+            slow, 0,
+            f"loopback reply handler should never take >=10ms; "
+            f"buckets={dict(rhb)}",
+        )
+
+
+class ReplyAgeStatsTests(unittest.TestCase):
+    """Cross-check that (now_ns - reply.tx_ns) ages reflect real
+    wall-clock between probe emit and reply decode. We force a 50ms
+    gap by stalling the receiver's reply send so the reply payload
+    carries a tx_ns that is ~50ms older than now() when the sender
+    decodes it.
+    """
+
+    def test_age_stats_track_emit_to_decode_delta(self) -> None:
+        sender_report_port = PORTS.take(1)
+        receiver_probe_port = PORTS.take(1)
+        self.table = EVStateTable(
+            tenants=("green",), num_planes=NUM_PLANES, num_paths=NUM_SPINES,
+        )
+        sender_xport, receiver_xport = _build_loopback_pair(
+            sender_report_port=sender_report_port,
+            receiver_probe_port=receiver_probe_port,
+        )
+        # Wrap the receiver's send_probe_reply with a 50ms pre-send
+        # sleep. The receiver computes its reply.tx_ns from the
+        # incoming probe's tx_ns echo (verbatim), so this stall
+        # adds latency entirely on the wire-time axis the sender
+        # measures as `now_ns - reply.tx_ns`.
+        original_send = receiver_xport.send_probe_reply
+
+        def delayed_send(*args, **kwargs):
+            time.sleep(0.05)
+            return original_send(*args, **kwargs)
+
+        receiver_xport.send_probe_reply = delayed_send  # type: ignore[assignment]
+
+        self.sender = SenderMrcAgent(
+            tenant="green",
+            src_id=0,
+            dst_id=15,
+            table=self.table,
+            config=FAST_CONFIG,
+            transport=sender_xport,
+        )
+        self.receiver = ReceiverMrcAgent(
+            tenant="green",
+            my_id=15,
+            config=FAST_CONFIG,
+            transport=receiver_xport,
+        )
+        try:
+            self.receiver.start()
+            self.sender.start()
+            self.assertTrue(
+                _wait_for(
+                    lambda: self.sender.reply_age_count >= 1,
+                    timeout_s=2.0,
+                ),
+                f"never observed any reply age sample; "
+                f"stats={dict(self.sender.probe_reply_stats)}",
+            )
+        finally:
+            self.sender.stop(timeout_s=0.5)
+            self.receiver.stop(timeout_s=0.5)
+
+        self.assertGreaterEqual(
+            self.sender.reply_age_max_ns, 50_000_000,
+            f"reply_age_max_ns expected >=50ms with 50ms stall; "
+            f"got max={self.sender.reply_age_max_ns} "
+            f"min={self.sender.reply_age_min_ns} "
+            f"count={self.sender.reply_age_count}",
+        )
+        self.assertGreaterEqual(
+            self.sender.reply_age_min_ns, 50_000_000,
+            f"reply_age_min_ns expected >=50ms when every reply is "
+            f"stalled by 50ms; got min={self.sender.reply_age_min_ns} "
+            f"count={self.sender.reply_age_count}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -284,6 +284,35 @@ class MrcDaemonLifecycleTests(unittest.TestCase):
             self.assertIsInstance(peb[key], int)
             self.assertGreaterEqual(peb[key], 0)
 
+        # reply_handler_buckets pins how long _handle_probe_reply
+        # spent doing internal work, end-to-end. Distinct from
+        # reply_latency_buckets: that one measures wall-clock between
+        # emit and decode (fabric+kernel+queue), this one is purely
+        # in-process work on the dispatch thread.
+        self.assertIn("reply_handler_buckets", payload)
+        rhb = payload["reply_handler_buckets"]
+        self.assertIsInstance(rhb, dict)
+        for key in (
+            "lt_10us", "lt_100us", "lt_1ms",
+            "lt_10ms", "lt_100ms", "ge_100ms",
+        ):
+            self.assertIn(key, rhb,
+                          f"missing reply_handler_buckets key {key}")
+            self.assertIsInstance(rhb[key], int)
+            self.assertGreaterEqual(rhb[key], 0)
+
+        # reply_age_stats cross-checks reply_latency_buckets: the
+        # raw aggregate of (now_ns - reply.tx_ns) on every successful
+        # decode. Locks {max_ns, min_ns, avg_ns, count} schema.
+        self.assertIn("reply_age_stats", payload)
+        ras = payload["reply_age_stats"]
+        self.assertIsInstance(ras, dict)
+        for key in ("max_ns", "min_ns", "avg_ns", "count"):
+            self.assertIn(key, ras,
+                          f"missing reply_age_stats key {key}")
+            self.assertIsInstance(ras[key], int)
+            self.assertGreaterEqual(ras[key], 0)
+
         # dispatch_rx_gap_buckets / dispatch_rx_backlog_buckets are
         # the sender-RX counterpart to the receiver's
         # probe_rx_gap_buckets / probe_rx_backlog_buckets. Lock both

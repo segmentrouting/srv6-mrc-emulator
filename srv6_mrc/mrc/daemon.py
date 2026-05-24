@@ -647,6 +647,19 @@ class MrcDaemon:
                 "probe_reply_stats": dict(agent.probe_reply_stats),
                 "reply_latency_buckets": dict(agent.reply_latency_buckets),
                 "probe_emit_buckets": dict(agent.probe_emit_buckets),
+                "reply_handler_buckets": dict(agent.reply_handler_buckets),
+                "reply_age_stats": {
+                    "max_ns": agent.reply_age_max_ns,
+                    "min_ns": (
+                        agent.reply_age_min_ns
+                        if agent.reply_age_min_ns >= 0 else 0
+                    ),
+                    "avg_ns": (
+                        agent.reply_age_sum_ns // agent.reply_age_count
+                        if agent.reply_age_count > 0 else 0
+                    ),
+                    "count": agent.reply_age_count,
+                },
             }
             path = self._snapshot_path(tenant, dst_id)
             self._atomic_write_json(path, payload)

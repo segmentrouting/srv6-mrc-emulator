@@ -355,6 +355,35 @@ class SenderMrcAgent:
             "lt_1s": 0,
             "ge_1s": 0,
         }
+        # Internal timing of _handle_probe_reply phases. Each call goes
+        # through: decode payload -> compute reply latency -> match
+        # against outstanding probe -> (if matched) record EV result.
+        # The TOTAL of (now() at entry) -> (now() at exit) is what
+        # shows up as additional dispatch_rx_gap on the daemon's
+        # dispatch loop. Buckets cover the expected fast range plus
+        # catastrophic outliers. Single-writer (dispatch thread only).
+        self.reply_handler_buckets: Dict[str, int] = {
+            "lt_10us": 0,
+            "lt_100us": 0,
+            "lt_1ms": 0,
+            "lt_10ms": 0,
+            "lt_100ms": 0,
+            "ge_100ms": 0,
+        }
+        # Wall-clock value of (now_ns - reply.tx_ns) in ns,
+        # captured on every successful decode (before match attempt).
+        # Cross-check against reply_latency_buckets: if reply_latency
+        # shows ge_5s but reply_age stats disagree, we have a
+        # tx_ns corruption / decode bug. If they agree, the 5s is
+        # real wall-clock between emit and reply-decode.
+        # min_ns sentinel: -1 means uninitialized so the first
+        # observation always replaces it (any non-negative latency
+        # qualifies); we expose 0 in the published snapshot when
+        # uninitialized.
+        self.reply_age_max_ns: int = 0
+        self.reply_age_min_ns: int = -1
+        self.reply_age_sum_ns: int = 0
+        self.reply_age_count: int = 0
         self.probe_clock = ProbeClock(
             num_planes=NUM_PLANES,
             num_paths=NUM_SPINES,
@@ -657,15 +686,31 @@ class SenderMrcAgent:
                 log.debug("mrc.reply: unknown magic 0x%02x", magic)
 
     def _handle_probe_reply(self, payload: bytes) -> None:
+        # Capture handler entry time in raw monotonic_ns (NOT clock_ns)
+        # so test injection of a fake agent clock cannot mask real
+        # wall-clock work; see probe_emit_buckets for the same reasoning.
+        handler_t0 = time.monotonic_ns()
         self.probe_reply_stats["received"] += 1
         try:
             reply = decode_probe_reply(payload)
         except ProbeDecodeError as e:
             self.probe_reply_stats["decode_failed"] += 1
             log.debug("mrc.probe: bad reply: %s", e)
+            self._bucket_reply_handler_elapsed(
+                time.monotonic_ns() - handler_t0)
             return
         now_ns = self.clock_ns()
         latency_ns = now_ns - reply.tx_ns
+        # Update reply-age stats BEFORE the bucketed reply_latency
+        # check so the cross-check has the same denominator as
+        # `decode_failed`-free reply count.
+        if latency_ns >= 0:
+            self.reply_age_count += 1
+            self.reply_age_sum_ns += latency_ns
+            if latency_ns > self.reply_age_max_ns:
+                self.reply_age_max_ns = latency_ns
+            if self.reply_age_min_ns < 0 or latency_ns < self.reply_age_min_ns:
+                self.reply_age_min_ns = latency_ns
         if latency_ns < 50_000_000:
             self.reply_latency_buckets["lt_50ms"] += 1
         elif latency_ns < 200_000_000:
@@ -692,12 +737,30 @@ class SenderMrcAgent:
             # healthy `received` is the smoking gun for "timeout
             # too tight" or "GIL starvation in dispatch loop."
             self.probe_reply_stats["no_match"] += 1
+            self._bucket_reply_handler_elapsed(
+                time.monotonic_ns() - handler_t0)
             return
         self.probe_reply_stats["matched"] += 1
         self.table.record_probe_result(
             self.tenant, reply.plane_id, reply.path_id,
             success=True, rtt_ns=rtt_ns,
         )
+        self._bucket_reply_handler_elapsed(
+            time.monotonic_ns() - handler_t0)
+
+    def _bucket_reply_handler_elapsed(self, elapsed_ns: int) -> None:
+        if elapsed_ns < 10_000:
+            self.reply_handler_buckets["lt_10us"] += 1
+        elif elapsed_ns < 100_000:
+            self.reply_handler_buckets["lt_100us"] += 1
+        elif elapsed_ns < 1_000_000:
+            self.reply_handler_buckets["lt_1ms"] += 1
+        elif elapsed_ns < 10_000_000:
+            self.reply_handler_buckets["lt_10ms"] += 1
+        elif elapsed_ns < 100_000_000:
+            self.reply_handler_buckets["lt_100ms"] += 1
+        else:
+            self.reply_handler_buckets["ge_100ms"] += 1
 
     def _handle_loss_report(self, payload: bytes) -> None:
         try:
