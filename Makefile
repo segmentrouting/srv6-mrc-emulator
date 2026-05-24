@@ -31,6 +31,12 @@ PYTHON ?= python3
 PYTHONPATH := $(CURDIR)
 export PYTHONPATH
 
+# Some containerlab installs require root (default); others (rootless
+# / capability-granted clab binary) work as a regular user. Set
+# `SUDO=` (empty) in env, or `make SUDO= deploy`, on hosts where
+# `containerlab deploy` works without root.
+SUDO ?= sudo
+
 # --- meta ------------------------------------------------------------------
 
 .PHONY: help
@@ -61,11 +67,11 @@ regen: ## regenerate topology.clab.yaml + SONiC configs from topo.yaml
 
 .PHONY: deploy
 deploy: ## containerlab deploy the topology
-	cd $(TOPO_DIR) && sudo containerlab deploy -t topology.clab.yaml
+	cd $(TOPO_DIR) && $(SUDO) containerlab deploy -t topology.clab.yaml
 
 .PHONY: destroy
 destroy: ## containerlab destroy the topology
-	cd $(TOPO_DIR) && sudo containerlab destroy -t topology.clab.yaml --cleanup
+	cd $(TOPO_DIR) && $(SUDO) containerlab destroy -t topology.clab.yaml --cleanup
 
 .PHONY: config
 config: ## push config_db.json + frr.conf into the running containers
