@@ -273,6 +273,26 @@ class MrcDaemon:
         # "IPv6 string canonicalization" / `_canon_addr` in report.py.
         self._demux: Dict[str, SenderMrcAgent] = {}
 
+        # Dispatch instrumentation. Counters expose where replies go
+        # to die between recv() on the shared socket and
+        # record_probe_result() on the per-flow EVStateTable. After
+        # `11df16c` (per-flow tables) the lab saw ~12,840 replies
+        # arrive at the kernel socket while only ~200 made it to
+        # record_probe_result — these counters localize which
+        # transition in the dispatch chain is dropping the rest.
+        #
+        # Updated WITHOUT a lock because Python's int += 1 is atomic
+        # under the GIL for the read-modify-write pattern we use
+        # (single _dispatch_loop thread writes; readers are snapshot
+        # publishers that don't care about a torn read of one tick).
+        self._dispatch_counters: Dict[str, int] = {
+            "replies_received": 0,        # every recvfrom() w/ payload
+            "replies_no_peer": 0,         # peer addr not in _demux
+            "replies_unknown_magic": 0,   # not 0xA6 / 0xA7
+            "replies_dispatched_probe": 0,   # routed to _handle_probe_reply
+            "replies_dispatched_loss": 0,    # routed to _handle_loss_report
+        }
+
         for flow in self.flows:
             agent = SenderMrcAgent(
                 tenant=flow.tenant,
@@ -420,6 +440,7 @@ class MrcDaemon:
                 return  # socket closed during stop()
             if not payload:
                 continue
+            self._dispatch_counters["replies_received"] += 1
             peer_addr = peer[0] if isinstance(peer, tuple) else None
             # Strip any scope-id suffix ("fe80::1%eth0") so link-local
             # forms don't break the lookup. Canonicalize through
@@ -431,6 +452,7 @@ class MrcDaemon:
                 if peer_addr else None
             )
             if agent is None:
+                self._dispatch_counters["replies_no_peer"] += 1
                 log.debug(
                     "mrc.daemon.dispatch: reply from unknown peer %s "
                     "(known: %s)", peer_addr, sorted(self._demux),
@@ -438,10 +460,13 @@ class MrcDaemon:
                 continue
             magic = payload[0]
             if magic == 0xA6:
+                self._dispatch_counters["replies_dispatched_probe"] += 1
                 self._handle_reply_safe(agent, payload, kind="probe_reply")
             elif magic == 0xA7:
+                self._dispatch_counters["replies_dispatched_loss"] += 1
                 self._handle_loss_safe(agent, payload, kind="loss_report")
             else:
+                self._dispatch_counters["replies_unknown_magic"] += 1
                 log.debug("mrc.daemon.dispatch: unknown magic 0x%02x", magic)
 
     @staticmethod
@@ -508,6 +533,8 @@ class MrcDaemon:
                 "captured_ns": self.clock_ns(),
                 "ev_state": snap,
                 "transport_stats": self.transport.stats(),
+                "dispatch_stats": dict(self._dispatch_counters),
+                "probe_reply_stats": dict(agent.probe_reply_stats),
             }
             path = self._snapshot_path(tenant, dst_id)
             self._atomic_write_json(path, payload)

@@ -125,7 +125,20 @@ log = logging.getLogger(__name__)
 # --- defaults (conservative; agent is off by default in scenarios) ---------
 
 DEFAULT_PROBE_INTERVAL_MS = 200
-DEFAULT_PROBE_TIMEOUT_MS = 100
+# Probe timeout was 100ms but measured fabric rtt_p50 under
+# all-to-all load is 50-140ms (4p-4x8) with the slow planes
+# (planes 2/3 on green-host00->host07) running 50-86ms tail. At
+# 100ms timeout every probe on the slow side races the deadline
+# and a non-trivial fraction lose. 200ms matches the per-EV
+# probe cadence: a probe must complete within one round, and
+# any reply arriving in the next round is matched against a
+# fresh outstanding-probe entry anyway. The probe_clock sweep
+# in `_sweep_loop` deletes timed-out entries at every interval
+# tick (`probe_interval_ms`), so the worst-case detection
+# latency for a hard EV blackhole is still 1*interval +
+# 1*timeout = 400ms — well under the loss-path's
+# `loss_demote_consecutive * loss_window_ms = 600ms` floor.
+DEFAULT_PROBE_TIMEOUT_MS = 200
 DEFAULT_LOSS_WINDOW_MS = 200
 DEFAULT_MAX_WINDOW_SKEW_MS = 500
 # DEFAULT_RECV_BUFSIZE and DEFAULT_SOCKET_TIMEOUT_S now live in
@@ -280,6 +293,20 @@ class SenderMrcAgent:
         self._lock = threading.Lock()
 
         self.stats = LossFusionStats()
+        # Per-agent probe-reply instrumentation. Counts the post-
+        # dispatch fate of every reply the daemon routed to us.
+        # See MrcDaemon._dispatch_counters for the pre-dispatch
+        # tally. Together they cover the full reply path from
+        # kernel recv() to EVStateTable.record_probe_result().
+        # Single-writer (_handle_probe_reply runs on the daemon's
+        # dispatch thread); readers are the snapshot publisher
+        # which tolerates one-tick stale reads.
+        self.probe_reply_stats: Dict[str, int] = {
+            "received": 0,         # entered _handle_probe_reply
+            "decode_failed": 0,    # ProbeDecodeError
+            "no_match": 0,         # probe_clock.match_reply -> None
+            "matched": 0,          # recorded a success in EVStateTable
+        }
         self.probe_clock = ProbeClock(
             num_planes=NUM_PLANES,
             num_paths=NUM_SPINES,
@@ -560,9 +587,11 @@ class SenderMrcAgent:
                 log.debug("mrc.reply: unknown magic 0x%02x", magic)
 
     def _handle_probe_reply(self, payload: bytes) -> None:
+        self.probe_reply_stats["received"] += 1
         try:
             reply = decode_probe_reply(payload)
         except ProbeDecodeError as e:
+            self.probe_reply_stats["decode_failed"] += 1
             log.debug("mrc.probe: bad reply: %s", e)
             return
         now_ns = self.clock_ns()
@@ -574,7 +603,16 @@ class SenderMrcAgent:
             now_ns=now_ns,
         )
         if rtt_ns is None:
+            # Reply arrived but no outstanding probe matched its
+            # (req_id, plane, path, tx_ns) tuple. Almost always
+            # means the probe already aged out via sweep_timeouts
+            # before the reply made it back — i.e. fabric RTT
+            # exceeded probe_timeout_ms. A spiking `no_match` with
+            # healthy `received` is the smoking gun for "timeout
+            # too tight" or "GIL starvation in dispatch loop."
+            self.probe_reply_stats["no_match"] += 1
             return
+        self.probe_reply_stats["matched"] += 1
         self.table.record_probe_result(
             self.tenant, reply.plane_id, reply.path_id,
             success=True, rtt_ns=rtt_ns,

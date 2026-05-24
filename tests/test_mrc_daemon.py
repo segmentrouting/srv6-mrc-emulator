@@ -231,6 +231,32 @@ class MrcDaemonLifecycleTests(unittest.TestCase):
         self.assertIn("transport_stats", payload)
         self.assertIsInstance(payload["transport_stats"], dict)
 
+        # dispatch_stats is daemon-wide (shared dispatcher counters).
+        # All five keys must always be present so lab jq queries can
+        # rely on the schema rather than `// 0`-guarding each lookup.
+        # Values are unsigned monotonic counters.
+        self.assertIn("dispatch_stats", payload)
+        ds = payload["dispatch_stats"]
+        self.assertIsInstance(ds, dict)
+        for key in (
+            "replies_received", "replies_no_peer",
+            "replies_unknown_magic",
+            "replies_dispatched_probe", "replies_dispatched_loss",
+        ):
+            self.assertIn(key, ds, f"missing dispatch_stats key {key}")
+            self.assertIsInstance(ds[key], int)
+            self.assertGreaterEqual(ds[key], 0)
+
+        # probe_reply_stats is per-flow (per agent); all four keys
+        # always present. Locks the schema the same way as dispatch_stats.
+        self.assertIn("probe_reply_stats", payload)
+        prs = payload["probe_reply_stats"]
+        self.assertIsInstance(prs, dict)
+        for key in ("received", "decode_failed", "no_match", "matched"):
+            self.assertIn(key, prs, f"missing probe_reply_stats key {key}")
+            self.assertIsInstance(prs[key], int)
+            self.assertGreaterEqual(prs[key], 0)
+
     def test_snapshot_refreshes_on_cadence(self) -> None:
         """Two snapshots taken ~2*probe_interval_ms apart have distinct
         captured_ns values (publisher actually re-runs)."""
@@ -338,6 +364,28 @@ class MrcDaemonReplyDispatchTests(unittest.TestCase):
         self.assertTrue(_wait_for(saw_a_reply, timeout_s=1.5),
                         "no probe reply landed in EV table within 1.5s "
                         "via daemon dispatcher")
+
+        # Dispatch + match counters must tick in lockstep with successful
+        # RTT recording. Pre-fix lab cycle showed thousands of replies
+        # at the kernel UDP layer but zero in record_probe_result; these
+        # counters localize exactly which transition fails.
+        ds = self.daemon._dispatch_counters
+        self.assertGreater(ds["replies_received"], 0,
+                           "dispatcher recvfrom counter never advanced")
+        self.assertGreater(ds["replies_dispatched_probe"], 0,
+                           "no reply made it to the 0xA6 dispatch branch")
+        self.assertEqual(ds["replies_no_peer"], 0,
+                         "loopback peer should always be in _demux")
+        self.assertEqual(ds["replies_unknown_magic"], 0,
+                         "unexpected unknown-magic count")
+
+        prs = agent.probe_reply_stats
+        self.assertGreater(prs["received"], 0,
+                           "agent never entered _handle_probe_reply")
+        self.assertGreater(prs["matched"], 0,
+                           "no reply matched an outstanding probe")
+        self.assertEqual(prs["decode_failed"], 0,
+                         "decode_probe_reply failed on a valid payload")
 
 
 class MrcDaemonFinalReportTests(unittest.TestCase):
