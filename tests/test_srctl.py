@@ -201,6 +201,25 @@ class TestRun(unittest.TestCase):
         self.assertIn("--verbose", argv)
         self.assertIn("--dry-run", argv)
 
+    def test_duration_flag_forwarded(self):
+        # `srctl run <scen> --duration 5s` must forward `--duration 5s`
+        # verbatim to run-scenario; the run-scenario layer owns parsing
+        # and override semantics (single source of truth).
+        with mock.patch("srv6_mrc.mrc.run.main", return_value=0) as m:
+            rc, _, _ = _run(["run", "green-mrc-baseline", "--duration", "5s"])
+        self.assertEqual(rc, 0)
+        argv = m.call_args[0][0]
+        self.assertIn("--duration", argv)
+        i = argv.index("--duration")
+        self.assertEqual(argv[i + 1], "5s")
+
+    def test_duration_flag_absent_when_unset(self):
+        with mock.patch("srv6_mrc.mrc.run.main", return_value=0) as m:
+            rc, _, _ = _run(["run", "green-mrc-baseline"])
+        self.assertEqual(rc, 0)
+        argv = m.call_args[0][0]
+        self.assertNotIn("--duration", argv)
+
 
 if __name__ == "__main__":
     unittest.main()

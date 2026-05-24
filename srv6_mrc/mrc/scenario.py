@@ -581,6 +581,34 @@ def _parse_duration(v: Any, path: str) -> float:
     raise ScenarioError(path, f"must be a duration like '30s' or '500ms', got {v!r}")
 
 
+def parse_duration_str(s: str) -> float:
+    """Parse a duration string ('30s', '500ms', '5') to seconds (float).
+
+    Public helper for CLI flag parsing (e.g. `srctl run --duration 5s`).
+    Raises ValueError on bad input — argparse will turn that into a
+    user-friendly error.
+    """
+    if not isinstance(s, str) or not s.strip():
+        raise ValueError(f"bad duration: {s!r}")
+    m = _DUR_RE.match(s)
+    if not m:
+        raise ValueError(f"bad duration {s!r}: expected like '30s' or '500ms'")
+    val = float(m.group(1))
+    if val <= 0:
+        raise ValueError(f"bad duration {s!r}: must be positive")
+    return val / 1000.0 if (m.group(2) or "").lower() == "ms" else val
+
+
+def override_duration(scenario: "Scenario", duration_s: float) -> "Scenario":
+    """Return a copy of `scenario` with every flow's duration set to
+    `duration_s`. Frozen-dataclass-safe."""
+    import dataclasses
+    new_flows = tuple(
+        dataclasses.replace(fs, duration_s=duration_s) for fs in scenario.flows
+    )
+    return dataclasses.replace(scenario, flows=new_flows)
+
+
 def _load_pyyaml():
     try:
         import yaml  # type: ignore

@@ -723,5 +723,70 @@ class TestMrcDaemonTeardown(unittest.TestCase):
         self.assertIn("No such file or directory", stderr_writes)
 
 
+class TestMainDurationOverride(unittest.TestCase):
+    """`run.main(['<yaml>', '--duration', '5s', '--dry-run'])` must
+    apply the override before `run_scenario` sees the scenario. Stubs
+    `run_scenario` and inspects what was passed."""
+
+    def _yaml_path(self):
+        # Use a real shipped scenario as the YAML fixture; --dry-run
+        # avoids any side effects beyond loading + printing the plan.
+        import os
+        from pathlib import Path
+        topo = os.environ.get("SRV6_TOPO")
+        self.assertIsNotNone(topo, "SRV6_TOPO must be pinned by test runner")
+        scen_dir = Path(topo).parent / "scenarios"
+        path = scen_dir / "green-mrc-baseline.yaml"
+        self.assertTrue(path.exists(), f"missing fixture: {path}")
+        return path
+
+    def test_duration_overrides_all_flows(self):
+        from srv6_mrc.mrc import run as run_mod
+        captured = {}
+
+        def fake_run_scenario(scenario, *, dry_run, verbose):
+            captured["scenario"] = scenario
+            captured["dry_run"] = dry_run
+            from srv6_mrc.report import ScenarioReport
+            return ScenarioReport(scenario=scenario.name, flows=[])
+
+        with mock.patch.object(run_mod, "run_scenario",
+                               side_effect=fake_run_scenario):
+            rc = run_mod.main([str(self._yaml_path()),
+                               "--duration", "5s", "--dry-run"])
+        self.assertEqual(rc, 0)
+        scen = captured["scenario"]
+        durations = {f.duration_s for f in scen.flows}
+        self.assertEqual(durations, {5.0},
+                         f"expected every flow at 5.0s, got {durations}")
+
+    def test_no_duration_preserves_yaml_values(self):
+        from srv6_mrc.mrc import run as run_mod
+        from srv6_mrc.mrc.scenario import from_yaml_file
+        captured = {}
+
+        def fake_run_scenario(scenario, *, dry_run, verbose):
+            captured["scenario"] = scenario
+            from srv6_mrc.report import ScenarioReport
+            return ScenarioReport(scenario=scenario.name, flows=[])
+
+        yaml = self._yaml_path()
+        original = from_yaml_file(yaml)
+        original_durations = [f.duration_s for f in original.flows]
+
+        with mock.patch.object(run_mod, "run_scenario",
+                               side_effect=fake_run_scenario):
+            rc = run_mod.main([str(yaml), "--dry-run"])
+        self.assertEqual(rc, 0)
+        passed_durations = [f.duration_s for f in captured["scenario"].flows]
+        self.assertEqual(passed_durations, original_durations)
+
+    def test_bad_duration_rejected_by_argparse(self):
+        from srv6_mrc.mrc import run as run_mod
+        with self.assertRaises(SystemExit):
+            run_mod.main([str(self._yaml_path()),
+                          "--duration", "forever", "--dry-run"])
+
+
 if __name__ == "__main__":
     unittest.main()

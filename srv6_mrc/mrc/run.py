@@ -82,7 +82,9 @@ _infer_srv6_topo_from_argv()
 
 from srv6_mrc.netem import Fault, Netem
 from srv6_mrc.report import ScenarioReport
-from srv6_mrc.mrc.scenario import MrcSpec, Scenario, from_yaml_file
+from srv6_mrc.mrc.scenario import (
+    MrcSpec, Scenario, from_yaml_file, override_duration, parse_duration_str,
+)
 from srv6_mrc.topo import (current_topology, inner_addr,
                               select_spines_for_addrs, usid_outer_dst)
 
@@ -894,6 +896,10 @@ def main(argv: list[str] | None = None) -> int:
                         "(overrides scenario.report.out)")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="extra progress prints during the run")
+    p.add_argument("--duration", type=parse_duration_str, default=None,
+                   metavar="DUR",
+                   help="override every flow's duration (e.g. '5s', '500ms'); "
+                        "applied after YAML parse, before run")
     args = p.parse_args(argv)
 
     try:
@@ -905,6 +911,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:
         print(f"mrc/run.py: failed to load scenario: {e}", file=sys.stderr)
         return 2
+
+    if args.duration is not None:
+        scenario = override_duration(scenario, args.duration)
 
     try:
         report = run_scenario(scenario, dry_run=args.dry_run,

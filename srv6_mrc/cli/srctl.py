@@ -446,6 +446,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         forwarded.append("--verbose")
     if args.dry_run:
         forwarded.append("--dry-run")
+    if args.duration is not None:
+        forwarded.extend(["--duration", args.duration])
     return run_main(forwarded)
 
 
@@ -502,6 +504,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="list available scenarios for the active topology")
     r.add_argument("--verbose", "-v", action="store_true")
     r.add_argument("--dry-run", action="store_true")
+    r.add_argument("--duration", default=None, metavar="DUR",
+                   help="override every flow's duration (e.g. '5s', '500ms'); "
+                        "forwarded to run-scenario")
     r.set_defaults(func=_cmd_run)
 
     return p

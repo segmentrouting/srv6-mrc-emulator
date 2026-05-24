@@ -434,5 +434,70 @@ flows:
             scenario.from_yaml_string(text)
 
 
+# --- public CLI helpers ----------------------------------------------------
+
+class TestParseDurationStr(unittest.TestCase):
+    """`scenario.parse_duration_str` is the CLI's source of truth for
+    `--duration`. Mirrors the YAML-side `_parse_duration` but raises
+    `ValueError` (argparse-friendly), not `ScenarioError`."""
+
+    def test_seconds_forms(self):
+        for raw, expected in (("5s", 5.0), ("30s", 30.0), ("1.5s", 1.5),
+                              ("5", 5.0)):
+            with self.subTest(raw=raw):
+                self.assertEqual(scenario.parse_duration_str(raw), expected)
+
+    def test_millis_form(self):
+        self.assertAlmostEqual(scenario.parse_duration_str("500ms"), 0.5)
+
+    def test_rejects_zero_and_negative(self):
+        for raw in ("0s", "-1s", "0"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    scenario.parse_duration_str(raw)
+
+    def test_rejects_garbage(self):
+        for raw in ("forever", "5x", "", "   ", None):
+            with self.subTest(raw=raw):
+                with self.assertRaises((ValueError, TypeError)):
+                    scenario.parse_duration_str(raw)  # type: ignore[arg-type]
+
+
+class TestOverrideDuration(unittest.TestCase):
+    """`scenario.override_duration(scenario, dur)` returns a copy with
+    every flow's duration rewritten. Frozen-dataclass-safe; original
+    is untouched."""
+
+    def _two_flow_scenario(self):
+        doc = {
+            **MINIMAL,
+            "flows": [
+                {**MINIMAL["flows"][0], "duration": "30s"},
+                {**MINIMAL["flows"][0], "duration": "500ms"},
+            ],
+        }
+        return scenario.validate(doc)
+
+    def test_overrides_all_flows(self):
+        s = self._two_flow_scenario()
+        s2 = scenario.override_duration(s, 5.0)
+        self.assertEqual([f.duration_s for f in s2.flows], [5.0, 5.0])
+
+    def test_does_not_mutate_original(self):
+        s = self._two_flow_scenario()
+        _ = scenario.override_duration(s, 5.0)
+        # Original frozen scenario unchanged.
+        self.assertEqual([f.duration_s for f in s.flows], [30.0, 0.5])
+
+    def test_preserves_other_fields(self):
+        s = self._two_flow_scenario()
+        s2 = scenario.override_duration(s, 7.5)
+        self.assertEqual(s2.name, s.name)
+        for orig, new in zip(s.flows, s2.flows):
+            self.assertEqual(orig.pairs, new.pairs)
+            self.assertEqual(orig.policy_spec, new.policy_spec)
+            self.assertEqual(orig.rate_pps, new.rate_pps)
+
+
 if __name__ == "__main__":
     unittest.main()
