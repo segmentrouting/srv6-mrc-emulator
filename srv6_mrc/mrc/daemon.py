@@ -646,6 +646,7 @@ class MrcDaemon:
                     dict(self._dispatch_rx_backlog_buckets),
                 "probe_reply_stats": dict(agent.probe_reply_stats),
                 "reply_latency_buckets": dict(agent.reply_latency_buckets),
+                "probe_emit_buckets": dict(agent.probe_emit_buckets),
             }
             path = self._snapshot_path(tenant, dst_id)
             self._atomic_write_json(path, payload)

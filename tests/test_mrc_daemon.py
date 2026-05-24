@@ -267,6 +267,23 @@ class MrcDaemonLifecycleTests(unittest.TestCase):
             self.assertIsInstance(rlb[key], int)
             self.assertGreaterEqual(rlb[key], 0)
 
+        # probe_emit_buckets is per-flow (per agent), measures the
+        # wall-clock cost of one transport.send_probe() call. Lab
+        # hypothesis under investigation: at all-to-all scale the
+        # raw-socket send is taking seconds, so probes' tx_ns is
+        # stale by the time the packet hits the wire and the receiver
+        # echoes it back inflated. Six-bucket schema.
+        self.assertIn("probe_emit_buckets", payload)
+        peb = payload["probe_emit_buckets"]
+        self.assertIsInstance(peb, dict)
+        for key in (
+            "lt_100us", "lt_1ms", "lt_10ms",
+            "lt_100ms", "lt_1s", "ge_1s",
+        ):
+            self.assertIn(key, peb, f"missing probe_emit_buckets key {key}")
+            self.assertIsInstance(peb[key], int)
+            self.assertGreaterEqual(peb[key], 0)
+
         # dispatch_rx_gap_buckets / dispatch_rx_backlog_buckets are
         # the sender-RX counterpart to the receiver's
         # probe_rx_gap_buckets / probe_rx_backlog_buckets. Lock both

@@ -336,6 +336,25 @@ class SenderMrcAgent:
             "lt_5s": 0,
             "ge_5s": 0,
         }
+        # Per-probe emit-side latency: how long the single
+        # transport.send_probe() call took. At all-to-all scale
+        # (7 emit threads/host x 16 EVs x 5 rounds/s = 560 probes/s/host)
+        # we suspect raw-socket sendto contends with the GIL and
+        # in-kernel TX queue, so a probe's tx_ns gets stamped seconds
+        # before the packet actually hits the wire. The receiver echoes
+        # tx_ns verbatim, so reply_latency = blocked_emit + wire_RTT +
+        # dispatch — heavy buckets here at lt_1s / ge_1s falsify the
+        # "send_probe is microseconds, blame must be elsewhere"
+        # assumption. Single-writer (emit thread only); snapshot
+        # reader tolerates a torn read.
+        self.probe_emit_buckets: Dict[str, int] = {
+            "lt_100us": 0,
+            "lt_1ms": 0,
+            "lt_10ms": 0,
+            "lt_100ms": 0,
+            "lt_1s": 0,
+            "ge_1s": 0,
+        }
         self.probe_clock = ProbeClock(
             num_planes=NUM_PLANES,
             num_paths=NUM_SPINES,
@@ -535,6 +554,15 @@ class SenderMrcAgent:
                             "for (plane=%d, path=%d)", plane, path,
                         )
                         continue
+                    # Time the actual send_probe() call. Uses
+                    # time.monotonic_ns() directly rather than
+                    # self.clock_ns() because tests may inject a fake
+                    # clock; we always want real wall-clock here.
+                    # Both successful AND OSError-failing sends bucket
+                    # — an EAGAIN/ENOBUFS that blocked for seconds
+                    # before the kernel refused is exactly the signal
+                    # we're chasing.
+                    emit_t0 = time.monotonic_ns()
                     try:
                         self.transport.send_probe(
                             plane=plane, path=path,
@@ -550,6 +578,19 @@ class SenderMrcAgent:
                         # will time out naturally and trigger a
                         # probe-fail signal. Right semantic for "I
                         # tried to probe but the kernel refused."
+                    emit_elapsed_ns = time.monotonic_ns() - emit_t0
+                    if emit_elapsed_ns < 100_000:
+                        self.probe_emit_buckets["lt_100us"] += 1
+                    elif emit_elapsed_ns < 1_000_000:
+                        self.probe_emit_buckets["lt_1ms"] += 1
+                    elif emit_elapsed_ns < 10_000_000:
+                        self.probe_emit_buckets["lt_10ms"] += 1
+                    elif emit_elapsed_ns < 100_000_000:
+                        self.probe_emit_buckets["lt_100ms"] += 1
+                    elif emit_elapsed_ns < 1_000_000_000:
+                        self.probe_emit_buckets["lt_1s"] += 1
+                    else:
+                        self.probe_emit_buckets["ge_1s"] += 1
                     # Pace within the round: sleep one slot between
                     # probes. The last iteration's slot is absorbed by
                     # the round-end deadline wait below.

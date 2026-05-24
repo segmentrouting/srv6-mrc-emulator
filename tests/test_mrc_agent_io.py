@@ -509,5 +509,121 @@ class ProbePacingTests(unittest.TestCase):
         )
 
 
+class ProbeEmitBucketsTests(unittest.TestCase):
+    """Verify the per-call timing instrumentation around
+    transport.send_probe() in _emit_loop.
+
+    These tests pin two invariants from the 2026-05-24 emit-latency
+    investigation:
+      (a) on a fast transport (loopback UDP, microsecond send),
+          all probes bucket into lt_100us or lt_1ms.
+      (b) on a slow transport (50ms artificial sleep), probes
+          bucket into lt_100ms — proving the wrapper measures the
+          actual send_probe wall-clock and not just a constant.
+    """
+
+    def _build_sender(
+        self, *, transport: LoopbackUdpTransport,
+    ) -> SenderMrcAgent:
+        table = EVStateTable(
+            tenants=("green",), num_planes=NUM_PLANES, num_paths=NUM_SPINES,
+        )
+        return SenderMrcAgent(
+            tenant="green",
+            src_id=0,
+            dst_id=15,
+            table=table,
+            config=FAST_CONFIG,
+            transport=transport,
+        )
+
+    def _wait_for_total(self, sender: SenderMrcAgent, target: int,
+                        timeout_s: float) -> int:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            total = sum(sender.probe_emit_buckets.values())
+            if total >= target:
+                return total
+            time.sleep(0.005)
+        return sum(sender.probe_emit_buckets.values())
+
+    def test_loopback_send_buckets_into_sub_millisecond(self) -> None:
+        sender_report_port = PORTS.take(1)
+        receiver_probe_port = PORTS.take(1)
+        xport = LoopbackUdpTransport(
+            is_sender=True,
+            per_plane_send_sockets=_make_send_sockets(),
+            rx_socket=_make_rx_socket(sender_report_port),
+            peer_rx_port=receiver_probe_port,
+        )
+        sender = self._build_sender(transport=xport)
+        sender.start()
+        try:
+            num_evs = NUM_PLANES * NUM_SPINES
+            total = self._wait_for_total(sender, num_evs, timeout_s=0.5)
+            self.assertGreaterEqual(
+                total, num_evs,
+                f"expected at least {num_evs} probe emits, got {total}"
+            )
+        finally:
+            sender.stop(timeout_s=0.5)
+
+        fast = (sender.probe_emit_buckets["lt_100us"]
+                + sender.probe_emit_buckets["lt_1ms"])
+        slow = (sender.probe_emit_buckets["lt_10ms"]
+                + sender.probe_emit_buckets["lt_100ms"]
+                + sender.probe_emit_buckets["lt_1s"]
+                + sender.probe_emit_buckets["ge_1s"])
+        self.assertEqual(
+            slow, 0,
+            f"loopback send_probe should never take >=10ms; "
+            f"buckets={dict(sender.probe_emit_buckets)}"
+        )
+        self.assertGreater(
+            fast, 0,
+            f"expected nonzero sub-millisecond emits on loopback; "
+            f"buckets={dict(sender.probe_emit_buckets)}"
+        )
+
+    def test_slow_send_buckets_into_lt_100ms(self) -> None:
+        sender_report_port = PORTS.take(1)
+        receiver_probe_port = PORTS.take(1)
+        xport = LoopbackUdpTransport(
+            is_sender=True,
+            per_plane_send_sockets=_make_send_sockets(),
+            rx_socket=_make_rx_socket(sender_report_port),
+            peer_rx_port=receiver_probe_port,
+        )
+        # Monkey-patch send_probe to sleep 50ms per call. Time measured
+        # by the wrapper is time.monotonic_ns(), not the agent's
+        # clock_ns, so we deliberately use real sleep here.
+        def slow_send(*, plane, path, dst_leaf, payload) -> None:
+            time.sleep(0.05)
+        xport.send_probe = slow_send  # type: ignore[assignment]
+
+        sender = self._build_sender(transport=xport)
+        sender.start()
+        try:
+            # 50ms per send * a few probes — wait for at least 3 emits
+            # so we're not asserting on a single sample.
+            self._wait_for_total(sender, 3, timeout_s=1.0)
+        finally:
+            sender.stop(timeout_s=1.0)
+
+        in_lt_100ms = sender.probe_emit_buckets["lt_100ms"]
+        self.assertGreaterEqual(
+            in_lt_100ms, 3,
+            f"expected >=3 probes in lt_100ms bucket with 50ms send; "
+            f"buckets={dict(sender.probe_emit_buckets)}"
+        )
+        # And NOT in the fast buckets — 50ms is comfortably above 10ms.
+        for fast_key in ("lt_100us", "lt_1ms", "lt_10ms"):
+            self.assertEqual(
+                sender.probe_emit_buckets[fast_key], 0,
+                f"50ms send leaked into fast bucket {fast_key}; "
+                f"buckets={dict(sender.probe_emit_buckets)}"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
