@@ -336,6 +336,27 @@ class MrcDaemonLifecycleTests(unittest.TestCase):
             self.assertIsInstance(bb[key], int)
             self.assertGreaterEqual(bb[key], 0)
 
+        # kernel_rx_dwell_buckets — kernel CLOCK_REALTIME at packet
+        # ingress (SO_TIMESTAMPNS) vs userland CLOCK_REALTIME after
+        # recvmsg returns. Locks the 7-key schema. The `negative` and
+        # `no_timestamp` keys are diagnostic-only:
+        #   - `negative`: system clock stepped backward mid-run
+        #     (manual `date`, NTP step). Should be 0 in lab runs.
+        #   - `no_timestamp`: SO_TIMESTAMPNS unavailable or the cmsg
+        #     wasn't returned (test fakes without recvmsg, older
+        #     kernels). All packets count here in the test fake path.
+        self.assertIn("kernel_rx_dwell_buckets", payload)
+        kd = payload["kernel_rx_dwell_buckets"]
+        self.assertIsInstance(kd, dict)
+        for key in (
+            "lt_1ms", "lt_10ms", "lt_100ms", "lt_1s", "ge_1s",
+            "negative", "no_timestamp",
+        ):
+            self.assertIn(key, kd,
+                          f"missing kernel_rx_dwell_buckets key {key}")
+            self.assertIsInstance(kd[key], int)
+            self.assertGreaterEqual(kd[key], 0)
+
     def test_snapshot_refreshes_on_cadence(self) -> None:
         """Two snapshots taken ~2*probe_interval_ms apart have distinct
         captured_ns values (publisher actually re-runs)."""
@@ -718,6 +739,32 @@ class MrcDaemonDispatchRxBucketsTests(unittest.TestCase):
         finally:
             daemon_mod._HAVE_SIOCINQ = saved_have
             daemon_mod._SIOCINQ = saved_inq
+
+    def test_kernel_rx_dwell_sums_to_recv_count(self) -> None:
+        """Every recv increments EXACTLY one kernel_rx_dwell bucket.
+
+        On Linux with SO_TIMESTAMPNS available, packets land in one of
+        the dwell buckets (`lt_1ms` / `lt_10ms` / ...). On macOS or
+        kernels without SO_TIMESTAMPNS, every packet lands in
+        `no_timestamp`. Either way: sum(buckets) == replies_received,
+        no double-counts and no skips. If we lose this invariant we
+        lose the ability to trust the dwell counters at all in lab
+        diagnostics.
+        """
+        self.daemon.start()
+        N = 16
+        self._inject(N)
+        ds = self.daemon._dispatch_counters
+        self.assertTrue(
+            _wait_for(lambda: ds["replies_received"] >= N, timeout_s=1.5),
+            f"dispatcher only received {ds['replies_received']}/{N}",
+        )
+        dwell_total = sum(self.daemon._kernel_rx_dwell_buckets.values())
+        self.assertEqual(
+            dwell_total, ds["replies_received"],
+            f"kernel_rx_dwell bucket sum {dwell_total} != recv "
+            f"({ds['replies_received']})",
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

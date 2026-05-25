@@ -105,6 +105,24 @@ except ImportError:
     _HAVE_SIOCINQ = False
     _SIOCINQ = None
 
+# SCM_TIMESTAMPNS constant for parsing ancillary data on recvmsg().
+# On Linux it's the same numeric value as SO_TIMESTAMPNS (35) and is
+# usually exposed by Python's `socket` module, but older macOS dev
+# laptops lack both. We fall back to the Linux numeric value so that
+# code paths reachable on lab containers (Linux/alpine) work even
+# when Python's socket module didn't surface the symbol. On macOS the
+# listener will fail to setsockopt SO_TIMESTAMPNS (we caught that
+# with a warning in `_open_udp_listener`); the daemon's recvmsg will
+# then receive no SCM_TIMESTAMPNS ancillary and we bucket those into
+# `kernel_rx_dwell_buckets["no_timestamp"]`.
+_SCM_TIMESTAMPNS = getattr(socket, "SCM_TIMESTAMPNS", 35)
+
+# struct timespec: 2 * native long (tv_sec, tv_nsec). On 64-bit Linux
+# both are 8 bytes, so 16 bytes total. `recvmsg` returns the raw
+# bytes; we unpack as two signed 64-bit ints.
+_TIMESPEC_FMT = "ll"
+_TIMESPEC_SIZE = struct.calcsize(_TIMESPEC_FMT)
+
 from ..topo import (
     NUM_PLANES,
     NUM_SPINES,
@@ -352,6 +370,38 @@ class MrcDaemon:
             "le_32k": 0,
             "gt_32k": 0,
         }
+        # Kernel-rx dwell: time between the kernel CLOCK_REALTIME stamp
+        # at packet ingress (SO_TIMESTAMPNS, SCM_TIMESTAMPNS ancillary
+        # data on recvmsg) and our userland CLOCK_REALTIME read right
+        # after recvmsg returns. This is the ONE measurement gap left
+        # by cycles 9-12: `dispatch_rx_gap_buckets` measures gap
+        # *between* recvfrom returns, `dispatch_rx_backlog_buckets`
+        # samples SIOCINQ *after* a recv — neither tells us how long
+        # each individual datagram sat in the UDP recvbuf before we
+        # came to drain it. If `reply_age` is multi-second and this
+        # bucket also shows multi-second, the dispatcher thread is
+        # being starved while the kernel is delivering replies on
+        # time. If `reply_age` is multi-second but this bucket is
+        # tight (lt_1ms), the seconds live somewhere we still have
+        # not measured.
+        #
+        # Bucket on REAL-TIME-vs-REAL-TIME deliberately: kernel
+        # SO_TIMESTAMPNS emits CLOCK_REALTIME (struct timespec), and
+        # we read `time.clock_gettime(CLOCK_REALTIME)` userland-side.
+        # NTP slew during a 30-second scenario is sub-millisecond and
+        # negligible for the buckets we care about (lt_1ms ... ge_1s).
+        # If the system clock JUMPS (manual `date`, large step) during
+        # a run, the delta can go negative; we guard with a `< 0` check
+        # and bucket those into a `negative` slot for diagnostics.
+        self._kernel_rx_dwell_buckets: Dict[str, int] = {
+            "lt_1ms": 0,
+            "lt_10ms": 0,
+            "lt_100ms": 0,
+            "lt_1s": 0,
+            "ge_1s": 0,
+            "negative": 0,        # clock jumped backward; sanity check
+            "no_timestamp": 0,    # SO_TIMESTAMPNS not supported / no cmsg
+        }
 
         for flow in self.flows:
             agent = SenderMrcAgent(
@@ -498,9 +548,38 @@ class MrcDaemon:
         # everywhere and we do not call fcntl.ioctl at all.
         last_recv_ns: Optional[int] = None
         inq_buf = bytearray(4) if _HAVE_SIOCINQ else None
+        # `recvmsg` is the path that surfaces SCM_TIMESTAMPNS ancillary
+        # data; test fakes (FakeRecvSocket in unit tests) only expose
+        # `recvfrom`. Detect once and pick the path. Ancillary buffer
+        # sized for one timespec cmsg (cmsghdr ~16B + 16B payload ≈
+        # 64B with alignment slack — 256B is overkill safe).
+        use_recvmsg = hasattr(sock, "recvmsg")
+        anc_bufsize = 256
         while not self._stop.is_set():
+            kernel_rx_realtime_ns: Optional[int] = None
             try:
-                payload, peer = sock.recvfrom(DEFAULT_RECV_BUFSIZE)
+                if use_recvmsg:
+                    payload, ancdata, _flags, peer = sock.recvmsg(
+                        DEFAULT_RECV_BUFSIZE, anc_bufsize,
+                    )
+                    # Parse SCM_TIMESTAMPNS out of the cmsg list. We
+                    # don't expect more than one but iterate defensively;
+                    # the first matching one wins.
+                    for cmsg_level, cmsg_type, cmsg_data in ancdata:
+                        if (
+                            cmsg_level == socket.SOL_SOCKET
+                            and cmsg_type == _SCM_TIMESTAMPNS
+                            and len(cmsg_data) >= _TIMESPEC_SIZE
+                        ):
+                            ts_sec, ts_nsec = struct.unpack(
+                                _TIMESPEC_FMT, cmsg_data[:_TIMESPEC_SIZE],
+                            )
+                            kernel_rx_realtime_ns = (
+                                ts_sec * 1_000_000_000 + ts_nsec
+                            )
+                            break
+                else:
+                    payload, peer = sock.recvfrom(DEFAULT_RECV_BUFSIZE)
             except socket.timeout:
                 continue
             except OSError:
@@ -508,6 +587,32 @@ class MrcDaemon:
             if not payload:
                 continue
             now_ns = time.monotonic_ns()
+            # Bucket kernel-rx dwell BEFORE the rest of dispatch so we
+            # measure pure recvmsg-return-to-now, not "recvmsg + gap
+            # bucketing + ioctl + demux". Userland CLOCK_REALTIME read
+            # is paired with the kernel CLOCK_REALTIME stamp; both are
+            # subject to the same NTP slew so the delta is stable
+            # within microseconds across the run.
+            if kernel_rx_realtime_ns is not None:
+                # `time.clock_gettime(CLOCK_REALTIME)` returns float
+                # seconds; multiply to ns. `time.time_ns()` is the same
+                # clock with integer return — use it directly.
+                userland_realtime_ns = time.time_ns()
+                dwell_ns = userland_realtime_ns - kernel_rx_realtime_ns
+                if dwell_ns < 0:
+                    self._kernel_rx_dwell_buckets["negative"] += 1
+                elif dwell_ns < 1_000_000:
+                    self._kernel_rx_dwell_buckets["lt_1ms"] += 1
+                elif dwell_ns < 10_000_000:
+                    self._kernel_rx_dwell_buckets["lt_10ms"] += 1
+                elif dwell_ns < 100_000_000:
+                    self._kernel_rx_dwell_buckets["lt_100ms"] += 1
+                elif dwell_ns < 1_000_000_000:
+                    self._kernel_rx_dwell_buckets["lt_1s"] += 1
+                else:
+                    self._kernel_rx_dwell_buckets["ge_1s"] += 1
+            else:
+                self._kernel_rx_dwell_buckets["no_timestamp"] += 1
             # Gap from previous recv. Skip on first iteration — a
             # cold-start "gap" from process boot isn't a meaningful
             # bucket value.
@@ -644,6 +749,8 @@ class MrcDaemon:
                 "dispatch_rx_gap_buckets": dict(self._dispatch_rx_gap_buckets),
                 "dispatch_rx_backlog_buckets":
                     dict(self._dispatch_rx_backlog_buckets),
+                "kernel_rx_dwell_buckets":
+                    dict(self._kernel_rx_dwell_buckets),
                 "probe_reply_stats": dict(agent.probe_reply_stats),
                 "reply_latency_buckets": dict(agent.reply_latency_buckets),
                 "probe_emit_buckets": dict(agent.probe_emit_buckets),

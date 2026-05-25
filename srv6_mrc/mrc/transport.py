@@ -219,6 +219,7 @@ class Srv6RawTransport(MrcTransport):
         if is_sender:
             self._reply_sock: Optional[socket.socket] = _open_udp_listener(
                 bind_addr="::", bind_port=SPRAY_REPORT_PORT,
+                enable_rx_timestamp=True,
             )
             self._probe_sock: Optional[socket.socket] = None
         else:
@@ -586,7 +587,9 @@ class LoopbackUdpTransport(MrcTransport):
 # --- internals -------------------------------------------------------------
 
 
-def _open_udp_listener(*, bind_addr: str, bind_port: int) -> socket.socket:
+def _open_udp_listener(
+    *, bind_addr: str, bind_port: int, enable_rx_timestamp: bool = False,
+) -> socket.socket:
     """Open a plain AF_INET6 UDP listener bound to (bind_addr, bind_port).
 
     No SO_BINDTODEVICE — the kernel delivers the inner UDP after
@@ -600,6 +603,20 @@ def _open_udp_listener(*, bind_addr: str, bind_port: int) -> socket.socket:
     SRV6_MRC_RCVBUF_BYTES). The kernel doubles the requested size and
     silently caps it to net.core.rmem_max; we read back the granted
     size with getsockopt and log it so lab runs surface kernel caps.
+
+    `enable_rx_timestamp` enables SO_TIMESTAMPNS on the socket. Callers
+    that use `recvmsg()` can then parse `SCM_TIMESTAMPNS` ancillary
+    data to learn the kernel CLOCK_REALTIME at which each datagram
+    became available (kernel-rx time). Compared against a userland
+    `time.clock_gettime(CLOCK_REALTIME)` taken right after recv,
+    this measures kernel-rx-to-userland-dwell — i.e. how long the
+    packet sat in the UDP recvbuf before our drain loop got to it.
+    Off by default; the listener call sites in `Srv6RawTransport`
+    enable it only for the daemon's shared reply socket where the
+    diagnostic matters. On platforms / kernels where SO_TIMESTAMPNS
+    is not available (older macOS), the setsockopt is best-effort and
+    the socket still works; readers MUST handle "no timestamp
+    ancillary" gracefully (skip the dwell bucket).
     """
     s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, 0)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -608,6 +625,17 @@ def _open_udp_listener(*, bind_addr: str, bind_port: int) -> socket.socket:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except OSError:
             pass
+    if enable_rx_timestamp:
+        ts_opt = getattr(socket, "SO_TIMESTAMPNS", None)
+        if ts_opt is not None:
+            try:
+                s.setsockopt(socket.SOL_SOCKET, ts_opt, 1)
+            except OSError as exc:  # pragma: no cover - kernel-dependent
+                log.warning(
+                    "mrc.transport: SO_TIMESTAMPNS failed (%s); "
+                    "kernel_rx_dwell_buckets will read all-zero",
+                    exc,
+                )
 
     requested = _rcvbuf_bytes_from_env()
     try:
