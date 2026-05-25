@@ -626,16 +626,32 @@ def _open_udp_listener(
         except OSError:
             pass
     if enable_rx_timestamp:
-        ts_opt = getattr(socket, "SO_TIMESTAMPNS", None)
-        if ts_opt is not None:
-            try:
-                s.setsockopt(socket.SOL_SOCKET, ts_opt, 1)
-            except OSError as exc:  # pragma: no cover - kernel-dependent
-                log.warning(
-                    "mrc.transport: SO_TIMESTAMPNS failed (%s); "
-                    "kernel_rx_dwell_buckets will read all-zero",
-                    exc,
-                )
+        # NOTE: the lab's alpine python build does not export the
+        # symbolic name `socket.SO_TIMESTAMPNS` even though the
+        # underlying Linux kernel supports the option (cycle 13:
+        # `hasattr(socket, "SO_TIMESTAMPNS") is False` inside
+        # `alpine-srv6-scapy:1.0`, but raw `setsockopt(SOL_SOCKET, 35,
+        # 1)` succeeds and `getsockopt(35) == 1`). The previous version
+        # of this code used `getattr(..., None)` and silently no-op'd
+        # the call, leaving the kernel never asked to emit ancillary
+        # timestamps and forcing every recvmsg into the `no_timestamp`
+        # dwell bucket. Fall back to the numeric option value 35
+        # (Linux's stable ABI for SO_TIMESTAMPNS), matching the
+        # numeric SCM_TIMESTAMPNS fallback that the parse side in
+        # daemon.py already uses. macOS dev kernels do not implement
+        # the option at all, so the setsockopt fails cleanly with
+        # ENOPROTOOPT and we log + carry on; the socket still works,
+        # readers get `no_timestamp` for every packet, and the
+        # diagnostic is graceful rather than silently broken.
+        ts_opt = getattr(socket, "SO_TIMESTAMPNS", 35)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, ts_opt, 1)
+        except OSError as exc:  # pragma: no cover - kernel-dependent
+            log.warning(
+                "mrc.transport: SO_TIMESTAMPNS failed (%s); "
+                "kernel_rx_dwell_buckets will read all-zero",
+                exc,
+            )
 
     requested = _rcvbuf_bytes_from_env()
     try:
