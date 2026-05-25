@@ -679,6 +679,14 @@ These are bugs surfaced by the collective-comm scenarios; carry
 forward across sessions until resolved. Adding new diagnostic data?
 Update this section, don't start a fresh "what we know" thread.
 
+**Active design pivot (2026-05-25)**: cycle 13 cleared kernel-rx
+dwell as the bottleneck; the match step is the actual binding
+constraint. Work is moving to `feature/stateless-probes`. See the
+2026-05-25 entry below and `docs/stateless-probes-validation.md`.
+The existing investigation notes below (probe-failure root cause,
+SO_REUSEPORT cascade, etc.) remain accurate for the stateful-probe
+design but are superseded for the new path.
+
 ### Universal probe failure in "every host is both sender AND receiver" scenarios
 
 **Symptom**: Run `yellow-allreduce-ring` (16 flows, 16 hosts each
@@ -894,6 +902,95 @@ fail loudly.
 If you ever see `consecutive_probe_successes` stuck at 0 across
 all flows while `rtt_samples > 0`, look for a new shared-writer
 hazard against an EV record.
+
+**2026-05-25 — cycle 13: kernel-rx dwell falsified the recvbuf-dwell hypothesis**:
+After `35f68f9` (probe-emit fast path), `42965d4` (snapshot
+visibility), `4570d90` (dispatch_rx_gap/backlog), `5ab8fdd` (probe-
+emit buckets), `adc9b2f` (reply-handler buckets + reply_age_stats),
+`ff6efb2` (kernel_rx_dwell_buckets via SO_TIMESTAMPNS), and
+`02cd48a` (alpine python attribute-detection fix on the listener
+side), the lab cycle on `4p-4x8 yellow-all-to-all` produced clean
+SO_TIMESTAMPNS data on all senders. Result: **`kernel_rx_dwell` is
+sub-millisecond for ~95% of packets, never reaches `ge_1s`, even
+while `reply_age_max_ns` is 12-17s and `reply_age_avg_ns` is 7-9s.**
+
+The 22s tail is NOT in the kernel UDP recvbuf. Six measured layers
+(receiver, sender emit, sender qdisc, sender kernel-rx dwell,
+sender dispatch gap/backlog, reply handler) are all sub-millisecond
+under load. Yet the matched-reply age stays multi-second.
+
+Additional sharpening from the cycle-13 data: `reply_age_count`
+(~1200-1500 per flow) is only ~12-15% of `replies_received`
+(~9878 per flow). So `reply_age` samples only the matched subset.
+The multi-second number is per matched reply, not per arrived
+packet. Combined with cycle-11's ~2% data-plane match rate, the
+picture is: **most replies arrive promptly but are rejected at
+the match step**; the small fraction that DO match are themselves
+seconds old. The binding bottleneck is
+`probe_clock.match_reply`'s `(plane, path, req_id, tx_ns)` tuple
+match table under high concurrency, NOT any I/O layer.
+
+If you see this pattern again (multi-second `reply_age_avg`,
+sub-ms dwell, low matched/received ratio), the bug is in the
+match path, not the recv path. Don't re-investigate kernel-rx
+dwell — cycle 13 cleared it.
+
+**Current design direction (2026-05-25, on
+`feature/stateless-probes`)**:
+The structural fix is to remove the match table entirely.
+Stateless host-turnaround probes:
+
+- Each host gets per-`(plane, path)` /128 unicast addresses on its
+  NICs (cccc::100..::103 on eth1, ::110..::113 on eth2, etc. on
+  yellow-host00; cccc:1::100..::133 on yellow-host01; etc.).
+- Each leaf gets ONE `End.DT6` entry on `fc00:0:dfff::/48` (the
+  probe-only uDT slot), table=main.
+- Probe outer DA encodes 6-slot µSID round trip:
+  `f<S> e<dst_leaf> e009 f<S> e<src_leaf> dfff`. SID list is
+  consumed left-to-right by uA at each uN-hop until `dfff` lands
+  on the sender's leaf which decaps and routes the inner packet
+  back via its connected route to the sender's eth<plane>.
+- Probe inner-dst = sender's own per-EV `/128` (e.g.
+  `cccc::100`). Inner-src = `cccc::ffff` (reserved, never
+  configured anywhere). Peer-host identity (`dst_id`) is in the
+  probe payload (1 byte).
+- The "peer" host's role in the round trip is pure IPv6
+  forwarding (no userland involvement, no decap). The inner-dst
+  is not locally configured on the peer, so the kernel forwards
+  on the outer DA via the `fc00::/32` route.
+- On return, the sender's daemon recv socket sees a byte-
+  identical (modulo hop limit) copy of the original probe.
+  EV identity = inner-dst extraction. `dst_id` = payload byte.
+- Match table (`probe_clock.py`) is deleted entirely. No
+  req_id, no tx_ns, no per-probe correspondence state. EV
+  health becomes a sliding-window recv-count / sent-count
+  ratio.
+- Walkthrough and hand-build runbook: `docs/stateless-probes-validation.md`.
+
+Invariants this design adds (do not violate):
+- The sender's per-EV `/128` (e.g. `cccc::100`) must NEVER be
+  locally configured on any host other than the owning sender.
+  If a peer host accidentally gets the same /128, it claims the
+  probe locally and the round trip dies silently. Generator
+  enforces uniqueness; one regression test must assert no host
+  has another host's per-EV address.
+- `cccc::ffff` (and any other inner-src placeholder) must never
+  be configured anywhere. Reserved unrouted address.
+- The leaf's `dfff` `End.DT6` entry must target `table main`,
+  not a tenant VRF. The decap routes the inner packet via the
+  leaf's connected route to its attached host's tenant subnet,
+  which lives in the global table.
+- Generator-emitted leaf state for stateless-probes: one
+  `dfff End.DT6` entry per leaf. Do NOT generate per-EV or per-
+  host static routes on the leaf — the design's whole point is
+  that no per-EV fabric state is needed.
+- Hop limit budget: 8 hops round trip; default hlim 64 leaves
+  56 at the sender's recv. Headroom is large but monitor if any
+  future fabric path adds intermediate hops.
+
+If validation fails (the hand-built runbook can't get a probe
+back to the sender), stop and report. Do not pivot to egress-
+leaf turnaround or any other fallback without user input.
 
 ### Spurious "orphan flow" report warnings on collective scenarios
 
