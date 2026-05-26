@@ -139,18 +139,19 @@ class TestMrcSnapshotPicking(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "ev.json")
             cfg = EVStateConfig(
-                probe_fail_threshold=3,
+                probe_window_ticks=2,
+                probe_min_samples=3,
                 min_active_evs=1,
             )
             table = EVStateTable(
                 tenants=("green",), num_planes=NUM_PLANES,
                 num_paths=NUM_SPINES, cfg=cfg,
             )
-            for spath in range(NUM_SPINES):
-                for _ in range(3):
-                    table.record_probe_result(
-                        "green", 1, spath, success=False,
-                    )
+            for _ in range(2):
+                for spath in range(NUM_SPINES):
+                    for _ in range(3):
+                        table.record_probe_sent("green", 1, spath)
+                table.tick("green")
             _make_snapshot(path, table=table)
             p = policy.MrcSnapshot(
                 snapshot_path=path,
@@ -210,7 +211,8 @@ class TestMrcSnapshotRefresh(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "ev.json")
             cfg = EVStateConfig(
-                probe_fail_threshold=3,
+                probe_window_ticks=2,
+                probe_min_samples=3,
                 min_active_evs=1,
             )
             table = EVStateTable(
@@ -238,11 +240,11 @@ class TestMrcSnapshotRefresh(unittest.TestCase):
                 # the same mtime and the refresh would skip the second
                 # file. os.utime with an explicit future timestamp
                 # guarantees the refresh thread sees a change.
-                for spath in range(NUM_SPINES):
-                    for _ in range(3):
-                        table.record_probe_result(
-                            "green", 0, spath, success=False,
-                        )
+                for _ in range(2):
+                    for spath in range(NUM_SPINES):
+                        for _ in range(3):
+                            table.record_probe_sent("green", 0, spath)
+                    table.tick("green")
                 _make_snapshot(path, table=table)
                 future = time.time() + 1.0
                 os.utime(path, (future, future))
@@ -289,18 +291,19 @@ class TestMrcSnapshotRefresh(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "ev.json")
             cfg = EVStateConfig(
-                probe_fail_threshold=3,
+                probe_window_ticks=2,
+                probe_min_samples=3,
                 min_active_evs=1,
             )
             table = EVStateTable(
                 tenants=("green",), num_planes=NUM_PLANES,
                 num_paths=NUM_SPINES, cfg=cfg,
             )
-            for spath in range(NUM_SPINES):
-                for _ in range(3):
-                    table.record_probe_result(
-                        "green", 1, spath, success=False,
-                    )
+            for _ in range(2):
+                for spath in range(NUM_SPINES):
+                    for _ in range(3):
+                        table.record_probe_sent("green", 1, spath)
+                table.tick("green")
             _make_snapshot(path, table=table)
             p = policy.MrcSnapshot(
                 snapshot_path=path,
@@ -412,12 +415,17 @@ class TestMrcSnapshotValidation(unittest.TestCase):
             table = EVStateTable(
                 tenants=("green",), num_planes=NUM_PLANES,
                 num_paths=NUM_SPINES,
-                cfg=EVStateConfig(min_active_evs=1),
+                cfg=EVStateConfig(
+                    probe_window_ticks=2,
+                    probe_min_samples=3,
+                    min_active_evs=1,
+                ),
             )
             # Demote a specific EV so we can prove the policy reads it.
-            for _ in range(table._cfg.probe_fail_threshold):
-                table.record_probe_result("green", plane=0, path=0,
-                                          success=False)
+            for _ in range(2):
+                for _ in range(3):
+                    table.record_probe_sent("green", plane=0, path=0)
+                table.tick("green")
             inner = table.snapshot()
             # Daemon's exact wrapper shape (see daemon.py:488-495).
             wrapped = {
@@ -486,6 +494,61 @@ class TestParsePolicyIntegration(unittest.TestCase):
             )
             try:
                 self.assertEqual(p.paths_per_plane, 2)
+            finally:
+                p.stop()
+
+
+class TestCDFCache(unittest.TestCase):
+    """CDF cache eliminates per-packet flat-list + tuple allocation."""
+
+    def test_cdf_cached_per_wgrid_and_spines(self):
+        """pick_ev builds CDF once per (wgrid, spines) pair, not per packet."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ev.json")
+            table = _make_snapshot(path)
+            p = policy.MrcSnapshot(path, "green", paths_per_plane=2)
+            try:
+                # First pick on this flow: cache miss, CDF built.
+                plane0, spine0 = p.pick_ev(0, F)
+                self.assertEqual(len(p._cdf_cache), 1,
+                                 "first pick should populate cache with 1 entry")
+                # Second pick, same flow: cache hit, no rebuild.
+                plane1, spine1 = p.pick_ev(1, F)
+                self.assertEqual(len(p._cdf_cache), 1,
+                                 "cache size should still be 1 after second pick")
+                # Different flow (different spines): new cache entry.
+                F2 = FlowKey("2001:db8:bbbb:01::2", "2001:db8:bbbb:0e::2",
+                             9999, 9999)
+                p.pick_ev(0, F2)
+                self.assertEqual(len(p._cdf_cache), 2,
+                                 "different spines should add a second cache entry")
+            finally:
+                p.stop()
+
+    def test_cache_cleared_on_wgrid_swap(self):
+        """Cache is invalidated when _wgrid is swapped by refresh."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ev.json")
+            table = _make_snapshot(path)
+            p = policy.MrcSnapshot(path, "green")
+            try:
+                # Warm the cache with one pick.
+                p.pick_ev(0, F)
+                self.assertEqual(len(p._cdf_cache), 1, "cache should have 1 entry")
+                # Modify snapshot, touch the file, trigger refresh.
+                # Bump recv count on EV (0,0) so weights change.
+                table.record_probe_recv("green", 0, 0)
+                _make_snapshot(path, table)  # writes with new mtime
+                time.sleep(0.01)  # ensure mtime advances
+                loaded = p._refresh_once()
+                self.assertTrue(loaded, "refresh should have loaded new snapshot")
+                # Cache should be cleared.
+                self.assertEqual(len(p._cdf_cache), 0,
+                                 "cache should be empty after wgrid swap")
+                # Next pick rebuilds for new weights.
+                p.pick_ev(0, F)
+                self.assertEqual(len(p._cdf_cache), 1,
+                                 "cache repopulated after wgrid swap")
             finally:
                 p.stop()
 

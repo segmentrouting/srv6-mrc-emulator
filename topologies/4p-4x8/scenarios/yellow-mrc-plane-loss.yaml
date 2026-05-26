@@ -1,6 +1,15 @@
 # yellow-mrc-plane-loss.yaml — 5% loss on plane 2, health_aware_mrc,
 # yellow tenant.
 #
+# DEPRECATED: This scenario uses embedded faults: blocks. Use the new
+# srctl fault injection workflow instead:
+#
+#   srctl fault netem "host yellow-host00 plane 2" "loss 5%"
+#   srctl run yellow-mrc-baseline --duration 10
+#   srctl fault clear --all
+#
+# See AGENTS.md "srctl fault" section for full documentation.
+#
 # Yellow counterpart to green-mrc-plane-loss.yaml. Same headline MRC
 # behavior — sender detects loss via receiver LossReports, demotes the
 # affected plane, spray weights shift away — exercised on the yellow

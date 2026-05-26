@@ -142,18 +142,23 @@ class TestHealthAwareMrc(unittest.TestCase):
             self.assertGreater(counts[plane], 0)
 
     def test_demoted_plane_gets_zero_picks(self):
-        # Drive every EV on plane 1 to ASSUMED_BAD via probe timeouts;
-        # verify the policy never picks plane 1. (We don't compare
-        # against another `Weighted` here because the floor logic can
-        # keep a "bad" plane nonzero if too many are bad; only one
-        # plane's worth of demotes keeps us above the floor.)
+        # Drive every EV on plane 1 to ASSUMED_BAD via the sliding-
+        # window stateless-probe API; verify the policy never picks
+        # plane 1. (We don't compare against another `Weighted` here
+        # because the floor logic can keep a "bad" plane nonzero if
+        # too many are bad; only one plane's worth of demotes keeps
+        # us above the floor.)
         table = self._table(
-            probe_fail_threshold=3,
+            probe_window_ticks=2,
+            probe_min_samples=3,
             min_active_evs=1,
         )
-        for path in range(NUM_SPINES):
-            for _ in range(3):
-                table.record_probe_result("green", 1, path, success=False)
+        # Fill plane 1's window with all-loss buckets.
+        for _ in range(2):
+            for path in range(NUM_SPINES):
+                for _ in range(3):
+                    table.record_probe_sent("green", 1, path)
+            table.tick("green")
         from srv6_mrc.mrc.ev_state import EVState
         for path in range(NUM_SPINES):
             self.assertEqual(
@@ -168,14 +173,17 @@ class TestHealthAwareMrc(unittest.TestCase):
         # picks should reshape the distribution. Sample 2k picks before
         # and after; plane 0's share must drop to zero.
         table = self._table(
-            probe_fail_threshold=3,
+            probe_window_ticks=2,
+            probe_min_samples=3,
             min_active_evs=1,
         )
         p = policy.HealthAwareMrc(table=table, tenant="green")
         before = Counter(p.pick(i, F) for i in range(2048))
-        for path in range(NUM_SPINES):
-            for _ in range(3):
-                table.record_probe_result("green", 0, path, success=False)
+        for _ in range(2):
+            for path in range(NUM_SPINES):
+                for _ in range(3):
+                    table.record_probe_sent("green", 0, path)
+            table.tick("green")
         after = Counter(p.pick(i, F) for i in range(2048, 4096))
         # Plane 0 was uniform-share (~25%) before; after fully demoting
         # all its EVs it should be zero given the min-active-evs floor.

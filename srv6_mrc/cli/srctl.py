@@ -32,6 +32,9 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
+from srv6_mrc import fault as fault_module
+from srv6_mrc.netem import Netem, Fault as NetemFault
+
 
 def _infer_srv6_topo_from_argv() -> None:
     """Set SRV6_TOPO before importing srv6_mrc.topo. Idempotent: does
@@ -451,6 +454,206 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return run_main(forwarded)
 
 
+# --- fault commands ---------------------------------------------------------
+
+
+def _cmd_fault_shutdown(args: argparse.Namespace) -> int:
+    """Handle 'srctl fault shutdown' command."""
+    node = args.node
+    interfaces = args.interfaces
+    unidirectional = args.unidirectional
+    
+    # Load fault state
+    state = fault_module.FaultState.load()
+    topo_links = fault_module.TopologyLinks()
+    
+    # Handle "all" keyword
+    if len(interfaces) == 1 and interfaces[0].lower() == "all":
+        interfaces = topo_links.get_all_interfaces(node)
+        if not interfaces:
+            print(f"Error: No interfaces found for node {node}", file=sys.stderr)
+            return 1
+        print(f"Shutting down all {len(interfaces)} interfaces on {node}")
+    
+    # Validate interfaces
+    for iface in interfaces:
+        if not iface.startswith("Ethernet"):
+            print(f"Error: Interface must be in SONiC format (EthernetN), got {iface!r}", file=sys.stderr)
+            return 1
+    
+    # Build target list (with peers if bidirectional)
+    targets = []
+    for iface in interfaces:
+        targets.append(fault_module.InterfaceEndpoint(node, iface))
+        
+        if not unidirectional:
+            peer = topo_links.get_peer(node, iface)
+            if peer:
+                peer_node, peer_iface = peer
+                targets.append(fault_module.InterfaceEndpoint(peer_node, peer_iface))
+                print(f"  {node}:{iface} ↔ {peer_node}:{peer_iface} (bidirectional)")
+            else:
+                print(f"  {node}:{iface} (no peer found, unidirectional)")
+        else:
+            print(f"  {node}:{iface} (unidirectional)")
+    
+    # Apply shutdowns
+    for target in targets:
+        try:
+            fault_module.shutdown_interface(target.node, target.interface)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+    
+    # Record fault
+    fault_id = fault_module.generate_fault_id(state)
+    fault = fault_module.Fault(
+        id=fault_id,
+        type="shutdown",
+        targets=targets,
+        spec="down",
+        bidirectional=not unidirectional,
+    )
+    state.add_fault(fault)
+    state.save()
+    
+    print(f"Fault {fault_id} applied: shutdown {len(targets)} interface(s)")
+    return 0
+
+
+def _cmd_fault_netem(args: argparse.Namespace) -> int:
+    """Handle 'srctl fault netem' command."""
+    target_str = args.target
+    spec = args.spec
+    
+    # Delegate to existing netem module
+    try:
+        netem_fault = NetemFault(target=target_str, spec=spec)
+        netem = Netem(faults=[netem_fault])
+        netem.apply()
+    except Exception as e:
+        print(f"Error applying netem fault: {e}", file=sys.stderr)
+        return 1
+    
+    # Record fault in state
+    state = fault_module.FaultState.load()
+    fault_id = fault_module.generate_fault_id(state)
+    
+    # netem targets are host-side veths, not fabric interfaces
+    # Store as a single pseudo-target with the target string
+    targets = [fault_module.InterfaceEndpoint(node="netem", interface=target_str)]
+    
+    fault = fault_module.Fault(
+        id=fault_id,
+        type="netem",
+        targets=targets,
+        spec=spec,
+        bidirectional=False,  # netem is host-side only
+    )
+    state.add_fault(fault)
+    state.save()
+    
+    print(f"Fault {fault_id} applied: netem '{target_str}' with spec '{spec}'")
+    return 0
+
+
+def _cmd_fault_clear(args: argparse.Namespace) -> int:
+    """Handle 'srctl fault clear' command."""
+    state = fault_module.FaultState.load()
+    
+    if args.all:
+        # Clear all faults
+        if not state.faults:
+            print("No active faults to clear")
+            return 0
+        
+        for fault in state.faults:
+            _revert_fault(fault)
+        
+        count = state.clear_all()
+        state.save()
+        print(f"Cleared {count} fault(s)")
+        return 0
+    
+    if args.node:
+        # Clear faults on specific node (and optionally specific interface)
+        if args.interface:
+            faults = state.find_by_interface(args.node, args.interface)
+        else:
+            faults = state.find_by_node(args.node)
+        
+        if not faults:
+            print(f"No faults found for {args.node}" + (f":{args.interface}" if args.interface else ""))
+            return 0
+        
+        for fault in faults:
+            _revert_fault(fault)
+            state.remove_fault(fault.id)
+        
+        state.save()
+        print(f"Cleared {len(faults)} fault(s)")
+        return 0
+    
+    print("Error: Must specify --all or a node name", file=sys.stderr)
+    return 1
+
+
+def _revert_fault(fault: fault_module.Fault) -> None:
+    """Revert a single fault (bring interfaces back up or remove netem)."""
+    if fault.type == "shutdown":
+        for target in fault.targets:
+            try:
+                fault_module.startup_interface(target.node, target.interface)
+                print(f"  Brought up {target.node}:{target.interface}")
+            except RuntimeError as e:
+                print(f"  Warning: Failed to bring up {target}: {e}", file=sys.stderr)
+    
+    elif fault.type == "netem":
+        # Revert netem via the netem module
+        target_str = fault.targets[0].interface  # stored as pseudo-target
+        try:
+            netem_fault = NetemFault(target=target_str, spec=fault.spec or "")
+            netem = Netem(faults=[netem_fault])
+            netem.revert()
+            print(f"  Reverted netem on '{target_str}'")
+        except Exception as e:
+            print(f"  Warning: Failed to revert netem: {e}", file=sys.stderr)
+
+
+def _cmd_fault_list(args: argparse.Namespace) -> int:
+    """Handle 'srctl fault list' command."""
+    state = fault_module.FaultState.load()
+    
+    if not state.faults:
+        print("No active faults")
+        return 0
+    
+    if args.output == "json":
+        print(json.dumps(state.to_dict(), indent=2))
+        return 0
+    
+    # Table format
+    print(f"{'ID':<12} {'TYPE':<10} {'TARGET':<40} {'SPEC':<20} {'APPLIED':<20}")
+    print("-" * 102)
+    
+    for fault in state.faults:
+        # Format targets
+        if fault.type == "shutdown":
+            target_strs = [f"{t.node}:{t.interface}" for t in fault.targets]
+            target_display = ", ".join(target_strs[:2])
+            if len(target_strs) > 2:
+                target_display += f" (+{len(target_strs) - 2} more)"
+        else:  # netem
+            target_display = fault.targets[0].interface  # stored as pseudo-target
+        
+        # Parse applied_at timestamp
+        applied_display = fault.applied_at.split("T")[1][:8] if "T" in fault.applied_at else fault.applied_at
+        
+        print(f"{fault.id:<12} {fault.type:<10} {target_display:<40} {fault.spec or '':<20} {applied_display:<20}")
+    
+    return 0
+
+
 # --- argument parser --------------------------------------------------------
 
 
@@ -508,6 +711,71 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="override every flow's duration (e.g. '5s', '500ms'); "
                         "forwarded to run-scenario")
     r.set_defaults(func=_cmd_run)
+
+    # --- fault --------------------------------------------------------
+    fault = sub.add_parser("fault", help="inject/clear/list faults in the fabric")
+    fault_sub = fault.add_subparsers(dest="fault_command", required=True)
+
+    # srctl fault shutdown
+    f_shutdown = fault_sub.add_parser(
+        "shutdown",
+        help="shutdown interface(s) on a fabric node",
+    )
+    f_shutdown.add_argument("node", help="node name (e.g. p0-spine01)")
+    f_shutdown.add_argument(
+        "interfaces",
+        nargs="+",
+        help="interface(s) to shutdown (e.g. Ethernet0, Ethernet4, or 'all')",
+    )
+    f_shutdown.add_argument(
+        "--unidirectional",
+        action="store_true",
+        help="only shutdown this side (default: bidirectional)",
+    )
+    f_shutdown.set_defaults(func=_cmd_fault_shutdown)
+
+    # srctl fault netem
+    f_netem = fault_sub.add_parser(
+        "netem",
+        help="inject tc/netem fault on host-side veth",
+    )
+    f_netem.add_argument("target", help="target string (e.g. 'host yellow-host00 plane 2')")
+    f_netem.add_argument("spec", help="netem spec (e.g. 'loss 5%%' or 'delay 10ms')")
+    f_netem.set_defaults(func=_cmd_fault_netem)
+
+    # srctl fault clear
+    f_clear = fault_sub.add_parser(
+        "clear",
+        help="clear injected faults",
+    )
+    f_clear.add_argument(
+        "--all",
+        action="store_true",
+        help="clear all tracked faults",
+    )
+    f_clear.add_argument(
+        "node",
+        nargs="?",
+        help="clear faults on specific node (optional if --all)",
+    )
+    f_clear.add_argument(
+        "interface",
+        nargs="?",
+        help="clear fault on specific interface (requires node)",
+    )
+    f_clear.set_defaults(func=_cmd_fault_clear)
+
+    # srctl fault list
+    f_list = fault_sub.add_parser(
+        "list",
+        help="list active faults",
+    )
+    f_list.add_argument(
+        "-o", "--output",
+        choices=("table", "json"),
+        default="table",
+    )
+    f_list.set_defaults(func=_cmd_fault_list)
 
     return p
 

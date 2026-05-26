@@ -468,6 +468,218 @@ def leaf_gateway_addr(tenant: str, plane: int, host_id: int) -> str:
 
 # --- uSID outer destination -------------------------------------------------
 
+# --- stateless-probe addressing (yellow only, this commit set) -------------
+#
+# Stateless host-turnaround probes use per-(host, plane, path) /128
+# unicast addresses on each host's tenant NICs, plus a single reserved
+# inner-src placeholder per tenant (never configured anywhere) and a
+# single per-leaf `dfff End.DT6` decap entry. The round trip carries the
+# probe back to the sender's own per-EV /128 via a 6-slot uSID list
+# ending in `dfff`. See docs/stateless-probes-validation.md.
+#
+# Numbering plan (yellow):
+#
+#   <tenant>:<H>::<NIC><path>
+#       <H>    = host_id (hex, 1 digit at 4p-4x8; widens at larger N)
+#       <NIC>  = plane + 1, hex digit (eth1 = 1, eth2 = 2, ...)
+#       <path> = spine index 0..NUM_SPINES-1, hex digit
+#
+#   Examples (yellow, 4p-4x8):
+#     host00 eth1 path 0 -> cccc:0::10
+#     host00 eth1 path 3 -> cccc:0::13
+#     host00 eth4 path 0 -> cccc:0::40
+#     host15 eth4 path 3 -> cccc:f::43
+#
+#   At 4p-8x16 NUM_SPINES=8, so paths fit in one hex digit and the
+#   shape is unchanged (host00 eth1 path 7 -> cccc:0::17).
+#
+# Decode (inner-dst -> (plane, path)): take the trailing two hex
+# nibbles of the address's last group; high nibble = NIC ordinal,
+# low nibble = path. plane = NIC - 1.
+#
+# Inner-src placeholder:
+#   cccc::ffff for yellow (RESERVED — must never be configured on any
+#   host or installed as a route).
+
+# Reserved unrouted inner-src placeholders. Generator and any new
+# routing code MUST refuse to configure these addresses anywhere; a
+# regression test asserts no host has them on any NIC.
+PROBE_INNER_SRC_PLACEHOLDER: dict[str, str] = {
+    "yellow": "2001:db8:cccc::ffff",
+    "green": "2001:db8:bbbb::ffff",
+}
+
+# Leaf uDT6 SID block used as the round-trip's final hop on the
+# sender's leaf.
+# Yellow: dfff End.DT6 -> table main (leaf decaps to main table, host claims)
+# Green: d000 End.DT6 -> Vrf-green (leaf decaps to VRF, forwards to host)
+# One per-leaf entry, NOT per-EV / per-host.
+PROBE_LEAF_DFFF_PREFIX_FMT = "fc00:000{plane:x}:dfff::/48"  # yellow only
+PROBE_LEAF_D000_PREFIX_FMT = "fc00:000{plane:x}:d000::/48"  # green VRF uDT
+
+
+def probe_ev_addr(tenant: str, host_id: int, plane: int, path: int) -> str:
+    """Per-(host, plane, path) /128 stateless-probe address.
+
+    This address is configured ONLY on `host_id`'s eth(plane+1) NIC.
+    No other host (and no leaf) may have it locally configured —
+    doing so would cause that host to claim the returning probe and
+    silently kill the round trip.
+
+    `path` is the spine index the round trip transits (MRC's path ↔
+    topology's spine).
+    
+    Yellow: probe turns around at peer host via kernel forwarding.
+    Green: probe turns around at remote leaf via d000 End.DT6; leaf
+    forwards decapped inner packet to host via connected /64 route.
+    """
+    _check_tenant(tenant)
+    _check_host(host_id)
+    _check_plane(plane)
+    _check_spine(path)
+    nic = plane + 1  # eth1 = 1, ..., eth4 = 4
+    low_byte = (nic << 4) | path
+    if tenant == "yellow":
+        return f"2001:db8:cccc:{host_id:x}::{low_byte:x}"
+    elif tenant == "green":
+        return f"2001:db8:bbbb:{host_id:x}::{low_byte:x}"
+    else:
+        raise NotImplementedError(
+            f"stateless-probe addressing not yet defined for tenant "
+            f"{tenant!r}; only yellow and green are supported"
+        )
+
+
+def probe_inner_src(tenant: str) -> str:
+    """Reserved unrouted inner-src placeholder for stateless probes.
+
+    Stamped into every outbound probe's inner-src. Must not be locally
+    configured anywhere; the kernel sees it briefly on egress and the
+    returning probe carries it inbound — neither path requires a route.
+    """
+    _check_tenant(tenant)
+    addr = PROBE_INNER_SRC_PLACEHOLDER.get(tenant)
+    if addr is None:
+        raise NotImplementedError(
+            f"stateless-probe inner-src placeholder not yet defined "
+            f"for tenant {tenant!r}"
+        )
+    return addr
+
+
+def probe_outer_dst(
+    tenant: str, plane: int, src_leaf: int, dst_leaf: int, path: int,
+) -> str:
+    """Outer IPv6 DA = 6-slot uSID list for stateless-probe round trip.
+
+    Walk (left to right, consumed by uA at each leaf/spine and finally
+    decapped on the sender's leaf):
+
+    Yellow (host-based decap):
+        f<S>  e<dst_leaf>  e009  f<S>  e<src_leaf>  dfff
+
+      slot 0  f<P>00<S>     leaf<src> -> spine<S>   (leaf-up uA)
+      slot 1  e00<dst_leaf> spine<S>  -> leaf<dst>  (spine-down uA)
+      slot 2  e009          leaf<dst> -> host<dst>  (leaf->host uA)
+      slot 3  f<P>00<S>     host<dst> forwards back via its leaf;
+                            leaf<dst> -> spine<S>   (leaf-up uA)
+      slot 4  e00<src_leaf> spine<S>  -> leaf<src>  (spine-down uA)
+      slot 5  dfff          leaf<src> End.DT6 table main; decap and
+                            route inner via connected route to host<src>
+
+    Green (leaf-based decap):
+        f<S>  e<dst_leaf>  f<S>  e<src_leaf>  d000
+
+      slot 0  f<P>00<S>     leaf<src> -> spine<S>   (leaf-up uA)
+      slot 1  e00<dst_leaf> spine<S>  -> leaf<dst>  (spine-down uA)
+      slot 2  f<P>00<S>     leaf<dst> -> spine<S>   (leaf-up uA, return)
+      slot 3  e00<src_leaf> spine<S>  -> leaf<src>  (spine-down uA, return)
+      slot 4  d000          leaf<src> End.DT6 Vrf-green; decap and
+                            route inner via Vrf-green to host<src>
+
+    Plane identity stays in the outer DA only (invariant 2). The
+    same plane number drives both leaf-up hops because the round
+    trip stays in-plane end to end.
+    """
+    _check_tenant(tenant)
+    _check_plane(plane)
+    _check_host(src_leaf)
+    _check_host(dst_leaf)
+    _check_spine(path)
+    
+    # uSID slots are 16-bit hextets; the address is the left-to-right
+    # concatenation packed into the 8 hextets of an IPv6 address.
+    if tenant == "yellow":
+        # 6-slot: f<S> e<dst> e009 f<S> e<src> dfff
+        return (
+            f"fc00:000{plane:x}:f00{path:x}:e00{dst_leaf:x}:"
+            f"e009:f00{path:x}:e00{src_leaf:x}:dfff"
+        )
+    elif tenant == "green":
+        # 5-slot: f<S> e<dst> f<S> e<src> d000 (no e009 host hop)
+        return (
+            f"fc00:000{plane:x}:f00{path:x}:e00{dst_leaf:x}:"
+            f"f00{path:x}:e00{src_leaf:x}:d000::"
+        )
+    else:
+        raise NotImplementedError(
+            f"stateless-probe outer-dst not yet defined for tenant "
+            f"{tenant!r}; only yellow and green are supported"
+        )
+
+
+def probe_ev_from_inner_dst(addr: str) -> tuple[str, int, int, int] | None:
+    """Reverse of `probe_ev_addr`: inner-dst -> (tenant, host, plane, path).
+
+    Used by the daemon's dispatch loop to demux a returning probe to the
+    right per-flow EVStateTable. Returns None for any address not in the
+    stateless-probe block.
+    """
+    import ipaddress
+    try:
+        normalized = ipaddress.IPv6Address(addr).exploded.lower()
+    except (ValueError, ipaddress.AddressValueError):
+        return None
+    parts = normalized.split(":")
+    if len(parts) != 8:
+        return None
+    if parts[0] != "2001" or parts[1] != "0db8":
+        return None
+    
+    # Check tenant prefix: bbbb = green, cccc = yellow
+    if parts[2] == "cccc":
+        tenant = "yellow"
+    elif parts[2] == "bbbb":
+        tenant = "green"
+    else:
+        return None
+    
+    if parts[4] != "0000" or parts[5] != "0000" or parts[6] != "0000":
+        return None
+    try:
+        host_id = int(parts[3], 16)
+    except ValueError:
+        return None
+    if not 0 <= host_id < NUM_LEAVES:
+        return None
+    try:
+        low = int(parts[7], 16)
+    except ValueError:
+        return None
+    # low byte: high nibble = NIC ordinal (1..NUM_PLANES), low nibble = path
+    if low < 0x10 or low > 0xFF:
+        return None
+    nic = (low >> 4) & 0xF
+    path = low & 0xF
+    if not 1 <= nic <= NUM_PLANES:
+        return None
+    if not 0 <= path < NUM_SPINES:
+        return None
+    return (tenant, host_id, nic - 1, path)
+
+
+# --- uSID outer destination -------------------------------------------------
+
 def usid_outer_dst(tenant: str, plane: int, spine: int, dst_leaf: int) -> str:
     """Outer IPv6 destination = compressed uSID list.
 

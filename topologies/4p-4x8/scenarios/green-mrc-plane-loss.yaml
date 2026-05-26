@@ -1,5 +1,14 @@
 # green-mrc-plane-loss.yaml — 5% loss on plane 2, health_aware_mrc spray.
 #
+# DEPRECATED: This scenario uses embedded faults: blocks. Use the new
+# srctl fault injection workflow instead:
+#
+#   srctl fault netem "host green-host00 plane 2" "loss 5%"
+#   srctl run green-mrc-baseline --duration 10
+#   srctl fault clear --all
+#
+# See AGENTS.md "srctl fault" section for full documentation.
+#
 # Headline MRC scenario. Inject loss on a single plane; the receiver's
 # loss-window thread observes ~5% loss, sends LossReport frames back to
 # the sender; the sender's EVStateTable demotes plane 2 (UNKNOWN ->

@@ -515,6 +515,15 @@ class MrcSnapshot:
         # Per-flow spine subset cache (mirrors EvSpray._spine_subsets).
         self._spine_subsets: dict = {}
 
+        # CDF cache: keyed by (id(wgrid), spines). Cleared on every
+        # wgrid swap so stale CDFs don't survive a weight update.
+        # Eliminates per-packet list+tuple allocation + _build_cdf call
+        # in the hot path (pick_ev). At 100pps × 56 flows = ~700 picks/s/host,
+        # the allocation overhead was measurable (3-5% of per-host CPU on
+        # alpine under docker-sonic-vs). CDF rebuild now happens exactly
+        # once per (wgrid, spines) pair instead of once per packet.
+        self._cdf_cache: dict[tuple[int, tuple[int, ...]], tuple[float, ...]] = {}
+
         # Refresh thread machinery. Started on .start(), stopped on
         # .stop(). The data sender owns the lifecycle.
         self._stop_event = threading.Event()
@@ -600,18 +609,34 @@ class MrcSnapshot:
         # what the rest of this pick uses.
         wgrid = self._wgrid
 
-        flat: list[float] = []
-        for plane in range(n_planes):
-            row = wgrid[plane]
-            for sp in spines:
-                flat.append(row[sp])
-        total = sum(flat)
-        if total <= 0:
+        # CDF cache lookup: keyed by (id(wgrid), spines). The cache is
+        # cleared on every wgrid swap (see _refresh_once), so a cache
+        # hit guarantees the CDF matches the current weights.
+        cache_key = (id(wgrid), spines)
+        cdf = self._cdf_cache.get(cache_key)
+        if cdf is None:
+            # Cache miss: build flat weights, compute CDF, store it.
+            flat: list[float] = []
+            for plane in range(n_planes):
+                row = wgrid[plane]
+                for sp in spines:
+                    flat.append(row[sp])
+            total = sum(flat)
+            if total > 0:
+                cdf = _build_cdf(tuple(flat))
+                self._cdf_cache[cache_key] = cdf
+            else:
+                # All-zero weights: fallback to round-robin, no CDF.
+                cdf = None
+
+        if cdf is None:
+            # All-zero fallback (no active EVs or cold-start with
+            # uniform weights that haven't been loaded yet).
             n = n_planes * len(spines)
             ev_idx = seq % n
         else:
-            cdf = _build_cdf(tuple(flat))
             ev_idx = _weighted_pick(seq, flow, cdf)
+
         plane = ev_idx // len(spines)
         spine = spines[ev_idx % len(spines)]
         return plane, spine
@@ -675,6 +700,11 @@ class MrcSnapshot:
             self._wgrid = wgrid
             self._last_mtime = mtime
             self.refresh_loaded += 1
+            # Invalidate CDF cache so next pick_ev rebuilds for new weights.
+            # The cache keys on id(wgrid), so the old entries are already
+            # orphaned (no future pick will match them), but clearing
+            # explicitly frees memory and keeps the cache size bounded.
+            self._cdf_cache.clear()
             return True
 
     def _wgrid_from_snapshot(self, data: dict) -> tuple[tuple[float, ...], ...]:

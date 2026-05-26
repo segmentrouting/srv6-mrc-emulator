@@ -1,82 +1,75 @@
-"""MRC daemon — single per-host process owning shared reply RX + per-flow agents.
+"""MRC daemon — single per-host process owning shared RX + per-flow agents.
 
 Background
 ----------
-At all-to-all scale (8 hosts, 56 sender flows total, 7 sender processes
-per host) the previous design — one `spray --role send` process per
-flow, each binding `("::", SPRAY_REPORT_PORT=9997)` with `SO_REUSEPORT`
-for its own reply listener — produced catastrophic reply misdelivery.
-The Linux kernel hashes inbound UDP packets across the REUSEPORT group
-by 4-tuple. With ~7 sender processes per host, a peer's reply stream
-gets pinned to one specific process; that process is the *correct*
-owner of the host→peer flow only ~1/7 of the time.
+At all-to-all scale the previous design (one `spray --role send`
+process per flow, each binding `(::, SPRAY_REPORT_PORT)` with
+`SO_REUSEPORT` for its own reply listener) produced catastrophic
+reply misdelivery: the Linux kernel hashes inbound UDP packets across
+the REUSEPORT group by 4-tuple, so a peer's reply stream gets pinned
+to one specific process — the *correct* owner of the host->peer flow
+only ~1/N of the time.
 
-The cure is a single MRC daemon process per src_host that owns the one
-shared reply listener and dispatches inbound replies to the right
-per-flow `SenderMrcAgent` by inspecting `recvfrom()`'s peer source
-address.
+The cure: a single MRC daemon process per src_host that owns the one
+shared recv listener and dispatches inbound packets to the right
+per-flow `SenderMrcAgent`.
 
-Process model
--------------
-For src_host green-host00 with N flows (host00→host01..hostN):
+Process model (stateless-probe design, 2026-05-25)
+--------------------------------------------------
+For src_host yellow-host00 with N peer flows:
 
-    spray --role mrc-daemon --flows-json '[{"tenant":"green","dst_id":1},...]'
+    spray --role mrc-daemon --flows-json '[{"tenant":"yellow","dst_id":1},...]'
         └─ MrcDaemon owns:
              - 1 Srv6RawTransport(is_sender=True), binds 9997 once
-             - N EVStateTables, N SenderMrcAgent instances (no own RX loop)
-             - 1 dispatcher thread on the shared reply socket
+             - N EVStateTables, N SenderMrcAgent instances
+             - 1 dispatcher thread on the shared recv socket
              - 1 snapshot publisher thread
-             - per-flow snapshots written to /dev/shm/srv6-mrc/<host>/<dst_id>.json
 
-Data sender processes (the existing one-per-flow `spray --role send`
-processes) read those snapshots via the `mrc_snapshot:<path>` policy
-(added in step b of the refactor) instead of running their own MRC
-agent. This keeps each process single-purpose: daemon = MRC control
-plane, senders = data plane.
+Wire-format demux (replaces the v3 reply/match design)
+------------------------------------------------------
+Two packet types arrive on the daemon's single
+``(::, SPRAY_REPORT_PORT)`` listener:
 
-Reply demux
------------
-The probe wire format (`mrc/probe.py`) echoes the originating sender's
-`tenant_id` + `src_id` in `ProbeReply`, but does NOT carry `dst_id`
-(the replying host's id from the sender's perspective). That field is
-unnecessary because `recvfrom()` returns `(payload, peer_addr)` where
-`peer_addr[0]` is the IPv6 source of the inbound UDP packet — i.e. the
-peer's tenant-inner anycast `inner_addr(tenant, dst_id)`. The daemon
-maintains a `peer_inner_addr -> SenderMrcAgent` map at startup (built
-from the flow list) and uses it as the dispatch key.
+  - magic ``0xA5`` — a stateless PROBE that round-tripped via the
+    peer host's leaf and came back to this sender. The payload's
+    ``dst_id`` byte identifies the originating peer flow; the
+    payload's ``(plane_id, path_id)`` identifies the EV. The
+    inner-dst (the sender's own per-EV /128) is a cross-check via
+    ``probe_ev_from_inner_dst`` but is not the primary key.
+  - magic ``0xA7`` — a LOSS_REPORT from a peer receiver. The sender
+    of the LOSS_REPORT is the host the report describes; we recover
+    its host_id from ``peer_addr`` (the inbound IPv6 source = the
+    peer's tenant-inner anycast) via ``host_id_from_inner_addr``.
 
-This works identically for green and yellow because both colors deliver
-the same inner UDP packet to the kernel after decap; only the encap
-path on the wire differs.
+There is no per-probe correspondence state on the sender. The probe-
+clock / match-table from the v3 design is deleted; EV health is a
+sliding-window recv/sent ratio rotated by ``EVStateTable.tick()``.
 
 Threading model
 ---------------
-Daemon threads (3 total):
-  - dispatcher: reads `transport.recv_reply_socket()`, decodes magic
-    byte, dispatches to the right agent's `_handle_probe_reply` or
-    `_handle_loss_report`. Single thread by design — funnels ALL
-    inbound replies through one drain loop, eliminating the GIL race
-    with multiple per-flow RX loops.
-  - snapshot publisher: every `probe_interval_ms`, writes per-flow
-    `EVStateTable.snapshot()` JSON to `/dev/shm/srv6-mrc/<host>/<dst>.json`.
-  - signal/sigterm reaper: blocks on `_stop` Event; exposed via
-    `MrcDaemon.stop()`.
+Daemon threads (2):
+  - dispatcher: reads ``transport.recv_socket()``, decodes magic
+    byte, dispatches to the right per-flow agent by ``dst_id``
+    (payload byte for probes, ``host_id_from_inner_addr(peer)``
+    for loss reports).
+  - snapshot publisher: every ``probe_interval_ms``, writes per-flow
+    ``EVStateTable.snapshot()`` JSON to
+    ``/dev/shm/srv6-mrc/<host>/<tenant>_<dst>.json``.
 
-Each per-flow `SenderMrcAgent` still spawns its own emit / sweep /
-window-rotate threads (1 + 1 + 1 = 3 per flow). With N=7 flows on a
-host that's 21 thread + 3 daemon threads = 24 threads — comfortable.
+Each per-flow ``SenderMrcAgent`` spawns 2 threads: ``mrc-emit`` and
+``mrc-window`` (the latter also drives ``EVStateTable.tick()``). The
+old ``mrc-sweep`` and ``mrc-reply-rx`` threads are gone.
 
 Lifecycle
 ---------
   d = MrcDaemon(src_host, flows, ...)
-  d.start()           # spawn dispatcher + publisher + per-flow agents
-  d.wait_for_stop()   # block until SIGTERM or stop()
-  d.stop()            # joins, closes transport, prints final JSON
+  d.start()
+  d.wait_for_stop()
+  d.stop()
 """
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import logging
 import os
@@ -88,14 +81,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# SIOCINQ (FIONREAD) ioctl probes the kernel UDP recv-buf depth at
-# recv()-time so we can localize whether replies are stacking up in
-# the kernel between our recvfrom() calls (sender-RX starvation) or
-# arriving cleanly (then the seconds are upstream — on the wire, in
-# the receiver, or in the kernel's tx path back to us). Mirror the
-# guard pattern from `srv6_mrc/mrc/agent.py:81-93`: macOS dev laptops
-# without `termios.FIONREAD` degrade to a no-op so unit tests run on
-# any OS. Lab containers are linux/alpine so this is always available.
+# SIOCINQ guard: macOS dev laptops without termios.FIONREAD degrade to
+# a no-op so unit tests run on any OS. Lab containers are linux/alpine
+# so this is always available.
 try:
     import fcntl  # type: ignore[import-untyped]
     import termios  # type: ignore[import-untyped]
@@ -105,33 +93,26 @@ except ImportError:
     _HAVE_SIOCINQ = False
     _SIOCINQ = None
 
-# SCM_TIMESTAMPNS constant for parsing ancillary data on recvmsg().
-# On Linux it's the same numeric value as SO_TIMESTAMPNS (35) and is
-# usually exposed by Python's `socket` module, but older macOS dev
-# laptops lack both. We fall back to the Linux numeric value so that
-# code paths reachable on lab containers (Linux/alpine) work even
-# when Python's socket module didn't surface the symbol. On macOS the
-# listener will fail to setsockopt SO_TIMESTAMPNS (we caught that
-# with a warning in `_open_udp_listener`); the daemon's recvmsg will
-# then receive no SCM_TIMESTAMPNS ancillary and we bucket those into
-# `kernel_rx_dwell_buckets["no_timestamp"]`.
+# SCM_TIMESTAMPNS constant for parsing recvmsg ancillary data. On Linux
+# it's the same numeric value as SO_TIMESTAMPNS (35). macOS dev laptops
+# lack the symbol; we fall back to the numeric value so lab containers
+# work even if Python's socket module didn't surface it.
 _SCM_TIMESTAMPNS = getattr(socket, "SCM_TIMESTAMPNS", 35)
 
-# struct timespec: 2 * native long (tv_sec, tv_nsec). On 64-bit Linux
-# both are 8 bytes, so 16 bytes total. `recvmsg` returns the raw
-# bytes; we unpack as two signed 64-bit ints.
+# struct timespec: 2 * native long (tv_sec, tv_nsec). 16 bytes on
+# 64-bit Linux.
 _TIMESPEC_FMT = "ll"
 _TIMESPEC_SIZE = struct.calcsize(_TIMESPEC_FMT)
 
 from ..topo import (
     NUM_PLANES,
     NUM_SPINES,
-    inner_addr,
-    tenant_id as topo_tenant_id,
+    host_id_from_inner_addr,
+    probe_ev_from_inner_dst,
 )
 from .agent import AgentConfig, SenderMrcAgent
 from .ev_state import EVStateConfig, EVStateTable
-from .probe import ProbeDecodeError, decode_loss_report, decode_probe_reply
+from .probe import ProbeDecodeError, decode_probe
 from .transport import (
     DEFAULT_RECV_BUFSIZE,
     MrcTransport,
@@ -142,41 +123,19 @@ from .transport import (
 log = logging.getLogger(__name__)
 
 
-def _canon_ipv6(addr: str) -> str:
-    """RFC 5952 canonical form, matching `socket.recvfrom`'s peer_addr[0].
-
-    Used to key/lookup `MrcDaemon._demux`. Both `inner_addr()`-produced
-    strings (which zero-pad hextets, e.g. "2001:db8:bbbb:07::2") and
-    kernel-canonical strings (zero-stripped, e.g. "2001:db8:bbbb:7::2")
-    must map to the same key. A scope-id suffix (`%ifname`) on
-    link-local addresses is stripped before parsing — the daemon only
-    ever talks to global addresses, but defensive normalization avoids
-    a future linkylocal-related foot-gun.
-
-    Returns the input string unchanged on parse failure so a malformed
-    `peer_addr` from recvfrom() (shouldn't happen) doesn't crash the
-    dispatcher's hot loop; the lookup just misses and the packet is
-    counted as `unknown peer`.
-    """
-    s = addr.split("%", 1)[0]
-    try:
-        return ipaddress.IPv6Address(s).compressed
-    except (ValueError, ipaddress.AddressValueError):
-        return addr
-
-
 DEFAULT_SNAPSHOT_DIR = "/dev/shm/srv6-mrc"
 
 # Filename used by `write_final_report_file()` for the on-exit dump.
 # Reading this back from disk is the orchestrator's authoritative path
 # for retrieving the daemon's final report — `docker exec` stdout is
-# unreliable for payloads of this size (dockerd's stdout multiplex
-# stream drops trailing frames if the container exits before drain;
-# we've observed 7-of-8 daemons producing empty stdout and 1 producing
-# stdout truncated at ~16 KiB on a `green-all-to-all` run). The file
-# is the source of truth; stdout is kept as a fallback for humans who
-# run `spray --role mrc-daemon` directly.
+# unreliable for payloads of this size (see AGENTS.md gotcha).
 FINAL_REPORT_FILENAME = "final_report.json"
+
+
+# Magic byte constants (mirror srv6_mrc.mrc.probe but pinned here so
+# the dispatch hot loop doesn't import private names).
+_MAGIC_PROBE = 0xA5
+_MAGIC_LOSS_REPORT = 0xA7
 
 
 @dataclass(frozen=True)
@@ -184,34 +143,30 @@ class DaemonFlow:
     """One flow owned by the daemon: (tenant, dst_id).
 
     `src_id` is the daemon's own host id and is shared by all flows.
-    Future versions may add per-flow probe-rate overrides etc.; for
-    now the AgentConfig is shared.
     """
     tenant: str
     dst_id: int
 
 
 class MrcDaemon:
-    """Per-src_host MRC daemon: shared reply RX + per-flow agents.
+    """Per-src_host MRC daemon: shared RX + per-flow agents.
 
     Constructs ONE Srv6RawTransport(is_sender=True) and shares it
-    across all per-flow SenderMrcAgent instances. The agents'
-    `_reply_rx_loop` is suppressed via `start(own_reply_rx=False)` and
-    the daemon's dispatcher thread takes over reading from the shared
-    reply socket, dispatching by peer source address.
+    across all per-flow SenderMrcAgent instances. The daemon's
+    dispatcher thread reads from the shared recv socket, decodes the
+    magic byte, and routes:
+      - returning stateless probes (0xA5) -> agent.record_probe_recv
+        keyed on the payload's ``dst_id`` byte.
+      - loss reports (0xA7) -> agent._handle_loss_report keyed on the
+        peer's inner-anycast IPv6 source.
 
-    Snapshot publisher writes per-flow `EVStateTable.snapshot()` JSON
-    to `<snapshot_dir>/<src_host>/<dst_id>.json` every
-    `probe_interval_ms`. Data sender processes read those files via
-    the (forthcoming) `mrc_snapshot:<path>` policy.
+    Snapshot publisher writes per-flow ``EVStateTable.snapshot()`` JSON
+    to ``<snapshot_dir>/<src_host>/<tenant>_<dst>.json`` every
+    ``probe_interval_ms``. Data sender processes read those files via
+    the ``mrc_snapshot:<path>`` policy.
 
-    Tests should pass `transport=LoopbackUdpTransport(...)` so the
-    daemon doesn't try to open AF_INET6/SOCK_RAW (which requires
-    CAP_NET_RAW). The loopback transport's recv socket is bound to
-    `("::1", peer_rx_port)` and `recvfrom()` returns peer addresses
-    as `("::1", ...)` — so the demux's address-based lookup works
-    only if the test arranges for distinct peer addresses. For
-    single-flow tests the demux is trivial (one entry).
+    Tests should pass ``transport=LoopbackUdpTransport(...)`` so the
+    daemon doesn't try to open AF_INET6/SOCK_RAW.
     """
 
     def __init__(
@@ -243,38 +198,19 @@ class MrcDaemon:
         # Tests inject a LoopbackUdpTransport here.
         if transport is None:
             transport = Srv6RawTransport(
-                tenant=flows[0].tenant,  # tenant is per-flow but the
-                # raw send sockets are tenant-agnostic; we pass
-                # flows[0].tenant only because Srv6RawTransport's
-                # constructor wants one for inner-anycast caching.
-                # The transport's per-plane raw sockets are NOT
-                # tenant-bound. Multi-tenant daemons would need a
-                # transport refactor; out of scope for V1.
+                tenant=flows[0].tenant,
                 my_id=src_id,
                 is_sender=True,
             )
         self.transport = transport
 
-        # Per-flow state. Construction order:
-        #   one EVStateTable per (tenant, dst_id) flow, NOT per tenant.
-        #
-        # Why per-flow: probe outcomes against the same EV from
-        # different destinations would otherwise race destructively
-        # in a shared counter. With 7 flows on a host all writing to
-        # one (tenant, plane, path) record, every successful probe
-        # from flow A would be erased by the next millisecond's
-        # timeout from flow B's sweep, leaving consecutive_probe_
-        # successes pegged at 0 even when probes were succeeding
-        # (rtt_ring populated but the state-machine counter
-        # trampled). This matches the MRC paper's per-endpoint-pair
-        # EV model: host00 has 16 EVs to host01, a separate 16 to
-        # host02, etc. Each pair is independently monitored.
-        #
-        # Memory: 16 EV records x N flows is small (N=7 on 4p-4x8
-        # all-to-all = 112 records per host per tenant). The
-        # snapshot already publishes per-(tenant, dst_id), so the
-        # on-disk file layout is unchanged; only the in-memory
-        # dict key changes from `tenant` to `(tenant, dst_id)`.
+        # Per-flow EVStateTable: one per (tenant, dst_id). Per-flow
+        # (not per-tenant) was the 2026-05-24 fix for cross-flow
+        # trampling of the consecutive-success / consecutive-timeout
+        # counter pair; preserved here even though the stateless
+        # design uses a sliding window because the recv/sent ratio
+        # is still per-peer and racing writes from N flows on the
+        # same shared record would produce nonsensical ratios.
         self.tables: Dict[Tuple[str, int], EVStateTable] = {
             (flow.tenant, flow.dst_id): EVStateTable(
                 num_planes=NUM_PLANES,
@@ -285,77 +221,45 @@ class MrcDaemon:
             for flow in self.flows
         }
 
-        # Per-flow agent. `transport=self.transport` shares the daemon's
+        # Per-flow agents. `transport=self.transport` shares the daemon's
         # transport; the agent does NOT construct its own.
         self.agents: Dict[Tuple[str, int], SenderMrcAgent] = {}
-        # Demux key: peer's inner anycast string -> agent. Built once
-        # at construction so the dispatcher's hot path is just a dict
-        # lookup.
-        #
-        # We MUST canonicalize the key on both insert and lookup. Two
-        # different string forms of the same IPv6 address exist:
-        #   - `inner_addr(green, 7)` builds "2001:db8:bbbb:07::2"
-        #     (zero-padded hextet from f"{host_id:02x}").
-        #   - `socket.recvfrom()`'s peer_addr[0] returns the kernel's
-        #     RFC 5952 canonical form "2001:db8:bbbb:7::2" (leading
-        #     zeros within each hextet are suppressed).
-        # Pre-fix, the dict was keyed by the unpadded inner_addr() form
-        # while the dispatcher looked up with the canonical form, so
-        # EVERY probe reply was silently dropped at the "unknown peer"
-        # branch — the bug was invisible because dispatch fell through
-        # to `continue` rather than logging at INFO. Normalizing through
-        # ipaddress.IPv6Address(...).compressed (the same form recvfrom
-        # returns) makes both sides agree. See AGENTS.md gotchas:
-        # "IPv6 string canonicalization" / `_canon_addr` in report.py.
-        self._demux: Dict[str, SenderMrcAgent] = {}
 
-        # Dispatch instrumentation. Counters expose where replies go
-        # to die between recv() on the shared socket and
-        # record_probe_result() on the per-flow EVStateTable. After
-        # `11df16c` (per-flow tables) the lab saw ~12,840 replies
-        # arrive at the kernel socket while only ~200 made it to
-        # record_probe_result — these counters localize which
-        # transition in the dispatch chain is dropping the rest.
+        # Demux map for the dispatcher hot loop: dst_id -> agent.
         #
-        # Updated WITHOUT a lock because Python's int += 1 is atomic
-        # under the GIL for the read-modify-write pattern we use
-        # (single _dispatch_loop thread writes; readers are snapshot
-        # publishers that don't care about a torn read of one tick).
+        # Returning-probe path: the payload's ``dst_id`` byte names the
+        # peer host the probe was directed at, which is the per-flow
+        # agent's own dst_id. Single dict lookup.
+        #
+        # Loss-report path: peer_addr is the LOSS_REPORT sender's inner
+        # anycast = ``inner_addr(tenant, peer_host_id)``. We recover
+        # peer_host_id via ``host_id_from_inner_addr`` and look up the
+        # same map (peer_host_id is the sender's dst_id).
+        #
+        # V1 assumes one tenant per daemon (the Srv6RawTransport itself
+        # is single-tenant). Multi-tenant daemons would key by
+        # (tenant, dst_id); deferred.
+        self._demux: Dict[int, SenderMrcAgent] = {}
+
+        # Dispatch instrumentation. Single-writer (dispatcher thread)
+        # int += 1 is GIL-atomic for our read-modify-write pattern;
+        # snapshot publisher tolerates one-tick stale reads.
         self._dispatch_counters: Dict[str, int] = {
-            "replies_received": 0,        # every recvfrom() w/ payload
-            "replies_no_peer": 0,         # peer addr not in _demux
-            "replies_unknown_magic": 0,   # not 0xA6 / 0xA7
-            "replies_dispatched_probe": 0,   # routed to _handle_probe_reply
-            "replies_dispatched_loss": 0,    # routed to _handle_loss_report
+            "packets_received": 0,        # every recvfrom() w/ payload
+            "probes_dispatched": 0,       # routed to agent.record_probe_recv
+            "probes_no_flow": 0,          # payload dst_id not in _demux
+            "probes_decode_failed": 0,    # ProbeDecodeError
+            "probes_ev_mismatch": 0,      # payload (plane,path) <> inner-dst
+            "loss_reports_dispatched": 0, # routed to _handle_loss_report
+            "loss_reports_no_peer": 0,    # peer_addr -> host_id not in _demux
+            "unknown_magic": 0,           # not 0xA5 / 0xA7
         }
-
-        # Sender reply-RX instrumentation. Symmetric to the receiver's
-        # probe_rx_gap_buckets / probe_rx_backlog_buckets (see
-        # agent.py:832-845): localizes whether the multi-second
-        # reply-latency tail observed in cycle 7 lives in the kernel's
-        # reply path TO the sender (replies sitting in the UDP recvbuf
-        # while we're GIL-blocked by emit/sweep/window threads) or
-        # upstream of recvfrom() (wire / receiver / kernel TX).
-        #
-        # dispatch_rx_gap_buckets: monotonic_ns gap between successive
-        # recvfrom() returns on the shared reply socket. Heavy lt_100ms+
-        # tail means we ARE the queue — dispatch thread is starved.
-        # Mostly lt_1ms means recvfrom is idle and the seconds vanish
-        # before they reach us.
-        #
-        # dispatch_rx_backlog_buckets: SIOCINQ BYTES queued on the
-        # reply socket AFTER the recvfrom that just returned. Bucketed
-        # on RAW BYTES (not record count) because the shared reply
-        # socket carries BOTH probe replies (0xA6, ~28B) AND loss
-        # reports (0xA7, variable / larger) — dividing by any fixed
-        # record size would mis-bin loss reports against probe
-        # replies. Buckets: inq_0 (caught up), le_512 (~<18 probe
-        # replies queued), le_4k (a probe round backlog), le_32k
-        # (heavy), gt_32k (very heavy / near rcvbuf limit).
-        #
-        # Single-writer (dispatcher thread) — int += 1 is GIL-atomic
-        # for the read-modify-write pattern, same justification as
-        # `_dispatch_counters` above.
+        # Sender RX gap / backlog / kernel-dwell buckets. Preserved
+        # from the v3 design; they are bug-innocent infrastructure
+        # that localizes whether the dispatcher is starved (gap heavy
+        # at lt_100ms+) or idle (mostly lt_1ms). Bucket shapes and
+        # bucketing logic are unchanged from the previous design so
+        # historical snapshot comparisons remain valid.
         self._dispatch_rx_gap_buckets: Dict[str, int] = {
             "lt_1ms": 0,
             "lt_10ms": 0,
@@ -370,37 +274,14 @@ class MrcDaemon:
             "le_32k": 0,
             "gt_32k": 0,
         }
-        # Kernel-rx dwell: time between the kernel CLOCK_REALTIME stamp
-        # at packet ingress (SO_TIMESTAMPNS, SCM_TIMESTAMPNS ancillary
-        # data on recvmsg) and our userland CLOCK_REALTIME read right
-        # after recvmsg returns. This is the ONE measurement gap left
-        # by cycles 9-12: `dispatch_rx_gap_buckets` measures gap
-        # *between* recvfrom returns, `dispatch_rx_backlog_buckets`
-        # samples SIOCINQ *after* a recv — neither tells us how long
-        # each individual datagram sat in the UDP recvbuf before we
-        # came to drain it. If `reply_age` is multi-second and this
-        # bucket also shows multi-second, the dispatcher thread is
-        # being starved while the kernel is delivering replies on
-        # time. If `reply_age` is multi-second but this bucket is
-        # tight (lt_1ms), the seconds live somewhere we still have
-        # not measured.
-        #
-        # Bucket on REAL-TIME-vs-REAL-TIME deliberately: kernel
-        # SO_TIMESTAMPNS emits CLOCK_REALTIME (struct timespec), and
-        # we read `time.clock_gettime(CLOCK_REALTIME)` userland-side.
-        # NTP slew during a 30-second scenario is sub-millisecond and
-        # negligible for the buckets we care about (lt_1ms ... ge_1s).
-        # If the system clock JUMPS (manual `date`, large step) during
-        # a run, the delta can go negative; we guard with a `< 0` check
-        # and bucket those into a `negative` slot for diagnostics.
         self._kernel_rx_dwell_buckets: Dict[str, int] = {
             "lt_1ms": 0,
             "lt_10ms": 0,
             "lt_100ms": 0,
             "lt_1s": 0,
             "ge_1s": 0,
-            "negative": 0,        # clock jumped backward; sanity check
-            "no_timestamp": 0,    # SO_TIMESTAMPNS not supported / no cmsg
+            "negative": 0,
+            "no_timestamp": 0,
         }
 
         for flow in self.flows:
@@ -414,8 +295,7 @@ class MrcDaemon:
                 clock_ns=clock_ns,
             )
             self.agents[(flow.tenant, flow.dst_id)] = agent
-            peer_inner = inner_addr(flow.tenant, flow.dst_id)
-            self._demux[_canon_ipv6(peer_inner)] = agent
+            self._demux[flow.dst_id] = agent
 
     # --- public API ----------------------------------------------------
 
@@ -423,19 +303,16 @@ class MrcDaemon:
         """Start dispatcher, snapshot publisher, and all per-flow agents.
 
         Order matters:
-          1. Per-flow agents start FIRST (without their own RX loops)
-             so probe TX threads are running when the dispatcher
-             begins delivering replies.
-          2. Dispatcher starts on the shared reply socket.
+          1. Per-flow agents start FIRST so probe TX threads are
+             running when the dispatcher begins delivering replies.
+          2. Dispatcher starts on the shared recv socket.
           3. Snapshot publisher starts writing initial snapshots.
-
-        Reverse on stop().
         """
         self._stop.clear()
         self._ensure_snapshot_dir()
 
         for agent in self.agents.values():
-            agent.start(own_reply_rx=False)
+            agent.start()
 
         self._spawn(self._dispatch_loop, name="mrc-daemon-dispatch")
         self._spawn(self._snapshot_loop, name="mrc-daemon-snapshot")
@@ -449,19 +326,12 @@ class MrcDaemon:
         """
         self._stop.set()
 
-        # Stop per-flow agents first so they stop emitting probes
-        # before we close the transport (otherwise their emit loops
-        # race against `transport.close()` and produce noisy OSError
-        # tracebacks).
         for agent in self.agents.values():
             try:
                 agent.stop(timeout_s=timeout_s, close_transport=False)
             except Exception as e:
                 log.debug("mrc.daemon: agent stop: %s", e)
 
-        # Close the transport, which unblocks the dispatcher's
-        # recvfrom. The dispatcher exits, the publisher exits on
-        # its next wakeup.
         try:
             self.transport.close()
         except Exception:
@@ -474,45 +344,34 @@ class MrcDaemon:
                 t.join(timeout=remaining)
 
     def wait_for_stop(self, *, poll_s: float = 0.5) -> None:
-        """Block until stop() is called (e.g. by signal handler).
-
-        Used by the `spray --role mrc-daemon` CLI which sets up a
-        SIGTERM handler that calls stop(). Returns when _stop is set.
-        """
+        """Block until stop() is called (e.g. by signal handler)."""
         while not self._stop.is_set():
             self._stop.wait(poll_s)
 
     def final_report(self) -> Dict[str, Any]:
-        """Return a JSON-serializable snapshot of all flows' state.
+        """JSON-serializable snapshot of all flows' state on shutdown.
 
-        Called after stop() to flush the final per-flow `mrc.ev_state`
-        + `mrc.probe_clock` + `mrc.loss_fusion` diagnostics out of
-        the daemon's address space and into the orchestrator's report
-        aggregator (via stdout).
-
-        The shape mirrors what `cli/spray.py` produces under the
-        `mrc` key today, except keyed per-flow under `flows`:
+        Shape (mirrors what the v3 daemon emitted, minus the
+        ``probe_clock`` block which no longer exists in the
+        stateless-probe design):
 
             {
-              "src_host": "green-host00",
+              "src_host": "yellow-host00",
               "src_id": 0,
               "flows": {
-                "green/01": {"ev_state": ..., "probe_clock": ..., "loss_fusion": ...},
-                "green/02": {...},
+                "yellow/01": {"ev_state": ..., "loss_fusion": ...},
+                ...
               }
             }
         """
         from ..cli.spray import (  # lazy import to avoid CLI/runtime cycle
             _loss_fusion_stats_to_dict,
-            _probe_clock_stats_to_jsonable,
         )
         flows_out: Dict[str, Any] = {}
         for (tenant, dst_id), agent in self.agents.items():
             try:
                 flows_out[f"{tenant}/{dst_id:02d}"] = {
                     "ev_state": agent.table.snapshot(),
-                    "probe_clock":
-                        _probe_clock_stats_to_jsonable(agent.probe_clock.stats()),
                     "loss_fusion":
                         _loss_fusion_stats_to_dict(agent.stats),
                 }
@@ -529,30 +388,27 @@ class MrcDaemon:
     # --- thread bodies -------------------------------------------------
 
     def _dispatch_loop(self) -> None:
-        """Single drain loop on the shared reply socket.
+        """Single drain loop on the shared recv socket.
 
-        Reads one packet, decodes the magic byte, looks up the right
-        per-flow agent by `peer_addr[0]`, and dispatches. Drops packets
-        from unknown peers (logged at debug level — could be probes
-        crossing in flight from peers we don't have a flow to).
+        Reads one packet, decodes the magic byte, and dispatches:
+          0xA5 (returning stateless probe) -> agent.record_probe_recv
+              keyed on the payload's dst_id byte.
+          0xA7 (loss report) -> agent._handle_loss_report keyed on
+              host_id_from_inner_addr(peer_addr).
+
+        Unknown peers / unknown magic increment the dispatch counters
+        and continue; defensive against malformed packets in the hot
+        loop.
         """
         try:
-            sock = self.transport.recv_reply_socket()
+            sock = self.transport.recv_socket()
         except RuntimeError as e:
             log.error("mrc.daemon.dispatch: %s", e)
             return
-        # Instrumentation state. last_recv_ns measures inter-recv gap;
-        # inq_buf is a reusable 4-byte scratch for the SIOCINQ ioctl
-        # (saves one allocation per packet on the hot path). On macOS
-        # where _HAVE_SIOCINQ is False, backlog buckets stay at zero
-        # everywhere and we do not call fcntl.ioctl at all.
         last_recv_ns: Optional[int] = None
         inq_buf = bytearray(4) if _HAVE_SIOCINQ else None
         # `recvmsg` is the path that surfaces SCM_TIMESTAMPNS ancillary
-        # data; test fakes (FakeRecvSocket in unit tests) only expose
-        # `recvfrom`. Detect once and pick the path. Ancillary buffer
-        # sized for one timespec cmsg (cmsghdr ~16B + 16B payload ≈
-        # 64B with alignment slack — 256B is overkill safe).
+        # data; test fakes (FakeRecvSocket) only expose `recvfrom`.
         use_recvmsg = hasattr(sock, "recvmsg")
         anc_bufsize = 256
         while not self._stop.is_set():
@@ -562,9 +418,6 @@ class MrcDaemon:
                     payload, ancdata, _flags, peer = sock.recvmsg(
                         DEFAULT_RECV_BUFSIZE, anc_bufsize,
                     )
-                    # Parse SCM_TIMESTAMPNS out of the cmsg list. We
-                    # don't expect more than one but iterate defensively;
-                    # the first matching one wins.
                     for cmsg_level, cmsg_type, cmsg_data in ancdata:
                         if (
                             cmsg_level == socket.SOL_SOCKET
@@ -587,16 +440,7 @@ class MrcDaemon:
             if not payload:
                 continue
             now_ns = time.monotonic_ns()
-            # Bucket kernel-rx dwell BEFORE the rest of dispatch so we
-            # measure pure recvmsg-return-to-now, not "recvmsg + gap
-            # bucketing + ioctl + demux". Userland CLOCK_REALTIME read
-            # is paired with the kernel CLOCK_REALTIME stamp; both are
-            # subject to the same NTP slew so the delta is stable
-            # within microseconds across the run.
             if kernel_rx_realtime_ns is not None:
-                # `time.clock_gettime(CLOCK_REALTIME)` returns float
-                # seconds; multiply to ns. `time.time_ns()` is the same
-                # clock with integer return — use it directly.
                 userland_realtime_ns = time.time_ns()
                 dwell_ns = userland_realtime_ns - kernel_rx_realtime_ns
                 if dwell_ns < 0:
@@ -613,9 +457,6 @@ class MrcDaemon:
                     self._kernel_rx_dwell_buckets["ge_1s"] += 1
             else:
                 self._kernel_rx_dwell_buckets["no_timestamp"] += 1
-            # Gap from previous recv. Skip on first iteration — a
-            # cold-start "gap" from process boot isn't a meaningful
-            # bucket value.
             if last_recv_ns is not None:
                 gap_ns = now_ns - last_recv_ns
                 if gap_ns < 1_000_000:
@@ -629,17 +470,11 @@ class MrcDaemon:
                 else:
                     self._dispatch_rx_gap_buckets["ge_1s"] += 1
             last_recv_ns = now_ns
-            # SIOCINQ AFTER recvfrom returns: bytes still queued in the
-            # kernel for this socket. Best-effort — ioctl can fail in
-            # odd kernel states; on failure we silently skip the bucket
-            # update for this packet (matching agent.py's pattern).
             if _HAVE_SIOCINQ and inq_buf is not None:
                 try:
                     fcntl.ioctl(sock.fileno(), _SIOCINQ, inq_buf, True)
                     inq_bytes = struct.unpack("i", bytes(inq_buf))[0]
                 except (OSError, AttributeError):
-                    # AttributeError covers test fakes lacking fileno();
-                    # OSError covers real-socket ioctl failures.
                     inq_bytes = -1
                 if inq_bytes >= 0:
                     if inq_bytes == 0:
@@ -652,71 +487,115 @@ class MrcDaemon:
                         self._dispatch_rx_backlog_buckets["le_32k"] += 1
                     else:
                         self._dispatch_rx_backlog_buckets["gt_32k"] += 1
-            self._dispatch_counters["replies_received"] += 1
-            peer_addr = peer[0] if isinstance(peer, tuple) else None
-            # Strip any scope-id suffix ("fe80::1%eth0") so link-local
-            # forms don't break the lookup. Canonicalize through
-            # ipaddress.IPv6Address so the key form matches what
-            # inner_addr() produced at __init__ (both routed through
-            # _canon_ipv6).
-            agent = (
-                self._demux.get(_canon_ipv6(peer_addr))
-                if peer_addr else None
-            )
-            if agent is None:
-                self._dispatch_counters["replies_no_peer"] += 1
-                log.debug(
-                    "mrc.daemon.dispatch: reply from unknown peer %s "
-                    "(known: %s)", peer_addr, sorted(self._demux),
-                )
-                continue
+            self._dispatch_counters["packets_received"] += 1
+
             magic = payload[0]
-            if magic == 0xA6:
-                self._dispatch_counters["replies_dispatched_probe"] += 1
-                self._handle_reply_safe(agent, payload, kind="probe_reply")
-            elif magic == 0xA7:
-                self._dispatch_counters["replies_dispatched_loss"] += 1
-                self._handle_loss_safe(agent, payload, kind="loss_report")
+            if magic == _MAGIC_PROBE:
+                self._dispatch_probe(payload, peer)
+            elif magic == _MAGIC_LOSS_REPORT:
+                self._dispatch_loss_report(payload, peer)
             else:
-                self._dispatch_counters["replies_unknown_magic"] += 1
-                log.debug("mrc.daemon.dispatch: unknown magic 0x%02x", magic)
+                self._dispatch_counters["unknown_magic"] += 1
+                log.debug(
+                    "mrc.daemon.dispatch: unknown magic 0x%02x", magic,
+                )
 
-    @staticmethod
-    def _handle_reply_safe(
-        agent: SenderMrcAgent, payload: bytes, *, kind: str,
-    ) -> None:
+    def _dispatch_probe(self, payload: bytes, peer: Any) -> None:
+        """Returning-probe path: payload byte ``dst_id`` keys the agent.
+
+        Optionally cross-checks the (plane, path) extracted from the
+        peer source IP against the payload's declared (plane, path)
+        as a corruption canary. peer is the inner-src placeholder
+        (e.g. cccc::ffff for yellow) so we can't extract EV identity
+        from it — instead the daemon's recvmsg path could surface
+        the inner-DST via IPV6_PKTINFO. Today we trust the payload
+        and log mismatches via probe_ev_from_inner_dst only when the
+        test fixture passes a peer that happens to be a per-EV /128
+        (this is the case for some test transports). On the lab path
+        peer_addr is the placeholder and we skip the cross-check.
+        """
         try:
-            agent._handle_probe_reply(payload)  # noqa: SLF001 — internal API
-        except Exception as e:  # pragma: no cover — defensive
-            log.debug("mrc.daemon.dispatch: %s handler raised: %s", kind, e)
+            probe = decode_probe(payload)
+        except ProbeDecodeError as e:
+            self._dispatch_counters["probes_decode_failed"] += 1
+            log.debug("mrc.daemon.dispatch: bad probe: %s", e)
+            return
+        agent = self._demux.get(probe.dst_id)
+        if agent is None:
+            self._dispatch_counters["probes_no_flow"] += 1
+            log.debug(
+                "mrc.daemon.dispatch: returning probe for unknown "
+                "dst_id %d (known: %s)",
+                probe.dst_id, sorted(self._demux),
+            )
+            return
+        # Optional cross-check: if peer happens to be a per-EV /128
+        # (some loopback tests synthesize this), the EV recovered
+        # from inner-dst MUST match the payload's (plane, path).
+        # On the lab path peer is the inner-src placeholder and the
+        # check is skipped.
+        peer_addr = peer[0] if isinstance(peer, tuple) else None
+        if peer_addr:
+            ev = probe_ev_from_inner_dst(peer_addr)
+            if ev is not None:
+                _t, _h, ev_plane, ev_path = ev
+                if (ev_plane, ev_path) != (probe.plane_id, probe.path_id):
+                    self._dispatch_counters["probes_ev_mismatch"] += 1
+                    log.debug(
+                        "mrc.daemon.dispatch: probe EV mismatch "
+                        "payload=(%d,%d) inner_dst=(%d,%d)",
+                        probe.plane_id, probe.path_id, ev_plane, ev_path,
+                    )
+                    # Mismatch is a corruption canary; record the
+                    # payload-stated EV anyway so a single bit-flip
+                    # doesn't lose the signal.
+        try:
+            agent.record_probe_recv(probe.plane_id, probe.path_id)
+            self._dispatch_counters["probes_dispatched"] += 1
+        except Exception as e:  # pragma: no cover - defensive
+            log.debug("mrc.daemon.dispatch: record_probe_recv raised: %s", e)
 
-    @staticmethod
-    def _handle_loss_safe(
-        agent: SenderMrcAgent, payload: bytes, *, kind: str,
-    ) -> None:
+    def _dispatch_loss_report(self, payload: bytes, peer: Any) -> None:
+        """Loss-report path: peer_addr -> host_id -> agent.
+
+        peer_addr is the receiver's inner anycast (e.g.
+        ``2001:db8:cccc:01::2`` for yellow-host01). We recover the
+        host_id and use it as the dst_id key into ``self._demux``
+        (the per-flow agent for src_host -> peer_host_id).
+        """
+        peer_addr = peer[0] if isinstance(peer, tuple) else None
+        host = host_id_from_inner_addr(peer_addr) if peer_addr else None
+        if host is None:
+            self._dispatch_counters["loss_reports_no_peer"] += 1
+            log.debug(
+                "mrc.daemon.dispatch: loss report from unparseable "
+                "peer %s", peer_addr,
+            )
+            return
+        _tenant, host_id = host
+        agent = self._demux.get(host_id)
+        if agent is None:
+            self._dispatch_counters["loss_reports_no_peer"] += 1
+            log.debug(
+                "mrc.daemon.dispatch: loss report from unknown "
+                "peer host_id=%d (known: %s)",
+                host_id, sorted(self._demux),
+            )
+            return
         try:
             agent._handle_loss_report(payload)  # noqa: SLF001 — internal API
-        except Exception as e:  # pragma: no cover — defensive
-            log.debug("mrc.daemon.dispatch: %s handler raised: %s", kind, e)
+            self._dispatch_counters["loss_reports_dispatched"] += 1
+        except Exception as e:  # pragma: no cover - defensive
+            log.debug("mrc.daemon.dispatch: loss handler raised: %s", e)
 
     def _snapshot_loop(self) -> None:
-        """Write per-flow EVStateTable.snapshot() JSON to /dev/shm.
-
-        Writes are atomic (write-then-rename) so a reader catching the
-        publisher mid-write never sees a truncated file. Cadence is
-        `probe_interval_ms`; readers refresh on `loss_window_ms` so
-        the snapshot is at most one publish interval stale.
-        """
+        """Write per-flow EVStateTable.snapshot() JSON to /dev/shm."""
         interval_s = self.cfg.probe_interval_ms / 1000.0
-        # Write an initial snapshot immediately so readers don't race
-        # against the first publish.
         self._publish_all_snapshots()
         while not self._stop.is_set():
             if self._stop.wait(interval_s):
                 return
             self._publish_all_snapshots()
-        # Final snapshot on stop so any reader just-spawned sees the
-        # last known state.
         try:
             self._publish_all_snapshots()
         except Exception:  # pragma: no cover — best effort on shutdown
@@ -732,11 +611,6 @@ class MrcDaemon:
                     tenant, dst_id, e,
                 )
                 continue
-            # Wrap with daemon-context metadata so a reader can sanity
-            # check it's the right file (paranoia against cross-flow
-            # mixups during development). transport_stats is daemon-
-            # wide (all flows share self.transport), included here so
-            # any single snapshot file is self-contained for jq.
             payload = {
                 "src_host": self.src_host,
                 "src_id": self.src_id,
@@ -751,22 +625,7 @@ class MrcDaemon:
                     dict(self._dispatch_rx_backlog_buckets),
                 "kernel_rx_dwell_buckets":
                     dict(self._kernel_rx_dwell_buckets),
-                "probe_reply_stats": dict(agent.probe_reply_stats),
-                "reply_latency_buckets": dict(agent.reply_latency_buckets),
                 "probe_emit_buckets": dict(agent.probe_emit_buckets),
-                "reply_handler_buckets": dict(agent.reply_handler_buckets),
-                "reply_age_stats": {
-                    "max_ns": agent.reply_age_max_ns,
-                    "min_ns": (
-                        agent.reply_age_min_ns
-                        if agent.reply_age_min_ns >= 0 else 0
-                    ),
-                    "avg_ns": (
-                        agent.reply_age_sum_ns // agent.reply_age_count
-                        if agent.reply_age_count > 0 else 0
-                    ),
-                    "count": agent.reply_age_count,
-                },
             }
             path = self._snapshot_path(tenant, dst_id)
             self._atomic_write_json(path, payload)
@@ -775,22 +634,11 @@ class MrcDaemon:
         return self.snapshot_dir / f"{tenant}_{dst_id:02d}.json"
 
     def final_report_path(self) -> Path:
-        """Path of the on-exit final-report file.
-
-        See FINAL_REPORT_FILENAME for why the file (not stdout) is
-        the source of truth the orchestrator reads back.
-        """
+        """Path of the on-exit final-report file."""
         return self.snapshot_dir / FINAL_REPORT_FILENAME
 
     def write_final_report_file(self) -> Path:
-        """Compute final_report() and atomically write it to disk.
-
-        Returns the path written. The orchestrator retrieves this
-        file via `docker exec <host> cat <path>` after teardown —
-        far more reliable than draining the daemon's stdout through
-        the dockerd exec multiplex stream, which silently drops
-        trailing frames at container exit (see FINAL_REPORT_FILENAME).
-        """
+        """Compute final_report() and atomically write it to disk."""
         self._ensure_snapshot_dir()
         path = self.final_report_path()
         self._atomic_write_json(path, self.final_report())
@@ -807,12 +655,7 @@ class MrcDaemon:
 
     @staticmethod
     def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
-        """Atomic JSON write: write to <path>.tmp + rename(<path>).
-
-        Linux rename(2) is atomic on the same filesystem, so a reader
-        opening <path> always sees either the previous content or the
-        new content — never a truncated/partial file.
-        """
+        """Atomic JSON write: write to <path>.tmp + rename(<path>)."""
         tmp = path.with_suffix(path.suffix + ".tmp")
         try:
             with open(tmp, "w") as f:
@@ -820,7 +663,6 @@ class MrcDaemon:
             os.replace(tmp, path)
         except OSError as e:
             log.debug("mrc.daemon: atomic write %s: %s", path, e)
-            # Best-effort cleanup of the temp file.
             try:
                 tmp.unlink()
             except OSError:

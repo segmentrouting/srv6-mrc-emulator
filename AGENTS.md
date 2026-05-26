@@ -30,6 +30,50 @@ Tenants:
   `2001:db8:cccc:<NN>::2` on all 4 NICs and on `lo` (`nodad`). Mirrors
   green's anycast plan with `bbbb`→`cccc` (Phase 1a).
 
+## Interface naming and topology structure
+
+### Containerlab ↔ SONiC interface mapping
+
+Docker-sonic-vs uses `Ethernet0, Ethernet4, Ethernet8, ...` (increments
+of 4). Containerlab uses `eth1, eth2, eth3, ...` (starting at 1).
+
+**Mapping formula**: `clab eth{N}` → `SONiC Ethernet{(N-1)*4}`
+
+Examples:
+- `eth1` → `Ethernet0`
+- `eth2` → `Ethernet4`
+- `eth9` → `Ethernet32` (leaf downlink to green host)
+- `eth10` → `Ethernet36` (leaf downlink to yellow host)
+
+### Physical topology (4p-4x8)
+
+**Spine connections** (NO direct host connections):
+- `eth1..eth8` → downlinks to 8 leaves within the plane
+- `p0-spine00:eth1` (Ethernet0) ↔ `p0-leaf00:eth1` (Ethernet0)
+- `p0-spine00:eth2` (Ethernet4) ↔ `p0-leaf01:eth1` (Ethernet0)
+- ...
+- `p0-spine00:eth8` (Ethernet28) ↔ `p0-leaf07:eth1` (Ethernet0)
+
+**Leaf connections**:
+- `eth1..eth4` → uplinks to 4 spines (one per plane)
+  - `p0-leaf00:eth1` (Ethernet0) → `p0-spine00`
+  - `p0-leaf00:eth2` (Ethernet4) → `p0-spine01`
+  - `p0-leaf00:eth3` (Ethernet8) → `p0-spine02`
+  - `p0-leaf00:eth4` (Ethernet12) → `p0-spine03`
+- `eth9` (Ethernet32) → green host downlink (in `Vrf-green`)
+- `eth10` (Ethernet36) → yellow host downlink (default VRF)
+
+**Host connections**:
+- `eth1..eth4` → one uplink per plane to corresponding leaf
+  - `green-host00:eth1` → `p0-leaf00:eth9` (plane 0)
+  - `green-host00:eth2` → `p1-leaf00:eth9` (plane 1)
+  - `green-host00:eth3` → `p2-leaf00:eth9` (plane 2)
+  - `green-host00:eth4` → `p3-leaf00:eth9` (plane 3)
+
+All link information is in `topologies/<topo>/topology.clab.yaml` under
+the `links:` section with `endpoints: ["node-a:ethN", "node-b:ethM"]`
+format.
+
 ## Repo layout
 
 ```
@@ -161,6 +205,64 @@ the `srv6_mrc.topo` ↔ `spray` reference-pairs map in sync.
     would resurrect the same anycast/ECMP ambiguity that invariant 8
     exists to prevent. Per-EV state attribution (planned for Phase
     1b step 3) depends on the sender owning the spine choice.
+11. **Stateless-probe per-EV /128 ownership is exclusive.** Each
+    `probe_ev_addr(tenant, host, plane, path)` (e.g. yellow
+    `2001:db8:cccc:0::10` = host00 eth1 path 0) is configured on
+    EXACTLY ONE host — the owner. Adding it locally anywhere else
+    (including the peer that's supposed to forward the probe back)
+    causes that host's kernel to claim the returning probe and
+    silently kill the round trip. Generator pins this in
+    `tests/test_generator_stateless_probes.py::test_per_ev_addrs_unique_per_host`;
+    runtime side asserts the same in
+    `srv6_mrc/topo.py::probe_ev_addr`. If you ever generate `/128`s
+    in a new addressing block (e.g. green parity), enforce the same
+    uniqueness test before shipping.
+12. **Stateless-probe inner-src placeholder is unrouted, period.**
+    `srv6_mrc.topo.probe_inner_src(tenant)` (yellow:
+    `2001:db8:cccc::ffff`) MUST NOT be locally configured on any
+    host or appear in any FIB. Kernel sees it briefly on egress and
+    the returning probe carries it inbound — neither needs a route.
+    Configuring it locally would have the kernel claim it on egress
+    and reject the source-routing. Generator pins this in
+    `test_inner_src_placeholder_never_configured`.
+13. **Stateless-probe `dfff` decap on leaves is exactly one
+    static-sid per leaf per plane, into vrf default (Linux table
+    main).** The FRR line is
+    `sid fc00:000<P>:dfff::/48 locator MAIN behavior uDT6 vrf default`.
+    Pointing it into a tenant VRF would deliver the inner packet
+    to the wrong RIB and the connected route back to the sender's
+    host would be missing. The runbook in
+    `docs/stateless-probes-validation.md` originally used
+    `ip -6 route add ... encap seg6local action End.DT6 table 254 dev <iface>`
+    for the hand-validation, but production state goes through FRR
+    so `make config`'s verify+repair loop counts it correctly.
+14. **Peer-host kernel forwarding must be ON for stateless probes
+    to round-trip.** Generator sets
+    `sysctl -w net.ipv6.conf.all.forwarding=1` in every yellow
+    host's clab `exec:` block. Alpine defaults forwarding=0; the
+    peer's role in the probe round trip is pure IPv6 forwarding
+    on the still-encapped outer DA (the inner-dst is by invariant
+    11 not locally configured on the peer), so without this the
+    peer silently drops every probe at FIB lookup time. Generator
+    pins this in `test_ipv6_forwarding_enabled_on_every_yellow_host`.
+15. **One `(::, SPRAY_REPORT_PORT)` bind per host, owned by the
+    MRC daemon.** `Srv6RawTransport.__init__` opens the UDP
+    listener ONLY when `is_sender=True`. The receiver-side
+    transport (constructed by `ReceiverMrcAgent` with
+    `is_sender=False`) MUST NOT open a second bind on the same
+    port — even with SO_REUSEPORT, the kernel hash-steers half
+    the returning stateless probes to whichever socket the hash
+    selects, and the receiver-process socket has no consumer
+    (loss reports are TX-only via `_raw_sockets[plane]`).
+    Symptom of a double-bind: yellow-all-to-all (or any scenario
+    where a host is both sender AND receiver) reports
+    `window_recv=0` on every EV of half the senders → universal
+    `assumed_bad` despite a clean data plane. Same class of bug
+    as the sender-side SO_REUSEPORT cascade resolved in PR #1;
+    the v4 stateless-probes redesign re-exposed it on the
+    receiver path until cycle 14 (2026-05-25) tightened the
+    bind. Tests `ReceiverNoReportListenerTests.*` in
+    `tests/test_mrc_transport.py` pin it.
 
 ## Roadmap
 
@@ -382,6 +484,151 @@ run-scenario topologies/4p-4x8/scenarios/green-mrc-plane-loss.yaml --dry-run
 `--dry-run` prints the plan plus the exact `nsenter ... tc qdisc add ...`
 argvs that would be invoked — useful for verifying fault targeting
 without touching the lab.
+
+### `srctl fault` — Manual Fault Injection
+
+`srctl fault` provides interactive fault injection for testing MRC
+behavior against fabric failures. Faults are tracked in
+`/dev/shm/srv6-mrc-faults.json` for cleanup. This replaces the legacy
+embedded `faults:` blocks in scenario YAMLs with an explicit,
+stateful CLI workflow.
+
+#### Subcommands
+
+```bash
+# Shutdown interface(s) — bidirectional by default
+srctl fault shutdown <node> <interface> [<interface>...]
+srctl fault shutdown <node> all  # shutdown all interfaces on node
+srctl fault shutdown <node> <interface> --unidirectional  # one side only
+
+# Inject tc/netem (loss, delay, etc.) on host-side veths
+srctl fault netem "<target>" "<spec>"
+
+# Clear faults
+srctl fault clear --all
+srctl fault clear <node>
+srctl fault clear <node> <interface>
+
+# List active faults
+srctl fault list
+srctl fault list -o json
+```
+
+#### Examples
+
+**Test MRC against single EV failure**:
+
+```bash
+# Break EV p0-spine01 (all 8 downlinks to leaves)
+srctl fault shutdown p0-spine01 all
+
+# Run without MRC (expect ~6% loss on affected flows)
+srctl run yellow-ev-spray --duration 5
+
+# Run with MRC (expect 0% loss, 15/16 EVs active, p0-spine01 unused)
+srctl run yellow-mrc-ev-spray --duration 5
+
+# Clean up
+srctl fault clear --all
+```
+
+**Test MRC against partial loss**:
+
+```bash
+# Inject 5% loss on plane 2 of host00
+srctl fault netem "host yellow-host00 plane 2" "loss 5%"
+
+# Run with MRC (expect demote, weight shift away from plane 2)
+srctl run yellow-mrc-baseline --duration 10
+
+# Check active faults
+srctl fault list
+
+# Clean up
+srctl fault clear --all
+```
+
+**Break a specific link**:
+
+```bash
+# Break p0-spine01 ↔ p0-leaf00 link (bidirectional)
+srctl fault shutdown p0-spine01 Ethernet0
+# This also shuts down p0-leaf00:Ethernet4 (the peer)
+
+# Run scenario
+srctl run yellow-all-to-all --duration 30
+
+# Expect: MRC detects + demotes affected EVs, traffic routes around failure
+
+# Clean up
+srctl fault clear p0-spine01
+```
+
+**Asymmetric failure** (unidirectional):
+
+```bash
+# Only shut down spine side, leave leaf side up
+srctl fault shutdown p0-spine01 Ethernet0 --unidirectional
+
+# Asymmetric failures can expose routing or failure-detection edge cases
+```
+
+**Multiple interfaces on one node**:
+
+```bash
+# Shut down two spine downlinks simultaneously
+srctl fault shutdown p1-spine03 Ethernet4 Ethernet8
+
+# Each shutdown is bidirectional by default
+```
+
+#### Fault State Tracking
+
+All faults are persisted to `/dev/shm/srv6-mrc-faults.json`:
+
+```json
+{
+  "version": 1,
+  "faults": [
+    {
+      "id": "fault-001",
+      "type": "shutdown",
+      "targets": [
+        {"node": "p0-spine01", "interface": "Ethernet0"},
+        {"node": "p0-leaf00", "interface": "Ethernet4"}
+      ],
+      "spec": "down",
+      "bidirectional": true,
+      "applied_at": "2024-05-26T10:32:15Z",
+      "applied_by": "srctl fault"
+    }
+  ]
+}
+```
+
+`srctl fault clear` uses this state to restore interfaces. Always run
+`clear --all` between test runs to avoid orphaned faults.
+
+#### netem Target Syntax
+
+netem targets are host-side veths (reuses `srv6_mrc.netem` module):
+
+- `"plane N"` → all host NICs in plane N (32 NICs: 16 green + 16 yellow)
+- `"host NAME"` → all 4 uplinks of one host
+- `"host NAME plane N"` → single NIC (e.g., `yellow-host00:eth3`)
+
+netem spec strings are passed directly to `tc qdisc add ... netem`:
+
+- `"loss 5%"` — random 5% packet loss
+- `"loss 5% 25%"` — Markov-correlated loss (5% base, 25% correlation)
+- `"delay 50ms 10ms 25%"` — mean delay 50ms, jitter 10ms, corr 25%
+- `"delay 50ms loss 1%"` — combined delay + loss
+
+#### Deprecation Note
+
+The old `faults:` block in scenario YAMLs (e.g.,
+`green-mrc-plane-loss.yaml`) is now deprecated. Use `srctl fault`
+for all new testing workflows.
 
 ### MRC architecture (current build)
 
@@ -795,6 +1042,37 @@ remaining live EVs cluster on a couple of planes by chance.
     = 560 scapy builds/sec/host, the emit threads are GIL-bound
     and `mrc-reply-rx` is starved.
 
+- **2026-05-26 cycle 16**: receiver-side ceiling + policy-specific cost
+  separated via rate-sweep experiment. User ran manual matrix on
+  `yellow-all-to-all` (4p-4x8, 56 flows × 30s) with varying rate and policy:
+  - **ev_spray**: 20pps/50pps/60pps/70pps all **0% loss**; 80pps first sign
+    of loss (~2.5% max); 100pps ~21% loss. Pins receiver-side processing
+    ceiling at **~70pps × 56 flows = 3920 packets/host inbound**. This is
+    a genuine fabric/host processing limit, independent of policy.
+  - **mrc_snapshot**: 1pps/5pps/10pps all ~18-22% loss; **100pps ~69% loss**.
+    At 10pps × 56 = 560 packets/host (7× below ev_spray's clean ceiling),
+    yet still 22% lossy. **Policy adds a separate, additive cost** on top
+    of whatever receiver-side ceiling exists.
+  Root cause for policy cost: `MrcSnapshot.pick_ev` rebuilt `flat` list
+  (16 floats) + CDF tuple on every packet (lines 603-614 in `policy.py`).
+  At 100pps × 56 flows = ~700 picks/s/host, the per-packet allocation +
+  `_build_cdf` call was 3-5% of per-host CPU on alpine-on-docker-sonic-vs.
+  Plus GIL contention: sender pacing thread + daemon's probe-emit thread +
+  daemon's reply-RX thread + snapshot refresh thread — all fighting the
+  GIL across 8 Python processes per host (7 sender procs + 1 daemon).
+  Fix in `0dfe48c`: cache CDF keyed by `(id(wgrid), spines)`. CDF now
+  built once per (wgrid, spines) pair instead of once per packet. Cache
+  invalidated on every wgrid swap so stale CDFs never survive a weight
+  update. pick_ev hot path: zero allocations, just dict lookup + int arith.
+  Memory: bounded by flow count × wgrid refresh cadence (negligible).
+  Tests: new `TestCDFCache` pins cache population + invalidation contracts;
+  full suite 564/564 pass. **Pending lab confirmation** at `mrc_snapshot @
+  100pps` — if loss drops from 69% to ~21% (matching ev_spray @ same rate),
+  the per-pick CDF rebuild was the answer. If it doesn't move, GIL
+  contention from daemon threads is the binding constraint and the next
+  move is daemon-side: reduce probe interval or batch probe emits into
+  fewer wake-ups.
+
 **Resolved sub-bugs (kept for the trail)**:
 - `200465f`: fast-path probe reply via byte template + manual UDP6
   checksum. Replaces scapy in `Srv6RawTransport.send_probe_reply`.
@@ -991,6 +1269,67 @@ Invariants this design adds (do not violate):
 If validation fails (the hand-built runbook can't get a probe
 back to the sender), stop and report. Do not pivot to egress-
 leaf turnaround or any other fallback without user input.
+
+**2026-05-25 — cycle 14: receiver-side SO_REUSEPORT double-bind
+on (::, SPRAY_REPORT_PORT)**:
+Lab validation of `feature/stateless-probes` on 4p-4x8:
+- `yellow-baseline` (data plane): 0% loss, plane-balanced. PASS.
+- `yellow-mrc-ev-spray` (4 sender hosts, 4 different receiver
+  hosts): 0% loss, 16/16 EVs `good` on every flow,
+  `window_recv/window_sent = 1.0`, zero floor suppression. PASS.
+  The v4 design works exactly as intended in the
+  split-sender/receiver scenario; cycle-13's multi-second
+  `reply_age` and ~half-EV floor protection are fully gone.
+- `yellow-all-to-all` (every host both sender and receiver):
+  28.3% aggregate loss, every flow only used 8/16 EVs (planes
+  0+1 starved), per-host EV state distribution split
+  deterministically — half the hosts saw 16 good EVs, the
+  other half saw 8 `assumed_bad` + 8 `unknown` held only by
+  the floor with `total_recv=0` despite `total_sent≈158`.
+  **FAIL.**
+
+Diagnosis (lab subagent):
+- `ss -lnp` on a failing host mid-run showed TWO processes bound
+  to `*:9997`: the sender-process MrcDaemon AND the
+  receiver-process `spray --role recv --mrc`. Both used
+  SO_REUSEPORT (kernel-default for raw IPv6 sockets after the
+  first bind).
+- `Srv6RawTransport.__init__` unconditionally called
+  `_open_udp_listener("::", SPRAY_REPORT_PORT, ...)` regardless
+  of `is_sender`. The receiver path constructed via
+  `ReceiverMrcAgent(...).transport = Srv6RawTransport(
+  is_sender=False)` therefore double-bound the same port.
+- Kernel hash-steered ~half the returning stateless probes to
+  the receiver-process socket, which has no reader (the
+  receiver only TX'es loss reports via per-plane raw sockets;
+  it does not need an RX socket at all). Probes accumulated
+  in the kernel queue while the daemon's dispatcher saw
+  `window_recv=0`.
+- Wire capture confirmed probes WERE round-tripping correctly
+  at the kernel level: `tcpdump -nei eth1` on a "failing" host
+  showed valid 6-slot uSID outer + decapped inner probes
+  arriving. The packets reached the host. They landed in the
+  wrong process's socket.
+
+This is the **same class of bug** as PR #1's sender-side
+SO_REUSEPORT cascade — the same lesson re-learned on the
+receiver path. AGENTS.md "Hard invariant: Never bind
+(::, SPRAY_REPORT_PORT) with SO_REUSEPORT more than once per
+host" applied to senders only; v4's introduction of an
+`is_sender=False` Srv6RawTransport on the receiver path
+violated it silently.
+
+Fix: gate `_open_udp_listener` on `is_sender=True` in
+`Srv6RawTransport.__init__`. Receiver path: `_recv_sock = None`,
+`recv_socket()` raises RuntimeError (no consumer exists).
+Regression tests `ReceiverNoReportListenerTests.*` in
+`tests/test_mrc_transport.py` pin it: receiver's
+`__init__` makes zero `_open_udp_listener` calls; sender's
+makes exactly one. Same commit cleans out the dead v3 vestige
+tests (`FastPathByteIdentityTests`, `_reply_templates`-keyed
+assertions) that referenced the removed `send_probe_reply`
+path. Invariant 15 in the "Hard invariants" section codifies
+the rule.
 
 ### Spurious "orphan flow" report warnings on collective scenarios
 

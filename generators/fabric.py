@@ -228,6 +228,47 @@ def yellow_udt_sid(plane: int) -> str:
     return f"{plane_block_prefix(plane)}:{TENANT_YELLOW_SID_FUNC:04x}::/48"
 
 
+# Stateless-probe leaf-side uDT6 SID (per-plane). Decap target for the
+# 6-slot round-trip uSID list; the inner packet is delivered via the
+# leaf's connected route to its attached host's tenant NIC. One per
+# leaf per plane block — NOT per-EV, NOT per-host. See
+# `srv6_mrc/topo.py::PROBE_LEAF_DFFF_PREFIX_FMT` and
+# `docs/stateless-probes-validation.md`.
+def probe_dfff_sid(plane: int) -> str:
+    return f"{plane_block_prefix(plane)}:dfff::/48"
+
+
+# Stateless-probe per-(host, plane, path) /128 unicast addresses.
+# These mirror `srv6_mrc/topo.py::probe_ev_addr` exactly — keep in
+# sync. Plane is encoded via the NIC ordinal (eth1 = plane 0, so
+# NIC = plane + 1); path is the spine index 0..NUM_SPINES-1. The
+# low byte of the trailing hextet is (NIC << 4) | path, so the
+# 4p-4x8 yellow layout puts e.g. host00 eth1 path0 at cccc:0::10
+# and host00 eth4 path3 at cccc:0::43.
+#
+# Invariants pinned by tests/test_generator_stateless_probes.py:
+#   1. Each /128 is configured on EXACTLY ONE host (the owner).
+#   2. The owner's eth(plane+1) is the only NIC carrying it.
+#   3. The inner-src placeholder cccc::ffff is never configured.
+def probe_ev_addr_yellow(host: int, plane: int, path: int) -> str:
+    nic = plane + 1  # eth1 = 1, ..., eth4 = 4
+    low_byte = (nic << 4) | path
+    return f"2001:db8:cccc:{host:x}::{low_byte:x}"
+
+
+def probe_ev_addr_green(host: int, plane: int, path: int) -> str:
+    """Green stateless-probe per-(host, plane, path) /128 unicast address.
+    
+    Mirrors probe_ev_addr_yellow with bbbb:: prefix instead of cccc::.
+    Configured on the green host's per-plane NIC (eth1..eth4). When a probe
+    returns via the leaf's d000 End.DT6 (Vrf-green), the leaf forwards the
+    decapped inner packet to the host via the connected /64 route.
+    """
+    nic = plane + 1  # eth1 = 1, ..., eth4 = 4
+    low_byte = (nic << 4) | path
+    return f"2001:db8:bbbb:{host:x}::{low_byte:x}"
+
+
 def host_uplink_prefix(color: str, plane: int, host: int) -> str:
     """DEPRECATED (Phase 1a): per-(host,plane) underlay /64.
 
@@ -489,6 +530,16 @@ def write_leaf_frr(plane: int, leaf: int) -> None:
         f"   sid {leaf_host_ua_sid(plane, 36)} locator MAIN behavior uA "
         f"interface Ethernet36 nexthop {yellow_host_nh}"
     )
+    # Stateless-probe round-trip decap. The final slot of every probe's
+    # outer uSID list is `dfff`, landing on the sender's own leaf. We
+    # decap into vrf default (Linux table main) so the inner /128 — the
+    # sender's per-EV address — resolves via the leaf's connected
+    # Ethernet36 /64 route to the host. One entry per plane per leaf;
+    # NOT per-EV, NOT per-host (the EV identity rides the inner-dst,
+    # peer identity rides the probe payload).
+    sid_lines.append(
+        f"   sid {probe_dfff_sid(plane)} locator MAIN behavior uDT6 vrf default"
+    )
     static_block = "\n".join(sid_lines)
 
     # Static IPv6 routes for every spine locator in this plane (one per spine,
@@ -689,6 +740,43 @@ def write_topology_yaml(path: Path) -> None:
                 L.append(
                     f'        - "ip -6 addr add {anycast}/128 dev lo nodad"'
                 )
+
+            # Stateless-probe per-EV /128 addresses. One /128 per (plane,
+            # path) on the matching NIC; the returning probe's inner-dst is
+            # the sender's own per-EV address so the kernel claims it locally
+            # and the daemon's recv socket sees it. These addresses MUST NOT
+            # appear on any other host or the round trip dies silently at
+            # that host's kernel ingress (verified by
+            # tests/test_generator_stateless_probes.py).
+            #
+            # Yellow: probe turns around at the peer host via kernel
+            # forwarding (needs forwarding=1).
+            # Green: probe turns around at the remote leaf via d000 End.DT6
+            # into Vrf-green; leaf forwards decapped inner packet to host via
+            # connected /64 route.
+            if color == "yellow":
+                # Allow the kernel to forward the probe at the *peer*
+                # host: the peer's inner-dst is NOT locally configured
+                # (by invariant), so the kernel must fall through to
+                # an FIB lookup on the still-encapped outer DA. Without
+                # forwarding=1 the kernel silently drops it. Alpine
+                # defaults forwarding=0 — see docs/stateless-probes-
+                # validation.md.
+                L.append(
+                    '        - "sysctl -w net.ipv6.conf.all.forwarding=1"'
+                )
+            
+            for p in range(NUM_PLANES):
+                eth = f"eth{p + 1}"
+                for ev_path in range(NUM_SPINES):
+                    if color == "green":
+                        ev_addr = probe_ev_addr_green(n, p, ev_path)
+                    else:  # yellow
+                        ev_addr = probe_ev_addr_yellow(n, p, ev_path)
+                    L.append(
+                        f'        - "ip -6 addr add {ev_addr}/128 '
+                        f'dev {eth} nodad"'
+                    )
 
             # One reachability route per plane: each plane's /32 uSID block
             # is reached via that plane's NIC. Unambiguous (no accidental
