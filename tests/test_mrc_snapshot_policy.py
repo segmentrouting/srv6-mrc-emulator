@@ -498,5 +498,60 @@ class TestParsePolicyIntegration(unittest.TestCase):
                 p.stop()
 
 
+class TestCDFCache(unittest.TestCase):
+    """CDF cache eliminates per-packet flat-list + tuple allocation."""
+
+    def test_cdf_cached_per_wgrid_and_spines(self):
+        """pick_ev builds CDF once per (wgrid, spines) pair, not per packet."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ev.json")
+            table = _make_snapshot(path)
+            p = policy.MrcSnapshot(path, "green", paths_per_plane=2)
+            try:
+                # First pick on this flow: cache miss, CDF built.
+                plane0, spine0 = p.pick_ev(0, F)
+                self.assertEqual(len(p._cdf_cache), 1,
+                                 "first pick should populate cache with 1 entry")
+                # Second pick, same flow: cache hit, no rebuild.
+                plane1, spine1 = p.pick_ev(1, F)
+                self.assertEqual(len(p._cdf_cache), 1,
+                                 "cache size should still be 1 after second pick")
+                # Different flow (different spines): new cache entry.
+                F2 = FlowKey("2001:db8:bbbb:01::2", "2001:db8:bbbb:0e::2",
+                             9999, 9999)
+                p.pick_ev(0, F2)
+                self.assertEqual(len(p._cdf_cache), 2,
+                                 "different spines should add a second cache entry")
+            finally:
+                p.stop()
+
+    def test_cache_cleared_on_wgrid_swap(self):
+        """Cache is invalidated when _wgrid is swapped by refresh."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ev.json")
+            table = _make_snapshot(path)
+            p = policy.MrcSnapshot(path, "green")
+            try:
+                # Warm the cache with one pick.
+                p.pick_ev(0, F)
+                self.assertEqual(len(p._cdf_cache), 1, "cache should have 1 entry")
+                # Modify snapshot, touch the file, trigger refresh.
+                # Bump recv count on EV (0,0) so weights change.
+                table.record_probe_recv("green", 0, 0)
+                _make_snapshot(path, table)  # writes with new mtime
+                time.sleep(0.01)  # ensure mtime advances
+                loaded = p._refresh_once()
+                self.assertTrue(loaded, "refresh should have loaded new snapshot")
+                # Cache should be cleared.
+                self.assertEqual(len(p._cdf_cache), 0,
+                                 "cache should be empty after wgrid swap")
+                # Next pick rebuilds for new weights.
+                p.pick_ev(0, F)
+                self.assertEqual(len(p._cdf_cache), 1,
+                                 "cache repopulated after wgrid swap")
+            finally:
+                p.stop()
+
+
 if __name__ == "__main__":
     unittest.main()
