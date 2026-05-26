@@ -506,14 +506,16 @@ def leaf_gateway_addr(tenant: str, plane: int, host_id: int) -> str:
 # regression test asserts no host has them on any NIC.
 PROBE_INNER_SRC_PLACEHOLDER: dict[str, str] = {
     "yellow": "2001:db8:cccc::ffff",
-    # green: filled in once green parity lands.
+    "green": "2001:db8:bbbb::ffff",
 }
 
 # Leaf uDT6 SID block used as the round-trip's final hop on the
-# sender's leaf. End.DT6 -> table main; decap routes the inner packet
-# via the leaf's connected route to its attached host's tenant NIC.
+# sender's leaf.
+# Yellow: dfff End.DT6 -> table main (leaf decaps to main table, host claims)
+# Green: d000 End.DT6 -> Vrf-green (leaf decaps to VRF, forwards to host)
 # One per-leaf entry, NOT per-EV / per-host.
-PROBE_LEAF_DFFF_PREFIX_FMT = "fc00:000{plane:x}:dfff::/48"
+PROBE_LEAF_DFFF_PREFIX_FMT = "fc00:000{plane:x}:dfff::/48"  # yellow only
+PROBE_LEAF_D000_PREFIX_FMT = "fc00:000{plane:x}:d000::/48"  # green VRF uDT
 
 
 def probe_ev_addr(tenant: str, host_id: int, plane: int, path: int) -> str:
@@ -526,19 +528,26 @@ def probe_ev_addr(tenant: str, host_id: int, plane: int, path: int) -> str:
 
     `path` is the spine index the round trip transits (MRC's path ↔
     topology's spine).
+    
+    Yellow: probe turns around at peer host via kernel forwarding.
+    Green: probe turns around at remote leaf via d000 End.DT6; leaf
+    forwards decapped inner packet to host via connected /64 route.
     """
     _check_tenant(tenant)
     _check_host(host_id)
     _check_plane(plane)
     _check_spine(path)
-    if tenant != "yellow":
-        raise NotImplementedError(
-            f"stateless-probe addressing not yet defined for tenant "
-            f"{tenant!r}; only yellow is in this commit set"
-        )
     nic = plane + 1  # eth1 = 1, ..., eth4 = 4
     low_byte = (nic << 4) | path
-    return f"2001:db8:cccc:{host_id:x}::{low_byte:x}"
+    if tenant == "yellow":
+        return f"2001:db8:cccc:{host_id:x}::{low_byte:x}"
+    elif tenant == "green":
+        return f"2001:db8:bbbb:{host_id:x}::{low_byte:x}"
+    else:
+        raise NotImplementedError(
+            f"stateless-probe addressing not yet defined for tenant "
+            f"{tenant!r}; only yellow and green are supported"
+        )
 
 
 def probe_inner_src(tenant: str) -> str:
@@ -566,6 +575,7 @@ def probe_outer_dst(
     Walk (left to right, consumed by uA at each leaf/spine and finally
     decapped on the sender's leaf):
 
+    Yellow (host-based decap):
         f<S>  e<dst_leaf>  e009  f<S>  e<src_leaf>  dfff
 
       slot 0  f<P>00<S>     leaf<src> -> spine<S>   (leaf-up uA)
@@ -577,6 +587,16 @@ def probe_outer_dst(
       slot 5  dfff          leaf<src> End.DT6 table main; decap and
                             route inner via connected route to host<src>
 
+    Green (leaf-based decap):
+        f<S>  e<dst_leaf>  f<S>  e<src_leaf>  d000
+
+      slot 0  f<P>00<S>     leaf<src> -> spine<S>   (leaf-up uA)
+      slot 1  e00<dst_leaf> spine<S>  -> leaf<dst>  (spine-down uA)
+      slot 2  f<P>00<S>     leaf<dst> -> spine<S>   (leaf-up uA, return)
+      slot 3  e00<src_leaf> spine<S>  -> leaf<src>  (spine-down uA, return)
+      slot 4  d000          leaf<src> End.DT6 Vrf-green; decap and
+                            route inner via Vrf-green to host<src>
+
     Plane identity stays in the outer DA only (invariant 2). The
     same plane number drives both leaf-up hops because the round
     trip stays in-plane end to end.
@@ -586,17 +606,26 @@ def probe_outer_dst(
     _check_host(src_leaf)
     _check_host(dst_leaf)
     _check_spine(path)
-    if tenant != "yellow":
-        raise NotImplementedError(
-            f"stateless-probe outer-dst not yet defined for tenant "
-            f"{tenant!r}; only yellow is in this commit set"
-        )
+    
     # uSID slots are 16-bit hextets; the address is the left-to-right
     # concatenation packed into the 8 hextets of an IPv6 address.
-    return (
-        f"fc00:000{plane:x}:f00{path:x}:e00{dst_leaf:x}:"
-        f"e009:f00{path:x}:e00{src_leaf:x}:dfff"
-    )
+    if tenant == "yellow":
+        # 6-slot: f<S> e<dst> e009 f<S> e<src> dfff
+        return (
+            f"fc00:000{plane:x}:f00{path:x}:e00{dst_leaf:x}:"
+            f"e009:f00{path:x}:e00{src_leaf:x}:dfff"
+        )
+    elif tenant == "green":
+        # 5-slot: f<S> e<dst> f<S> e<src> d000 (no e009 host hop)
+        return (
+            f"fc00:000{plane:x}:f00{path:x}:e00{dst_leaf:x}:"
+            f"f00{path:x}:e00{src_leaf:x}:d000::"
+        )
+    else:
+        raise NotImplementedError(
+            f"stateless-probe outer-dst not yet defined for tenant "
+            f"{tenant!r}; only yellow and green are supported"
+        )
 
 
 def probe_ev_from_inner_dst(addr: str) -> tuple[str, int, int, int] | None:
@@ -616,9 +645,15 @@ def probe_ev_from_inner_dst(addr: str) -> tuple[str, int, int, int] | None:
         return None
     if parts[0] != "2001" or parts[1] != "0db8":
         return None
-    if parts[2] != "cccc":
-        # green parity not in this commit set
+    
+    # Check tenant prefix: bbbb = green, cccc = yellow
+    if parts[2] == "cccc":
+        tenant = "yellow"
+    elif parts[2] == "bbbb":
+        tenant = "green"
+    else:
         return None
+    
     if parts[4] != "0000" or parts[5] != "0000" or parts[6] != "0000":
         return None
     try:
@@ -640,7 +675,7 @@ def probe_ev_from_inner_dst(addr: str) -> tuple[str, int, int, int] | None:
         return None
     if not 0 <= path < NUM_SPINES:
         return None
-    return ("yellow", host_id, nic - 1, path)
+    return (tenant, host_id, nic - 1, path)
 
 
 # --- uSID outer destination -------------------------------------------------
