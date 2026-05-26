@@ -131,6 +131,36 @@ def _build_loopback_pair(
     return sender_xport, receiver_xport
 
 
+class _FakeRecvSocket:
+    """Canned-recvfrom socket for driving the daemon's _dispatch_loop
+    directly. Mirrors test_mrc_daemon_multiflow._FakeRecvSocket."""
+
+    def __init__(self) -> None:
+        self._queue: list = []
+        self._cond = threading.Condition()
+        self._closed = False
+
+    def push(self, payload: bytes, peer: Tuple[str, int]) -> None:
+        with self._cond:
+            self._queue.append((payload, peer))
+            self._cond.notify()
+
+    def recvfrom(self, bufsize: int):  # noqa: ARG002
+        with self._cond:
+            while not self._queue and not self._closed:
+                self._cond.wait(timeout=0.01)
+                if not self._queue and not self._closed:
+                    raise socket.timeout()
+            if self._closed and not self._queue:
+                raise OSError("fake socket closed")
+            return self._queue.pop(0)
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+
 class MrcDaemonLifecycleTests(unittest.TestCase):
     """start/stop bring threads up + tear them down cleanly."""
 
@@ -239,40 +269,18 @@ class MrcDaemonLifecycleTests(unittest.TestCase):
         ds = payload["dispatch_stats"]
         self.assertIsInstance(ds, dict)
         for key in (
-            "replies_received", "replies_no_peer",
-            "replies_unknown_magic",
-            "replies_dispatched_probe", "replies_dispatched_loss",
+            "packets_received", "probes_dispatched", "probes_no_flow",
+            "probes_decode_failed", "probes_ev_mismatch",
+            "loss_reports_dispatched", "loss_reports_no_peer",
+            "unknown_magic",
         ):
             self.assertIn(key, ds, f"missing dispatch_stats key {key}")
             self.assertIsInstance(ds[key], int)
             self.assertGreaterEqual(ds[key], 0)
 
-        # probe_reply_stats is per-flow (per agent); all four keys
-        # always present. Locks the schema the same way as dispatch_stats.
-        self.assertIn("probe_reply_stats", payload)
-        prs = payload["probe_reply_stats"]
-        self.assertIsInstance(prs, dict)
-        for key in ("received", "decode_failed", "no_match", "matched"):
-            self.assertIn(key, prs, f"missing probe_reply_stats key {key}")
-            self.assertIsInstance(prs[key], int)
-            self.assertGreaterEqual(prs[key], 0)
-
-        # reply_latency_buckets diagnoses arrival-time of replies
-        # relative to their outstanding probe entries' sweep deadline.
-        self.assertIn("reply_latency_buckets", payload)
-        rlb = payload["reply_latency_buckets"]
-        self.assertIsInstance(rlb, dict)
-        for key in ("lt_50ms", "lt_200ms", "lt_1s", "lt_5s", "ge_5s"):
-            self.assertIn(key, rlb, f"missing reply_latency_buckets key {key}")
-            self.assertIsInstance(rlb[key], int)
-            self.assertGreaterEqual(rlb[key], 0)
-
         # probe_emit_buckets is per-flow (per agent), measures the
-        # wall-clock cost of one transport.send_probe() call. Lab
-        # hypothesis under investigation: at all-to-all scale the
-        # raw-socket send is taking seconds, so probes' tx_ns is
-        # stale by the time the packet hits the wire and the receiver
-        # echoes it back inflated. Six-bucket schema.
+        # wall-clock cost of one transport.send_probe() call. Six-bucket
+        # schema.
         self.assertIn("probe_emit_buckets", payload)
         peb = payload["probe_emit_buckets"]
         self.assertIsInstance(peb, dict)
@@ -283,35 +291,6 @@ class MrcDaemonLifecycleTests(unittest.TestCase):
             self.assertIn(key, peb, f"missing probe_emit_buckets key {key}")
             self.assertIsInstance(peb[key], int)
             self.assertGreaterEqual(peb[key], 0)
-
-        # reply_handler_buckets pins how long _handle_probe_reply
-        # spent doing internal work, end-to-end. Distinct from
-        # reply_latency_buckets: that one measures wall-clock between
-        # emit and decode (fabric+kernel+queue), this one is purely
-        # in-process work on the dispatch thread.
-        self.assertIn("reply_handler_buckets", payload)
-        rhb = payload["reply_handler_buckets"]
-        self.assertIsInstance(rhb, dict)
-        for key in (
-            "lt_10us", "lt_100us", "lt_1ms",
-            "lt_10ms", "lt_100ms", "ge_100ms",
-        ):
-            self.assertIn(key, rhb,
-                          f"missing reply_handler_buckets key {key}")
-            self.assertIsInstance(rhb[key], int)
-            self.assertGreaterEqual(rhb[key], 0)
-
-        # reply_age_stats cross-checks reply_latency_buckets: the
-        # raw aggregate of (now_ns - reply.tx_ns) on every successful
-        # decode. Locks {max_ns, min_ns, avg_ns, count} schema.
-        self.assertIn("reply_age_stats", payload)
-        ras = payload["reply_age_stats"]
-        self.assertIsInstance(ras, dict)
-        for key in ("max_ns", "min_ns", "avg_ns", "count"):
-            self.assertIn(key, ras,
-                          f"missing reply_age_stats key {key}")
-            self.assertIsInstance(ras[key], int)
-            self.assertGreaterEqual(ras[key], 0)
 
         # dispatch_rx_gap_buckets / dispatch_rx_backlog_buckets are
         # the sender-RX counterpart to the receiver's
@@ -400,9 +379,8 @@ class MrcDaemonLifecycleTests(unittest.TestCase):
 
 
 class MrcDaemonReplyDispatchTests(unittest.TestCase):
-    """The dispatcher routes inbound replies into the right agent's
-    EVStateTable, mirroring what SenderMrcAgent's removed _reply_rx_loop
-    used to do."""
+    """The dispatcher routes inbound stateless probes (magic 0xA5)
+    into the right per-flow EVStateTable via record_probe_recv."""
 
     def setUp(self) -> None:
         self.tmpdir = tempfile.mkdtemp(prefix="mrc-daemon-test-")
@@ -421,19 +399,31 @@ class MrcDaemonReplyDispatchTests(unittest.TestCase):
             transport=self.sender_xport,
             snapshot_dir=self.tmpdir,
         )
-        only_agent = next(iter(self.daemon.agents.values()))
-        self.daemon._demux = {"::1": only_agent}
-        self.receiver = ReceiverMrcAgent(
-            tenant="green", my_id=15, config=FAST_CONFIG,
-            transport=self.receiver_xport,
+        # Patch recv_socket with a fake so we can inject probe bytes
+        # directly. The real lab uses kernel-turnaround of stateless
+        # probes; the loopback transport doesn't model that.
+        from unittest import mock
+        self.fake_rx = _FakeRecvSocket()
+        self._patch = mock.patch.object(
+            self.sender_xport, "recv_socket",
+            return_value=self.fake_rx,
         )
+        self._patch.start()
 
     def tearDown(self) -> None:
+        try:
+            self._patch.stop()
+        except Exception:
+            pass
+        try:
+            self.fake_rx.close()
+        except Exception:
+            pass
         try:
             self.daemon.stop(timeout_s=0.5)
         finally:
             try:
-                self.receiver.stop(timeout_s=0.5)
+                self.receiver_xport.close()
             except Exception:
                 pass
             try:
@@ -447,64 +437,44 @@ class MrcDaemonReplyDispatchTests(unittest.TestCase):
                 pass
 
     def test_replies_reach_table_via_dispatcher(self) -> None:
-        """End-to-end: probe goes out, receiver responds, daemon's
-        dispatcher decodes + invokes _handle_probe_reply, RTT lands."""
-        self.receiver.start()
+        """Stateless probes injected at the dispatcher's recv socket
+        route through record_probe_recv into the per-flow EV table."""
+        from srv6_mrc.mrc.probe import encode_probe
         self.daemon.start()
 
         agent = next(iter(self.daemon.agents.values()))
+        tid = topo_tenant_id("green")
+        # Inject probes spanning a few EVs.
+        for plane in range(NUM_PLANES):
+            for path in range(NUM_SPINES):
+                payload = encode_probe(
+                    plane_id=plane, path_id=path,
+                    tenant_id=tid, src_id=0, dst_id=15,
+                )
+                self.fake_rx.push(payload, ("::1", 1234))
 
-        def saw_a_reply() -> bool:
-            for plane in range(NUM_PLANES):
-                for path in range(NUM_SPINES):
-                    if agent.table.rtt_p50_ns("green", plane, path) is not None:
-                        return True
+        def saw_a_recv() -> bool:
+            snap = agent.table.snapshot()
+            for rec in snap["tenants"]["green"]:
+                if rec["window_recv"] > 0 or rec["total_recv"] > 0:
+                    return True
             return False
 
-        self.assertTrue(_wait_for(saw_a_reply, timeout_s=1.5),
-                        "no probe reply landed in EV table within 1.5s "
+        self.assertTrue(_wait_for(saw_a_recv, timeout_s=1.5),
+                        "no probe recv landed in EV table within 1.5s "
                         "via daemon dispatcher")
 
-        # Dispatch + match counters must tick in lockstep with successful
-        # RTT recording. Pre-fix lab cycle showed thousands of replies
-        # at the kernel UDP layer but zero in record_probe_result; these
-        # counters localize exactly which transition fails.
         ds = self.daemon._dispatch_counters
-        self.assertGreater(ds["replies_received"], 0,
+        self.assertGreater(ds["packets_received"], 0,
                            "dispatcher recvfrom counter never advanced")
-        self.assertGreater(ds["replies_dispatched_probe"], 0,
-                           "no reply made it to the 0xA6 dispatch branch")
-        self.assertEqual(ds["replies_no_peer"], 0,
-                         "loopback peer should always be in _demux")
-        self.assertEqual(ds["replies_unknown_magic"], 0,
+        self.assertGreater(ds["probes_dispatched"], 0,
+                           "no probe made it to the 0xA5 dispatch branch")
+        self.assertEqual(ds["unknown_magic"], 0,
                          "unexpected unknown-magic count")
-
-        prs = agent.probe_reply_stats
-        self.assertGreater(prs["received"], 0,
-                           "agent never entered _handle_probe_reply")
-        self.assertGreater(prs["matched"], 0,
-                           "no reply matched an outstanding probe")
-        self.assertEqual(prs["decode_failed"], 0,
-                         "decode_probe_reply failed on a valid payload")
-
-        # Reply latency on a loopback transport must land in the
-        # fastest bucket. If a future change accidentally swaps
-        # clocks (monotonic vs realtime) or stops echoing tx_ns,
-        # this asserts catch it before the lab does. Bucketing
-        # happens post-decode, so bucket sum == received - decode_failed.
-        rlb = agent.reply_latency_buckets
-        total_bucketed = sum(rlb.values())
-        self.assertEqual(
-            total_bucketed, prs["received"] - prs["decode_failed"],
-            "bucket sum must equal post-decode reply count",
-        )
-        self.assertGreater(rlb["lt_50ms"], 0,
-                           "loopback replies must land in lt_50ms bucket")
-        for slow in ("lt_1s", "lt_5s", "ge_5s"):
-            self.assertEqual(
-                rlb[slow], 0,
-                f"loopback replies should never bucket as {slow}",
-            )
+        self.assertEqual(ds["probes_decode_failed"], 0,
+                         "decode_probe failed on a valid payload")
+        self.assertEqual(ds["probes_no_flow"], 0,
+                         "all probes targeted the only configured flow")
 
 
 class MrcDaemonFinalReportTests(unittest.TestCase):
@@ -568,7 +538,6 @@ class MrcDaemonFinalReportTests(unittest.TestCase):
         self.assertIn("green/15", report["flows"])
         per_flow = report["flows"]["green/15"]
         self.assertIn("ev_state", per_flow)
-        self.assertIn("probe_clock", per_flow)
         self.assertIn("loss_fusion", per_flow)
 
     def test_write_final_report_file_persists_to_disk(self) -> None:
@@ -660,13 +629,18 @@ class MrcDaemonDispatchRxBucketsTests(unittest.TestCase):
             except OSError:
                 pass
 
-    def _inject(self, n: int, *, magic: int = 0xA6) -> None:
-        # Minimum probe-reply length is checked by decode_probe_reply,
-        # but the dispatcher buckets BEFORE decode. We send 28-byte
-        # payloads anyway so the magic-byte branch routes consistently
-        # — the agent's _handle_probe_reply will count decode_failed,
-        # which we don't care about here.
-        body = bytes([magic]) + b"\x00" * 27
+    def _inject(self, n: int, *, magic: int = 0xA5) -> None:
+        # Build a valid 10-byte v4 PROBE so the dispatcher counts it
+        # as probes_dispatched (not probes_decode_failed) — bucketing
+        # happens BEFORE decode either way, so the dwell/gap/backlog
+        # buckets fire identically.
+        from srv6_mrc.mrc.probe import encode_probe
+        tid = topo_tenant_id("green")
+        body = encode_probe(
+            plane_id=0, path_id=0, tenant_id=tid, src_id=0, dst_id=15,
+        )
+        if magic != 0xA5:
+            body = bytes([magic]) + body[1:]
         for _ in range(n):
             self.injector.sendto(
                 body, ("::1", self.sender_report_port))
@@ -677,8 +651,8 @@ class MrcDaemonDispatchRxBucketsTests(unittest.TestCase):
         self._inject(N)
         ds = self.daemon._dispatch_counters
         self.assertTrue(
-            _wait_for(lambda: ds["replies_received"] >= N, timeout_s=1.5),
-            f"dispatcher only received {ds['replies_received']}/{N}",
+            _wait_for(lambda: ds["packets_received"] >= N, timeout_s=1.5),
+            f"dispatcher only received {ds['packets_received']}/{N}",
         )
         # Gap bucket skips the first recv (no prior baseline), so
         # gap-bucket sum is N-1. Backlog bucket fires on every recv
@@ -687,17 +661,17 @@ class MrcDaemonDispatchRxBucketsTests(unittest.TestCase):
         from srv6_mrc.mrc import daemon as daemon_mod
         gap_total = sum(self.daemon._dispatch_rx_gap_buckets.values())
         self.assertEqual(
-            gap_total, ds["replies_received"] - 1,
+            gap_total, ds["packets_received"] - 1,
             f"gap bucket sum {gap_total} != recv-1 "
-            f"({ds['replies_received']-1})",
+            f"({ds['packets_received']-1})",
         )
         backlog_total = sum(
             self.daemon._dispatch_rx_backlog_buckets.values())
         if daemon_mod._HAVE_SIOCINQ:
             self.assertEqual(
-                backlog_total, ds["replies_received"],
+                backlog_total, ds["packets_received"],
                 f"backlog bucket sum {backlog_total} != recv "
-                f"({ds['replies_received']})",
+                f"({ds['packets_received']})",
             )
         else:
             self.assertEqual(
@@ -722,13 +696,13 @@ class MrcDaemonDispatchRxBucketsTests(unittest.TestCase):
             ds = self.daemon._dispatch_counters
             self.assertTrue(
                 _wait_for(
-                    lambda: ds["replies_received"] >= N, timeout_s=1.5),
-                f"dispatcher only received {ds['replies_received']}/{N}",
+                    lambda: ds["packets_received"] >= N, timeout_s=1.5),
+                f"dispatcher only received {ds['packets_received']}/{N}",
             )
             # Gap path is OS-independent — must still bucket.
             self.assertEqual(
                 sum(self.daemon._dispatch_rx_gap_buckets.values()),
-                ds["replies_received"] - 1,
+                ds["packets_received"] - 1,
             )
             # Backlog must be all-zero on the degraded path.
             self.assertEqual(
@@ -746,7 +720,7 @@ class MrcDaemonDispatchRxBucketsTests(unittest.TestCase):
         On Linux with SO_TIMESTAMPNS available, packets land in one of
         the dwell buckets (`lt_1ms` / `lt_10ms` / ...). On macOS or
         kernels without SO_TIMESTAMPNS, every packet lands in
-        `no_timestamp`. Either way: sum(buckets) == replies_received,
+        `no_timestamp`. Either way: sum(buckets) == packets_received,
         no double-counts and no skips. If we lose this invariant we
         lose the ability to trust the dwell counters at all in lab
         diagnostics.
@@ -756,14 +730,14 @@ class MrcDaemonDispatchRxBucketsTests(unittest.TestCase):
         self._inject(N)
         ds = self.daemon._dispatch_counters
         self.assertTrue(
-            _wait_for(lambda: ds["replies_received"] >= N, timeout_s=1.5),
-            f"dispatcher only received {ds['replies_received']}/{N}",
+            _wait_for(lambda: ds["packets_received"] >= N, timeout_s=1.5),
+            f"dispatcher only received {ds['packets_received']}/{N}",
         )
         dwell_total = sum(self.daemon._kernel_rx_dwell_buckets.values())
         self.assertEqual(
-            dwell_total, ds["replies_received"],
+            dwell_total, ds["packets_received"],
             f"kernel_rx_dwell bucket sum {dwell_total} != recv "
-            f"({ds['replies_received']})",
+            f"({ds['packets_received']})",
         )
 
 

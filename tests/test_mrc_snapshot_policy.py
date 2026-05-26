@@ -139,18 +139,19 @@ class TestMrcSnapshotPicking(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "ev.json")
             cfg = EVStateConfig(
-                probe_fail_threshold=3,
+                probe_window_ticks=2,
+                probe_min_samples=3,
                 min_active_evs=1,
             )
             table = EVStateTable(
                 tenants=("green",), num_planes=NUM_PLANES,
                 num_paths=NUM_SPINES, cfg=cfg,
             )
-            for spath in range(NUM_SPINES):
-                for _ in range(3):
-                    table.record_probe_result(
-                        "green", 1, spath, success=False,
-                    )
+            for _ in range(2):
+                for spath in range(NUM_SPINES):
+                    for _ in range(3):
+                        table.record_probe_sent("green", 1, spath)
+                table.tick("green")
             _make_snapshot(path, table=table)
             p = policy.MrcSnapshot(
                 snapshot_path=path,
@@ -210,7 +211,8 @@ class TestMrcSnapshotRefresh(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "ev.json")
             cfg = EVStateConfig(
-                probe_fail_threshold=3,
+                probe_window_ticks=2,
+                probe_min_samples=3,
                 min_active_evs=1,
             )
             table = EVStateTable(
@@ -238,11 +240,11 @@ class TestMrcSnapshotRefresh(unittest.TestCase):
                 # the same mtime and the refresh would skip the second
                 # file. os.utime with an explicit future timestamp
                 # guarantees the refresh thread sees a change.
-                for spath in range(NUM_SPINES):
-                    for _ in range(3):
-                        table.record_probe_result(
-                            "green", 0, spath, success=False,
-                        )
+                for _ in range(2):
+                    for spath in range(NUM_SPINES):
+                        for _ in range(3):
+                            table.record_probe_sent("green", 0, spath)
+                    table.tick("green")
                 _make_snapshot(path, table=table)
                 future = time.time() + 1.0
                 os.utime(path, (future, future))
@@ -289,18 +291,19 @@ class TestMrcSnapshotRefresh(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "ev.json")
             cfg = EVStateConfig(
-                probe_fail_threshold=3,
+                probe_window_ticks=2,
+                probe_min_samples=3,
                 min_active_evs=1,
             )
             table = EVStateTable(
                 tenants=("green",), num_planes=NUM_PLANES,
                 num_paths=NUM_SPINES, cfg=cfg,
             )
-            for spath in range(NUM_SPINES):
-                for _ in range(3):
-                    table.record_probe_result(
-                        "green", 1, spath, success=False,
-                    )
+            for _ in range(2):
+                for spath in range(NUM_SPINES):
+                    for _ in range(3):
+                        table.record_probe_sent("green", 1, spath)
+                table.tick("green")
             _make_snapshot(path, table=table)
             p = policy.MrcSnapshot(
                 snapshot_path=path,
@@ -412,12 +415,17 @@ class TestMrcSnapshotValidation(unittest.TestCase):
             table = EVStateTable(
                 tenants=("green",), num_planes=NUM_PLANES,
                 num_paths=NUM_SPINES,
-                cfg=EVStateConfig(min_active_evs=1),
+                cfg=EVStateConfig(
+                    probe_window_ticks=2,
+                    probe_min_samples=3,
+                    min_active_evs=1,
+                ),
             )
             # Demote a specific EV so we can prove the policy reads it.
-            for _ in range(table._cfg.probe_fail_threshold):
-                table.record_probe_result("green", plane=0, path=0,
-                                          success=False)
+            for _ in range(2):
+                for _ in range(3):
+                    table.record_probe_sent("green", plane=0, path=0)
+                table.tick("green")
             inner = table.snapshot()
             # Daemon's exact wrapper shape (see daemon.py:488-495).
             wrapped = {

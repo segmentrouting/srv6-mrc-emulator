@@ -1,23 +1,27 @@
-"""Step (c): multi-flow demux verification for MrcDaemon.
+"""Multi-flow demux verification for MrcDaemon (stateless-probe v4).
 
-The single-flow daemon tests in test_mrc_daemon.py work around
-LoopbackUdpTransport's invariant that every recv reports
-peer_addr=("::1", ...) by re-keying _demux to {"::1": only_agent}.
-That's fine for proving the dispatch -> handler pipeline, but it
-sidesteps the actual demux dict — which is what cures the SO_REUSEPORT
-reply-misdelivery cascade at all-to-all scale.
+Under the stateless-probe design the daemon's ``_demux`` is keyed by
+``dst_id`` (the peer host id encoded as a single byte in the probe
+payload), NOT by IPv6 peer address. The dispatcher hot loop:
 
-This file proves that:
-    1. The daemon's _demux is keyed correctly: one entry per
-       (tenant, dst_id) flow, keyed on inner_addr(tenant, dst_id).
-    2. Inbound replies arriving with peer_addr matching flow A's
-       inner-anycast are dispatched to flow A's agent and never to
-       flow B's, even when both flows are active.
+  - 0xA5 (PROBE) — extracts ``payload.dst_id``, looks up the matching
+    per-flow ``SenderMrcAgent``, calls ``record_probe_recv``.
+  - 0xA7 (LOSS_REPORT) — extracts the peer host id from ``peer_addr``
+    via ``host_id_from_inner_addr`` and looks up the SAME demux
+    (peer_host_id is the sender's dst_id), then calls
+    ``_handle_loss_report`` on the matching agent.
 
-We test (2) without raw sockets by replacing the daemon's
-`transport.recv_reply_socket()` with a fake socket whose recvfrom()
-returns canned (payload, peer_addr) tuples. The dispatcher loop then
-runs its real lookup logic against the real _demux dict.
+These tests verify:
+    1. ``_demux`` is keyed by ``dst_id`` (int), with exactly one
+       entry per ``(tenant, dst_id)`` flow.
+    2. Per-flow ``EVStateTable`` allocation: one table per
+       ``(tenant, dst_id)``, never shared across flows. Locks the
+       2026-05-24 fix.
+    3. Returning-probe dispatch routes to the correct agent based
+       on ``payload.dst_id``, even when peer_addr is identical
+       across flows (the loopback transport always reports
+       ``peer_addr=("::1", ...)``, which now poses no problem
+       because demux is payload-driven).
 """
 from __future__ import annotations
 
@@ -31,20 +35,18 @@ from typing import Dict, Tuple
 from unittest import mock
 
 from srv6_mrc.mrc.agent import AgentConfig
-from srv6_mrc.mrc.daemon import DaemonFlow, MrcDaemon, _canon_ipv6
-from srv6_mrc.mrc.probe import encode_probe_reply
+from srv6_mrc.mrc.daemon import DaemonFlow, MrcDaemon
+from srv6_mrc.mrc.probe import encode_probe
 from srv6_mrc.mrc.transport import LoopbackUdpTransport
 from srv6_mrc.topo import (
     NUM_PLANES,
     NUM_SPINES,
-    inner_addr,
     tenant_id as topo_tenant_id,
 )
 
 
 FAST_CONFIG = AgentConfig(
     probe_interval_ms=20,
-    probe_timeout_ms=40,
     loss_window_ms=40,
     max_window_skew_ms=200,
     use_loopback=True,
@@ -95,13 +97,7 @@ def _build_loopback_transport(*, rx_port: int, peer_rx_port: int):
 
 
 class _FakeRecvSocket:
-    """Stand-in for a UDP socket that yields canned recvfrom results.
-
-    Used by MrcDaemonMultiFlowDispatchTests to drive the daemon's
-    dispatcher loop with synthetic (payload, peer_addr) pairs whose
-    peer_addr fields differ -- something LoopbackUdpTransport cannot
-    do (it always reports peer_addr=("::1", port)).
-    """
+    """Canned-recvfrom socket for driving _dispatch_loop directly."""
 
     def __init__(self) -> None:
         self._queue: list = []
@@ -113,11 +109,9 @@ class _FakeRecvSocket:
             self._queue.append((payload, peer))
             self._cond.notify()
 
-    def recvfrom(self, bufsize: int):  # noqa: ARG002 — mimics socket API
+    def recvfrom(self, bufsize: int):  # noqa: ARG002
         with self._cond:
             while not self._queue and not self._closed:
-                # Mimic a short-timeout socket so the dispatcher's
-                # outer loop can periodically check self._stop.
                 self._cond.wait(timeout=0.01)
                 if not self._queue and not self._closed:
                     raise socket.timeout()
@@ -132,14 +126,7 @@ class _FakeRecvSocket:
 
 
 class MrcDaemonDemuxKeysTests(unittest.TestCase):
-    """The _demux dict is keyed by inner_addr(tenant, dst_id).
-
-    Pure construction-time test -- no threads started. Just verifies
-    that the daemon's setup wired the right peer-address keys to the
-    right per-flow agents. This is the "did we actually build the
-    routing table correctly" sanity check that single-flow tests can't
-    exercise.
-    """
+    """The ``_demux`` dict is keyed by ``dst_id`` (int), per flow."""
 
     def setUp(self) -> None:
         self.tmpdir = tempfile.mkdtemp(prefix="mrc-multiflow-")
@@ -154,96 +141,73 @@ class MrcDaemonDemuxKeysTests(unittest.TestCase):
         except Exception:
             pass
 
-    def test_demux_keys_match_inner_anycast_per_flow(self) -> None:
+    def _daemon(self, flows):
+        return MrcDaemon(
+            src_host="green-host00",
+            src_id=0,
+            flows=flows,
+            agent_cfg=FAST_CONFIG,
+            transport=self.sender_xport,
+            snapshot_dir=self.tmpdir,
+        )
+
+    def test_demux_keys_are_dst_ids(self) -> None:
         flows = [
             DaemonFlow(tenant="green", dst_id=15),
             DaemonFlow(tenant="green", dst_id=14),
             DaemonFlow(tenant="green", dst_id=13),
         ]
-        d = MrcDaemon(
-            src_host="green-host00",
-            src_id=0,
-            flows=flows,
-            agent_cfg=FAST_CONFIG,
-            transport=self.sender_xport,
-            snapshot_dir=self.tmpdir,
-        )
-        # One demux entry per flow. No collisions.
+        d = self._daemon(flows)
         self.assertEqual(len(d._demux), 3)
         for f in flows:
-            # _demux keys are RFC 5952-canonical, matching what
-            # socket.recvfrom() returns as peer_addr[0]. inner_addr()
-            # produces a zero-padded form ("...:0f::2") that doesn't
-            # match the kernel's canonical form ("...:f::2") for
-            # single-digit hextets — see _canon_ipv6 in daemon.py.
-            key = _canon_ipv6(inner_addr(f.tenant, f.dst_id))
-            self.assertIn(key, d._demux,
-                          f"flow {f} missing from _demux: keys={list(d._demux)}")
-            # And the agent under that key is the same as the one
-            # held under the (tenant, dst_id) tuple.
-            self.assertIs(d._demux[key], d.agents[(f.tenant, f.dst_id)])
+            self.assertIn(f.dst_id, d._demux,
+                          f"dst_id={f.dst_id} missing from _demux: "
+                          f"keys={sorted(d._demux)}")
+            # Key value matches the corresponding (tenant, dst_id) agent.
+            self.assertIs(
+                d._demux[f.dst_id],
+                d.agents[(f.tenant, f.dst_id)],
+            )
 
     def test_demux_keys_distinct_across_dst_ids(self) -> None:
-        # The original SO_REUSEPORT cascade was that *all* per-process
-        # daemons heard each other's replies. Here we verify the
-        # in-process demux at least gives every (tenant, dst_id) a
-        # distinct key -- so misrouting between flows on the same host
-        # is structurally impossible.
         flows = [
             DaemonFlow(tenant="green", dst_id=d) for d in (10, 11, 12, 13)
         ]
-        d = MrcDaemon(
-            src_host="green-host00",
-            src_id=0,
-            flows=flows,
-            agent_cfg=FAST_CONFIG,
-            transport=self.sender_xport,
-            snapshot_dir=self.tmpdir,
-        )
+        d = self._daemon(flows)
         keys = list(d._demux.keys())
         self.assertEqual(len(keys), len(set(keys)),
                          f"duplicate demux keys: {Counter(keys)}")
+        self.assertEqual(set(keys), {10, 11, 12, 13})
 
     def test_one_ev_state_table_per_flow_not_per_tenant(self) -> None:
-        """Each (tenant, dst_id) flow gets its own EVStateTable.
+        """Each ``(tenant, dst_id)`` flow gets its own EVStateTable.
 
-        Pre-fix the daemon allocated one EVStateTable per tenant and
-        shared it across all flows. Under multi-flow, every probe
-        outcome from flow A raced against flow B's outcomes on the
-        same (plane, path) record. The "consecutive successes" /
-        "consecutive timeouts" counters in the table can't survive
-        7 producers writing concurrently: one flow's success
-        immediately reset by the next flow's timeout, leaving
-        consecutive_probe_successes pegged at 0 even though the
-        RTT ring was populating correctly.
+        Pre-fix: one ``EVStateTable`` per tenant, shared across all
+        flows on a host. Under multi-flow that caused the consecutive-
+        success / consecutive-timeout counter pair to be trampled by
+        concurrent writers from sibling flows on the same shared
+        record. Stateless v4 uses sliding-window ratios instead of
+        consecutive counters, but the same sharing hazard would apply
+        to the bucket-rotation tick.
 
-        Per the MRC paper, each endpoint maintains its own EV grid
-        per peer endpoint. Lock that contract: distinct tables per
-        (tenant, dst_id), and each agent must hold the one matching
-        its own (tenant, dst_id).
+        Lock the contract: distinct ``EVStateTable`` instances per
+        ``(tenant, dst_id)``, and each agent holds the one matching
+        its own flow key.
         """
         flows = [
             DaemonFlow(tenant="green", dst_id=d) for d in (1, 2, 3, 7)
         ]
-        d = MrcDaemon(
-            src_host="green-host00",
-            src_id=0,
-            flows=flows,
-            agent_cfg=FAST_CONFIG,
-            transport=self.sender_xport,
-            snapshot_dir=self.tmpdir,
-        )
-        # 4 tables, one per (tenant, dst_id), all distinct objects.
+        d = self._daemon(flows)
         self.assertEqual(len(d.tables), 4)
         self.assertEqual(
             sorted(d.tables.keys()),
             [("green", 1), ("green", 2), ("green", 3), ("green", 7)],
         )
         seen_ids = {id(t) for t in d.tables.values()}
-        self.assertEqual(len(seen_ids), 4,
-                         "EVStateTables were aliased across flows")
-
-        # Each agent points at its own table (not its neighbor's).
+        self.assertEqual(
+            len(seen_ids), 4,
+            "EVStateTables were aliased across flows",
+        )
         for f in flows:
             agent = d.agents[(f.tenant, f.dst_id)]
             self.assertIs(
@@ -251,53 +215,9 @@ class MrcDaemonDemuxKeysTests(unittest.TestCase):
                 f"flow {f} agent table is not its own per-flow table",
             )
 
-    def test_demux_keys_are_rfc5952_canonical(self) -> None:
-        # Regression rail for the silent-drop bug fixed alongside this
-        # test: dispatcher looked up by `peer_addr[0]` (the kernel's
-        # canonical form, e.g. "2001:db8:bbbb:7::2") while keys were
-        # inserted as `inner_addr()` (zero-padded, e.g. "...:07::2").
-        # Every probe reply was dropped at the "unknown peer" branch
-        # and no EV ever recorded a probe success — root cause of the
-        # 2026-05-22 "MRC never demotes" lab report.
-        #
-        # Lock the contract: keys MUST be canonical (no leading zeros
-        # inside hextets). If you ever change the demux key shape, this
-        # test will fail loudly rather than silently regressing.
-        import ipaddress
-        flows = [
-            DaemonFlow(tenant="green", dst_id=d)
-            for d in (0, 1, 7, 9, 10, 15)
-        ]
-        d = MrcDaemon(
-            src_host="green-host00",
-            src_id=0,
-            flows=flows,
-            agent_cfg=FAST_CONFIG,
-            transport=self.sender_xport,
-            snapshot_dir=self.tmpdir,
-        )
-        for key in d._demux.keys():
-            self.assertEqual(
-                key,
-                ipaddress.IPv6Address(key).compressed,
-                f"demux key {key!r} is not RFC 5952-canonical "
-                f"(would not match socket.recvfrom() peer_addr[0])",
-            )
-        # And spot-check the specific case that triggered the bug:
-        # dst_id=7 -> kernel returns "2001:db8:bbbb:7::2", NOT
-        # "2001:db8:bbbb:07::2" — even though inner_addr() builds the
-        # latter. The demux MUST contain the former.
-        self.assertIn("2001:db8:bbbb:7::2", d._demux)
-        self.assertNotIn("2001:db8:bbbb:07::2", d._demux)
-
 
 class MrcDaemonMultiFlowDispatchTests(unittest.TestCase):
-    """Dispatched replies route to the right flow's agent.
-
-    Drives the daemon's _dispatch_loop with synthesized recvfrom()
-    tuples whose peer_addr differs per flow, then verifies each agent
-    saw exactly the replies addressed to its peer.
-    """
+    """Probe payloads route to the correct agent by ``payload.dst_id``."""
 
     def setUp(self) -> None:
         self.tmpdir = tempfile.mkdtemp(prefix="mrc-multiflow-")
@@ -318,33 +238,29 @@ class MrcDaemonMultiFlowDispatchTests(unittest.TestCase):
             snapshot_dir=self.tmpdir,
         )
         # Replace the transport's reply-socket factory with our fake
-        # so the dispatcher reads from it. This is what lets us inject
-        # custom peer_addr values per packet.
+        # so the dispatcher reads from it.
         self.fake_rx = _FakeRecvSocket()
         self._patch = mock.patch.object(
-            self.sender_xport, "recv_reply_socket",
+            self.sender_xport, "recv_socket",
             return_value=self.fake_rx,
         )
         self._patch.start()
 
-        # Wrap each agent's _handle_probe_reply with a counter so we
-        # can assert WHICH agent got each dispatched packet. We pass
-        # through to the real handler so the agent's internal state
-        # behaves normally.
+        # Wrap each agent's record_probe_recv with a counter.
         self.recv_counts: Counter = Counter()
         self._wrappers = []
         for (tenant, dst_id), agent in self.daemon.agents.items():
-            real = agent._handle_probe_reply
+            real = agent.record_probe_recv
             key = (tenant, dst_id)
 
             def make_wrapper(_real, _key):
-                def wrapper(payload):
+                def wrapper(plane, path):
                     self.recv_counts[_key] += 1
-                    return _real(payload)
+                    return _real(plane, path)
                 return wrapper
 
             wrapper = make_wrapper(real, key)
-            agent._handle_probe_reply = wrapper  # type: ignore[assignment]
+            agent.record_probe_recv = wrapper  # type: ignore[assignment]
             self._wrappers.append((agent, real))
 
     def tearDown(self) -> None:
@@ -361,91 +277,65 @@ class MrcDaemonMultiFlowDispatchTests(unittest.TestCase):
         except Exception:
             pass
         for agent, real in self._wrappers:
-            agent._handle_probe_reply = real  # type: ignore[assignment]
+            agent.record_probe_recv = real  # type: ignore[assignment]
         try:
             self.sender_xport.close()
         except Exception:
             pass
 
-    def _build_reply(self, *, tenant: str, src_id: int, reply_port: int = 9997,
-                    plane: int = 0, path: int = 0,
-                    req_id: int = 0xBEEF) -> bytes:
-        """Synthesize a probe-reply payload as an EV would have sent.
-
-        Field values are arbitrary except `tenant_id`/`src_id`, which
-        the receiving agent uses to validate the reply is "for it".
-        We don't need a matching outstanding req_id for this test
-        because we're asserting on which agent's _handle_probe_reply
-        was invoked, not on RTT-table effects (an unmatched reply
-        increments stale_replies and returns).
-        """
-        return encode_probe_reply(
-            req_id=req_id, plane_id=plane, path_id=path,
-            tx_ns=time.monotonic_ns(), svc_time_ns=0,
-            tenant_id=topo_tenant_id(tenant), src_id=src_id,
-            reply_port=reply_port,
+    def _probe(self, *, dst_id: int, plane: int = 0, path: int = 0) -> bytes:
+        return encode_probe(
+            plane_id=plane, path_id=path,
+            tenant_id=topo_tenant_id("green"),
+            src_id=0, dst_id=dst_id,
         )
 
-    def test_replies_route_by_peer_addr(self) -> None:
-        # Start the daemon. Probe-emit threads run, snapshot publisher
-        # runs, and -- crucially -- the dispatcher reads from our
-        # fake_rx instead of the real socket.
+    def test_probes_route_by_payload_dst_id(self) -> None:
         self.daemon.start()
-
-        # The two peers' inner-anycast addresses. These are the
-        # peer_addr[0] values the dispatcher will look up in _demux.
-        peer_15 = inner_addr("green", 15)
-        peer_14 = inner_addr("green", 14)
-
-        # Push 5 replies for flow (green,15) and 3 replies for
-        # flow (green,14), interleaved.
         n_15, n_14 = 5, 3
-        sched = ([(peer_15, 15)] * n_15) + ([(peer_14, 14)] * n_14)
-        # Interleave so a buggy demux that always picked, say, the
-        # first flow would fail visibly rather than coincidentally
-        # passing on the count-only check.
-        sched = [
-            sched[i] for i in (0, 5, 1, 6, 2, 7, 3, 4)
-        ][:n_15 + n_14]
+        sched = ([15] * n_15) + ([14] * n_14)
+        # Interleave so a buggy demux that always picked the first
+        # flow would fail visibly rather than coincidentally passing.
+        sched = [sched[i] for i in (0, 5, 1, 6, 2, 7, 3, 4)][:n_15 + n_14]
+        for dst_id in sched:
+            payload = self._probe(dst_id=dst_id)
+            # peer_addr is irrelevant for probe dispatch but the loop
+            # still passes it through to instrumentation paths.
+            self.fake_rx.push(payload, ("::1", 9997))
 
-        for peer_addr, peer_dst_id in sched:
-            payload = self._build_reply(
-                tenant="green", src_id=0,
-            )
-            self.fake_rx.push(payload, (peer_addr, 9997))
-
-        # Wait for the dispatcher to drain the queue. The fake socket
-        # blocks until the queue is non-empty; the dispatcher pops one
-        # at a time. Total expected calls = n_15 + n_14.
         deadline = time.monotonic() + 2.0
         while (sum(self.recv_counts.values()) < n_15 + n_14
                and time.monotonic() < deadline):
             time.sleep(0.01)
 
-        self.assertEqual(self.recv_counts[("green", 15)], n_15,
-                         f"flow 15 received wrong count: {dict(self.recv_counts)}")
-        self.assertEqual(self.recv_counts[("green", 14)], n_14,
-                         f"flow 14 received wrong count: {dict(self.recv_counts)}")
+        self.assertEqual(
+            self.recv_counts[("green", 15)], n_15,
+            f"flow 15 received wrong count: {dict(self.recv_counts)}",
+        )
+        self.assertEqual(
+            self.recv_counts[("green", 14)], n_14,
+            f"flow 14 received wrong count: {dict(self.recv_counts)}",
+        )
 
-    def test_unknown_peer_dropped_silently(self) -> None:
-        # A reply from a peer we don't have a flow to (e.g. a probe
-        # crossing in flight from a host we just stopped talking to)
-        # must be silently dropped, NOT delivered to a random agent.
-        # This is the structural guarantee that makes the daemon
-        # immune to the SO_REUSEPORT misdelivery class.
+    def test_unknown_dst_id_dropped_silently(self) -> None:
+        """A probe naming a dst_id we have no flow to is dropped.
+
+        Structural guarantee against probes from a peer we just
+        stopped talking to being misdelivered to a sibling flow.
+        """
         self.daemon.start()
-        unknown_peer = inner_addr("green", 7)  # no flow for dst_id=7
-        self.assertNotIn(unknown_peer, self.daemon._demux)
-
-        payload = self._build_reply(tenant="green", src_id=0)
-        self.fake_rx.push(payload, (unknown_peer, 9997))
-
-        # Give the dispatcher a moment to consume + drop.
+        self.assertNotIn(7, self.daemon._demux)
+        payload = self._probe(dst_id=7)
+        self.fake_rx.push(payload, ("::1", 9997))
         time.sleep(0.1)
-
-        self.assertEqual(sum(self.recv_counts.values()), 0,
-                         f"unknown-peer reply was delivered: "
-                         f"{dict(self.recv_counts)}")
+        self.assertEqual(
+            sum(self.recv_counts.values()), 0,
+            f"unknown-dst_id probe was delivered: "
+            f"{dict(self.recv_counts)}",
+        )
+        self.assertGreaterEqual(
+            self.daemon._dispatch_counters["probes_no_flow"], 1,
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

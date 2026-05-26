@@ -31,6 +31,8 @@ report decode, a thresholding regression, or a weight-table caching bug.
 from __future__ import annotations
 
 import collections
+import socket
+import threading
 import time
 import unittest
 
@@ -63,8 +65,11 @@ FAST_EV = EVStateConfig(
 def _build_pair(table: EVStateTable):
     """Spin up a sender+receiver pair over loopback bound to `table`.
 
-    Returns (sender, receiver, flow_key). Caller is responsible for
-    .start() and .stop() on both agents.
+    Returns (sender, receiver, flow_key, sender_xport). Caller is
+    responsible for .start() and .stop() on both agents. The sender
+    transport is exposed so the caller can attach a mini-dispatcher
+    thread (in v4 the daemon owns the recv socket; standalone agent
+    tests must run their own).
     """
     sender_report_port = PORTS.take(1)
     receiver_probe_port = PORTS.take(1)
@@ -85,7 +90,31 @@ def _build_pair(table: EVStateTable):
     )
 
     flow_key = (topo_tenant_id("green"), 0, 15)
-    return sender, receiver, flow_key
+    return sender, receiver, flow_key, sender_xport
+
+
+def _start_loss_report_dispatcher(sender, sender_xport):
+    """Forward 0xA7 LOSS_REPORTs from the loopback rx socket into
+    `sender._handle_loss_report`. In production the daemon does this;
+    in standalone-agent tests we spin our own.
+
+    Returns (thread, stop_event).
+    """
+    stop_evt = threading.Event()
+
+    def _mini_dispatcher():
+        sock = sender_xport.recv_socket()
+        while not stop_evt.is_set():
+            try:
+                payload, _peer = sock.recvfrom(2048)
+            except (socket.timeout, OSError):
+                continue
+            if payload and payload[0] == 0xA7:
+                sender._handle_loss_report(payload)  # noqa: SLF001
+
+    t = threading.Thread(target=_mini_dispatcher, daemon=True)
+    t.start()
+    return t, stop_evt
 
 
 def _drive_spray(policy: HealthAwareMrc, sender: SenderMrcAgent,
@@ -153,18 +182,18 @@ class HealthyFabricTests(unittest.TestCase):
             tenants=("green",), num_planes=NUM_PLANES, num_paths=NUM_SPINES, cfg=FAST_EV,
         )
         policy = HealthAwareMrc(table=table, tenant="green")
-        sender, receiver, flow_key = _build_pair(table)
+        sender, receiver, flow_key, sender_xport = _build_pair(table)
+        disp_t, disp_stop = _start_loss_report_dispatcher(sender, sender_xport)
 
         try:
             receiver.start()
-            sender.start()
-            # Wait for the receiver to learn the sender via probes
-            # (otherwise the first loss-emit round can't reach back).
-            self.assertTrue(_wait_for(
-                lambda: (topo_tenant_id("green"), 0)
-                        in receiver.known_senders(),
-                timeout_s=1.0,
-            ), "receiver never learned sender")
+            # NOTE: we intentionally do NOT call sender.start(). In v4
+            # the sender's mrc-emit thread fires probes whose kernel
+            # turnaround doesn't exist on loopback, so the sliding-
+            # window probe path would demote every EV regardless of
+            # data-loss state. This integration test exercises the
+            # data-loss feedback path (LOSS_REPORT → _handle_loss_report
+            # → EVStateTable), so we drive that explicitly.
 
             # Drive 200 picks across ~4 loss windows. With no EV
             # dropped, every packet reaches the receiver.
@@ -172,6 +201,11 @@ class HealthyFabricTests(unittest.TestCase):
             picks = _drive_spray(policy, sender, receiver, flow_key,
                                  n=200, bad_ev=None,
                                  per_ev_seq=seqs)
+            self.assertTrue(_wait_for(
+                lambda: (topo_tenant_id("green"), 0)
+                        in receiver.known_senders(),
+                timeout_s=1.0,
+            ), "receiver never learned sender via record_data")
             time.sleep(FAST_CONFIG.loss_window_ms * 3.0 / 1000.0)
 
             # No EV should be ASSUMED_BAD. Check every (plane, path)
@@ -192,8 +226,10 @@ class HealthyFabricTests(unittest.TestCase):
             self.assertEqual(planes_seen, set(range(NUM_PLANES)),
                              f"clean fabric left a plane unused: {picks}")
         finally:
+            disp_stop.set()
             sender.stop(timeout_s=0.5)
             receiver.stop(timeout_s=0.5)
+            disp_t.join(timeout=0.5)
 
 
 class PlaneLossShiftsDistributionTests(unittest.TestCase):
@@ -206,7 +242,8 @@ class PlaneLossShiftsDistributionTests(unittest.TestCase):
             tenants=("green",), num_planes=NUM_PLANES, num_paths=NUM_SPINES, cfg=FAST_EV,
         )
         policy = HealthAwareMrc(table=table, tenant="green")
-        sender, receiver, flow_key = _build_pair(table)
+        sender, receiver, flow_key, sender_xport = _build_pair(table)
+        disp_t, disp_stop = _start_loss_report_dispatcher(sender, sender_xport)
 
         # EV-centric expectation: with NUM_PLANES planes and NUM_SPINES
         # paths/plane there are NUM_PLANES * NUM_SPINES EVs; a single
@@ -221,12 +258,10 @@ class PlaneLossShiftsDistributionTests(unittest.TestCase):
 
         try:
             receiver.start()
-            sender.start()
-            self.assertTrue(_wait_for(
-                lambda: (topo_tenant_id("green"), 0)
-                        in receiver.known_senders(),
-                timeout_s=1.0,
-            ), "receiver never learned sender")
+            # As in HealthyFabricTests, skip sender.start() to avoid
+            # probe-emit thread demoting EVs (no kernel turnaround on
+            # loopback). The mini-dispatcher feeds LOSS_REPORTs into
+            # `sender._handle_loss_report` directly.
 
             # Phase 1: drive picks while dropping ~50% of the bad EV's
             # packets. We need enough arrivals on it that the receiver
@@ -239,7 +274,22 @@ class PlaneLossShiftsDistributionTests(unittest.TestCase):
                 _drive_spray(policy, sender, receiver, flow_key,
                              n=200, bad_ev=(BAD_PLANE, BAD_PATH),
                              bad_loss=0.5, per_ev_seq=seqs)
+                # In v4 the sender's _window_loop drives both EV-tick
+                # cadence AND SentWindowRing rotation. We're not
+                # starting that thread (probe-emit on loopback would
+                # demote every EV via the sliding-window probe path
+                # and contaminate the loss-feedback signal under test),
+                # so drive both manually + deterministically here.
+                # Order matters: rotate the sent-window first so the
+                # LOSS_REPORT the receiver is about to emit can be
+                # paired against a populated SentWindow on the sender.
+                sender._rotate_window()
                 time.sleep(FAST_CONFIG.loss_window_ms / 1000.0)
+                table.tick("green")
+            self.assertIn(
+                (topo_tenant_id("green"), 0), receiver.known_senders(),
+                "receiver never learned sender via record_data",
+            )
 
             # Wait for the demote to propagate to the specific EV that
             # carried the loss feedback.
@@ -301,8 +351,10 @@ class PlaneLossShiftsDistributionTests(unittest.TestCase):
                     f"post-demote: {share:.2%}; ev_picks={ev_picks}",
                 )
         finally:
+            disp_stop.set()
             sender.stop(timeout_s=0.5)
             receiver.stop(timeout_s=0.5)
+            disp_t.join(timeout=0.5)
 
 
 if __name__ == "__main__":

@@ -243,25 +243,6 @@ def _loss_fusion_stats_to_dict(stats) -> dict:
     return dict(vars(stats))
 
 
-def _probe_clock_stats_to_jsonable(stats: dict) -> dict:
-    """Convert ProbeClock.stats() output to JSON-serializable form.
-
-    `stats()` returns dicts keyed by `(plane, path)` tuples for the
-    per-EV counters (`emit`, `reply`, `timeout`, `outstanding`). JSON
-    can't represent tuple keys, so we re-key those as `"p<plane>s<path>"`
-    strings — same shape ev_state.snapshot() uses elsewhere in the
-    report so downstream tools see one convention. Scalar fields
-    (`stale_replies`) pass through unchanged.
-    """
-    out: dict = {}
-    for k, v in stats.items():
-        if isinstance(v, dict) and v and isinstance(next(iter(v)), tuple):
-            out[k] = {f"p{p}s{s}": n for (p, s), n in v.items()}
-        else:
-            out[k] = v
-    return out
-
-
 def cmd_send(args, tenant: str, my_id: int) -> int:
     if args.dst_id is None:
         print("spray.py: --dst-id is required for --role send", file=sys.stderr)
@@ -367,19 +348,14 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
                     "loss_fusion": _loss_fusion_stats_to_dict(
                         mrc_agent.stats,
                     ),
-                    # ProbeClock stats expose `stale_replies` — the count
-                    # of probe-replies that arrived AFTER the sweep
-                    # thread had already given up on them and recorded a
-                    # timeout. Non-zero values here indicate the probe
-                    # RX path is losing the race against probe_timeout_ms
-                    # and the cascade we're seeing in all-to-all is a
-                    # sweep-vs-RX timing race rather than actual fabric
-                    # loss. Also includes per-EV emit/reply/timeout
-                    # counters which let us cross-check the wire
-                    # observations against what the agent recorded.
-                    "probe_clock": _probe_clock_stats_to_jsonable(
-                        mrc_agent.probe_clock.stats(),
-                    ),
+                    # Stateless-probe redesign (2026-05-25) removed
+                    # the per-probe match table. The former
+                    # `probe_clock` block (stale_replies +
+                    # per-EV emit/reply/timeout counters) no longer
+                    # exists; sliding-window recv/sent counters
+                    # live inside the EV snapshot under
+                    # `.ev_state.tenants[tenant][...].sent_window /
+                    # recv_window`.
                 }
             except Exception as e:  # diag must never crash the run
                 mrc_diag = {"error": f"snapshot failed: {e}"}
