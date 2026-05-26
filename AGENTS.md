@@ -161,6 +161,46 @@ the `srv6_mrc.topo` ↔ `spray` reference-pairs map in sync.
     would resurrect the same anycast/ECMP ambiguity that invariant 8
     exists to prevent. Per-EV state attribution (planned for Phase
     1b step 3) depends on the sender owning the spine choice.
+11. **Stateless-probe per-EV /128 ownership is exclusive.** Each
+    `probe_ev_addr(tenant, host, plane, path)` (e.g. yellow
+    `2001:db8:cccc:0::10` = host00 eth1 path 0) is configured on
+    EXACTLY ONE host — the owner. Adding it locally anywhere else
+    (including the peer that's supposed to forward the probe back)
+    causes that host's kernel to claim the returning probe and
+    silently kill the round trip. Generator pins this in
+    `tests/test_generator_stateless_probes.py::test_per_ev_addrs_unique_per_host`;
+    runtime side asserts the same in
+    `srv6_mrc/topo.py::probe_ev_addr`. If you ever generate `/128`s
+    in a new addressing block (e.g. green parity), enforce the same
+    uniqueness test before shipping.
+12. **Stateless-probe inner-src placeholder is unrouted, period.**
+    `srv6_mrc.topo.probe_inner_src(tenant)` (yellow:
+    `2001:db8:cccc::ffff`) MUST NOT be locally configured on any
+    host or appear in any FIB. Kernel sees it briefly on egress and
+    the returning probe carries it inbound — neither needs a route.
+    Configuring it locally would have the kernel claim it on egress
+    and reject the source-routing. Generator pins this in
+    `test_inner_src_placeholder_never_configured`.
+13. **Stateless-probe `dfff` decap on leaves is exactly one
+    static-sid per leaf per plane, into vrf default (Linux table
+    main).** The FRR line is
+    `sid fc00:000<P>:dfff::/48 locator MAIN behavior uDT6 vrf default`.
+    Pointing it into a tenant VRF would deliver the inner packet
+    to the wrong RIB and the connected route back to the sender's
+    host would be missing. The runbook in
+    `docs/stateless-probes-validation.md` originally used
+    `ip -6 route add ... encap seg6local action End.DT6 table 254 dev <iface>`
+    for the hand-validation, but production state goes through FRR
+    so `make config`'s verify+repair loop counts it correctly.
+14. **Peer-host kernel forwarding must be ON for stateless probes
+    to round-trip.** Generator sets
+    `sysctl -w net.ipv6.conf.all.forwarding=1` in every yellow
+    host's clab `exec:` block. Alpine defaults forwarding=0; the
+    peer's role in the probe round trip is pure IPv6 forwarding
+    on the still-encapped outer DA (the inner-dst is by invariant
+    11 not locally configured on the peer), so without this the
+    peer silently drops every probe at FIB lookup time. Generator
+    pins this in `test_ipv6_forwarding_enabled_on_every_yellow_host`.
 
 ## Roadmap
 
