@@ -485,6 +485,151 @@ run-scenario topologies/4p-4x8/scenarios/green-mrc-plane-loss.yaml --dry-run
 argvs that would be invoked — useful for verifying fault targeting
 without touching the lab.
 
+### `srctl fault` — Manual Fault Injection
+
+`srctl fault` provides interactive fault injection for testing MRC
+behavior against fabric failures. Faults are tracked in
+`/dev/shm/srv6-mrc-faults.json` for cleanup. This replaces the legacy
+embedded `faults:` blocks in scenario YAMLs with an explicit,
+stateful CLI workflow.
+
+#### Subcommands
+
+```bash
+# Shutdown interface(s) — bidirectional by default
+srctl fault shutdown <node> <interface> [<interface>...]
+srctl fault shutdown <node> all  # shutdown all interfaces on node
+srctl fault shutdown <node> <interface> --unidirectional  # one side only
+
+# Inject tc/netem (loss, delay, etc.) on host-side veths
+srctl fault netem "<target>" "<spec>"
+
+# Clear faults
+srctl fault clear --all
+srctl fault clear <node>
+srctl fault clear <node> <interface>
+
+# List active faults
+srctl fault list
+srctl fault list -o json
+```
+
+#### Examples
+
+**Test MRC against single EV failure**:
+
+```bash
+# Break EV p0-spine01 (all 8 downlinks to leaves)
+srctl fault shutdown p0-spine01 all
+
+# Run without MRC (expect ~6% loss on affected flows)
+srctl run yellow-ev-spray --duration 5
+
+# Run with MRC (expect 0% loss, 15/16 EVs active, p0-spine01 unused)
+srctl run yellow-mrc-ev-spray --duration 5
+
+# Clean up
+srctl fault clear --all
+```
+
+**Test MRC against partial loss**:
+
+```bash
+# Inject 5% loss on plane 2 of host00
+srctl fault netem "host yellow-host00 plane 2" "loss 5%"
+
+# Run with MRC (expect demote, weight shift away from plane 2)
+srctl run yellow-mrc-baseline --duration 10
+
+# Check active faults
+srctl fault list
+
+# Clean up
+srctl fault clear --all
+```
+
+**Break a specific link**:
+
+```bash
+# Break p0-spine01 ↔ p0-leaf00 link (bidirectional)
+srctl fault shutdown p0-spine01 Ethernet0
+# This also shuts down p0-leaf00:Ethernet4 (the peer)
+
+# Run scenario
+srctl run yellow-all-to-all --duration 30
+
+# Expect: MRC detects + demotes affected EVs, traffic routes around failure
+
+# Clean up
+srctl fault clear p0-spine01
+```
+
+**Asymmetric failure** (unidirectional):
+
+```bash
+# Only shut down spine side, leave leaf side up
+srctl fault shutdown p0-spine01 Ethernet0 --unidirectional
+
+# Asymmetric failures can expose routing or failure-detection edge cases
+```
+
+**Multiple interfaces on one node**:
+
+```bash
+# Shut down two spine downlinks simultaneously
+srctl fault shutdown p1-spine03 Ethernet4 Ethernet8
+
+# Each shutdown is bidirectional by default
+```
+
+#### Fault State Tracking
+
+All faults are persisted to `/dev/shm/srv6-mrc-faults.json`:
+
+```json
+{
+  "version": 1,
+  "faults": [
+    {
+      "id": "fault-001",
+      "type": "shutdown",
+      "targets": [
+        {"node": "p0-spine01", "interface": "Ethernet0"},
+        {"node": "p0-leaf00", "interface": "Ethernet4"}
+      ],
+      "spec": "down",
+      "bidirectional": true,
+      "applied_at": "2024-05-26T10:32:15Z",
+      "applied_by": "srctl fault"
+    }
+  ]
+}
+```
+
+`srctl fault clear` uses this state to restore interfaces. Always run
+`clear --all` between test runs to avoid orphaned faults.
+
+#### netem Target Syntax
+
+netem targets are host-side veths (reuses `srv6_mrc.netem` module):
+
+- `"plane N"` → all host NICs in plane N (32 NICs: 16 green + 16 yellow)
+- `"host NAME"` → all 4 uplinks of one host
+- `"host NAME plane N"` → single NIC (e.g., `yellow-host00:eth3`)
+
+netem spec strings are passed directly to `tc qdisc add ... netem`:
+
+- `"loss 5%"` — random 5% packet loss
+- `"loss 5% 25%"` — Markov-correlated loss (5% base, 25% correlation)
+- `"delay 50ms 10ms 25%"` — mean delay 50ms, jitter 10ms, corr 25%
+- `"delay 50ms loss 1%"` — combined delay + loss
+
+#### Deprecation Note
+
+The old `faults:` block in scenario YAMLs (e.g.,
+`green-mrc-plane-loss.yaml`) is now deprecated. Use `srctl fault`
+for all new testing workflows.
+
 ### MRC architecture (current build)
 
 `health_aware_mrc` is the live MRC policy. It reads weights from an
