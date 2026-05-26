@@ -201,6 +201,24 @@ the `srv6_mrc.topo` ↔ `spray` reference-pairs map in sync.
     11 not locally configured on the peer), so without this the
     peer silently drops every probe at FIB lookup time. Generator
     pins this in `test_ipv6_forwarding_enabled_on_every_yellow_host`.
+15. **One `(::, SPRAY_REPORT_PORT)` bind per host, owned by the
+    MRC daemon.** `Srv6RawTransport.__init__` opens the UDP
+    listener ONLY when `is_sender=True`. The receiver-side
+    transport (constructed by `ReceiverMrcAgent` with
+    `is_sender=False`) MUST NOT open a second bind on the same
+    port — even with SO_REUSEPORT, the kernel hash-steers half
+    the returning stateless probes to whichever socket the hash
+    selects, and the receiver-process socket has no consumer
+    (loss reports are TX-only via `_raw_sockets[plane]`).
+    Symptom of a double-bind: yellow-all-to-all (or any scenario
+    where a host is both sender AND receiver) reports
+    `window_recv=0` on every EV of half the senders → universal
+    `assumed_bad` despite a clean data plane. Same class of bug
+    as the sender-side SO_REUSEPORT cascade resolved in PR #1;
+    the v4 stateless-probes redesign re-exposed it on the
+    receiver path until cycle 14 (2026-05-25) tightened the
+    bind. Tests `ReceiverNoReportListenerTests.*` in
+    `tests/test_mrc_transport.py` pin it.
 
 ## Roadmap
 
@@ -1031,6 +1049,67 @@ Invariants this design adds (do not violate):
 If validation fails (the hand-built runbook can't get a probe
 back to the sender), stop and report. Do not pivot to egress-
 leaf turnaround or any other fallback without user input.
+
+**2026-05-25 — cycle 14: receiver-side SO_REUSEPORT double-bind
+on (::, SPRAY_REPORT_PORT)**:
+Lab validation of `feature/stateless-probes` on 4p-4x8:
+- `yellow-baseline` (data plane): 0% loss, plane-balanced. PASS.
+- `yellow-mrc-ev-spray` (4 sender hosts, 4 different receiver
+  hosts): 0% loss, 16/16 EVs `good` on every flow,
+  `window_recv/window_sent = 1.0`, zero floor suppression. PASS.
+  The v4 design works exactly as intended in the
+  split-sender/receiver scenario; cycle-13's multi-second
+  `reply_age` and ~half-EV floor protection are fully gone.
+- `yellow-all-to-all` (every host both sender and receiver):
+  28.3% aggregate loss, every flow only used 8/16 EVs (planes
+  0+1 starved), per-host EV state distribution split
+  deterministically — half the hosts saw 16 good EVs, the
+  other half saw 8 `assumed_bad` + 8 `unknown` held only by
+  the floor with `total_recv=0` despite `total_sent≈158`.
+  **FAIL.**
+
+Diagnosis (lab subagent):
+- `ss -lnp` on a failing host mid-run showed TWO processes bound
+  to `*:9997`: the sender-process MrcDaemon AND the
+  receiver-process `spray --role recv --mrc`. Both used
+  SO_REUSEPORT (kernel-default for raw IPv6 sockets after the
+  first bind).
+- `Srv6RawTransport.__init__` unconditionally called
+  `_open_udp_listener("::", SPRAY_REPORT_PORT, ...)` regardless
+  of `is_sender`. The receiver path constructed via
+  `ReceiverMrcAgent(...).transport = Srv6RawTransport(
+  is_sender=False)` therefore double-bound the same port.
+- Kernel hash-steered ~half the returning stateless probes to
+  the receiver-process socket, which has no reader (the
+  receiver only TX'es loss reports via per-plane raw sockets;
+  it does not need an RX socket at all). Probes accumulated
+  in the kernel queue while the daemon's dispatcher saw
+  `window_recv=0`.
+- Wire capture confirmed probes WERE round-tripping correctly
+  at the kernel level: `tcpdump -nei eth1` on a "failing" host
+  showed valid 6-slot uSID outer + decapped inner probes
+  arriving. The packets reached the host. They landed in the
+  wrong process's socket.
+
+This is the **same class of bug** as PR #1's sender-side
+SO_REUSEPORT cascade — the same lesson re-learned on the
+receiver path. AGENTS.md "Hard invariant: Never bind
+(::, SPRAY_REPORT_PORT) with SO_REUSEPORT more than once per
+host" applied to senders only; v4's introduction of an
+`is_sender=False` Srv6RawTransport on the receiver path
+violated it silently.
+
+Fix: gate `_open_udp_listener` on `is_sender=True` in
+`Srv6RawTransport.__init__`. Receiver path: `_recv_sock = None`,
+`recv_socket()` raises RuntimeError (no consumer exists).
+Regression tests `ReceiverNoReportListenerTests.*` in
+`tests/test_mrc_transport.py` pin it: receiver's
+`__init__` makes zero `_open_udp_listener` calls; sender's
+makes exactly one. Same commit cleans out the dead v3 vestige
+tests (`FastPathByteIdentityTests`, `_reply_templates`-keyed
+assertions) that referenced the removed `send_probe_reply`
+path. Invariant 15 in the "Hard invariants" section codifies
+the rule.
 
 ### Spurious "orphan flow" report warnings on collective scenarios
 

@@ -124,22 +124,28 @@ class TransportExportsTests(unittest.TestCase):
         self.assertIn("DEFAULT_RCVBUF_BYTES", transport.__all__)
 
 
-# --- Receiver fast-path prewarm + byte-identity regression ----------------
+# --- Receiver-side listener invariants (v4 stateless-probes) -------------
 #
-# These tests run without CAP_NET_RAW by mocking raw-socket constructors.
-# The motivating bug (caught only in lab, 2026-05-23): the receiver-side
-# `Srv6RawTransport(is_sender=False)` calls `_prewarm_reply_templates()`,
-# which calls `build_outer_template(...)` and later `udp6_checksum_inplace(
-# pkt, payload_len=...)`. Two signature/argument errors slipped past the
-# unit suite because no test exercised the full receiver __init__ -> prewarm
-# -> send_probe_reply hot path end-to-end:
-#   1. build_outer_template was called without required `payload_len=` kwarg
-#      -> receiver crashed at startup, every flow reported rx=0.
-#   2. udp6_checksum_inplace was called positionally with
-#      `UDP_HEADER_LEN + payload_len` -> after fixing #1, every reply would
-#      have had a wrong UDP checksum (or crashed on positional-into-kwonly
-#      param). Receivers would drop replies silently.
-# These tests pin the contract so neither bug can return.
+# Stateless-probe v4 (2026-05-25) deleted the receiver-side
+# `_prewarm_reply_templates` / `send_probe_reply` path entirely — the
+# peer host's role in the probe round trip is pure kernel forwarding
+# (see invariants 11-14 in AGENTS.md). The class below replaces the
+# old `ReceiverPrewarmStartupTests` whose `_reply_templates` assertions
+# referenced removed v3 infrastructure.
+#
+# The bug pinned by these tests: `Srv6RawTransport.__init__` used to
+# unconditionally open `(::, SPRAY_REPORT_PORT)` regardless of
+# `is_sender`. On every collective-comm scenario (ring, all-to-all,
+# any future workload) where one host is BOTH sender and receiver,
+# the sender process's `MrcDaemon` already owned that bind; the
+# receiver process's `Srv6RawTransport(is_sender=False)` re-bound
+# the same `(::, SPRAY_REPORT_PORT)` with SO_REUSEPORT, and the
+# kernel hash-steered ~half the returning stateless probes to the
+# receiver-process socket — which had no consumer. EVs went
+# universally to `assumed_bad` with `window_recv=0`. Lab diagnosis
+# 2026-05-25 cycle 14. Fix: gate `_open_udp_listener` on
+# `is_sender=True`.
+
 
 try:
     from scapy.all import IPv6, UDP, Raw  # noqa: F401
@@ -168,44 +174,90 @@ def _close_transport(t: "transport.Srv6RawTransport") -> None:
             s.close()
         except (OSError, AttributeError):
             pass
-    for attr in ("_reply_sock", "_probe_sock"):
-        s = getattr(t, attr, None)
-        if s is not None:
-            try:
-                s.close()
-            except (OSError, AttributeError):
-                pass
+    s = getattr(t, "_recv_sock", None)
+    if s is not None:
+        try:
+            s.close()
+        except (OSError, AttributeError):
+            pass
 
 
 class _FakeUdpListener:
     """Minimal stand-in for `_open_udp_listener` return value.
 
-    `Srv6RawTransport.__init__` stores it in `_probe_sock` / `_reply_sock`
-    and doesn't touch it further until `recv_probe_socket()` /
-    `recv_reply_socket()` is called by the agent. The tests here never
-    call those, so we just need an object that can be closed.
+    Stateless-probe v4: `Srv6RawTransport.__init__` opens ONE listener
+    on (::, SPRAY_REPORT_PORT) for the sender's daemon, and ONLY when
+    `is_sender=True`. Tests below assert that constraint; they never
+    actually read from this socket.
     """
 
     def close(self) -> None:  # pragma: no cover
         pass
 
 
-def _fake_udp_listener(*, bind_addr: str, bind_port: int) -> "_FakeUdpListener":
+def _fake_udp_listener(
+    *, bind_addr: str, bind_port: int,
+    enable_rx_timestamp: bool = False,
+) -> "_FakeUdpListener":
     return _FakeUdpListener()
 
 
-class ReceiverPrewarmStartupTests(unittest.TestCase):
-    """Receiver-side `Srv6RawTransport` must construct without raising.
+class ReceiverNoReportListenerTests(unittest.TestCase):
+    """Receiver-side `Srv6RawTransport(is_sender=False)` MUST NOT open
+    the `(::, SPRAY_REPORT_PORT)` listener.
 
-    Regression for the 2026-05-23 lab crash where every receiver died at
-    `_prewarm_reply_templates` -> `build_outer_template(...)` because the
-    required `payload_len=` kwarg was missing.
+    The MRC daemon (one per host, always `is_sender=True`) is the sole
+    authoritative owner of that bind per AGENTS.md "Hard invariant:
+    Never bind `(::, SPRAY_REPORT_PORT)` with SO_REUSEPORT more than
+    once per host." A double-bind on hosts that are both sender AND
+    receiver (every ring / all-to-all scenario) silently kills the
+    stateless-probe round trip by hash-steering half the returning
+    probes to a socket with no consumer.
+
+    These tests don't need scapy (sender-side prewarm is mocked out
+    via raw-socket-constructor patching, but receiver-side prewarm
+    is GONE in v4 — there's nothing to skip for).
     """
 
-    @unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")
-    def test_receiver_init_populates_reply_template_cache(self) -> None:
-        from srv6_mrc.topo import NUM_LEAVES, NUM_PLANES, NUM_SPINES
+    def _open_calls(self) -> list:
+        """Capture invocations of `_open_udp_listener` for assertion."""
+        return []
 
+    def test_receiver_does_not_open_listener(self) -> None:
+        calls: list = []
+
+        def tracking_listener(**kw):
+            calls.append(kw)
+            return _FakeUdpListener()
+
+        with mock.patch(
+            "srv6_mrc.mrc.transport.open_raw_send_socket",
+            side_effect=_fake_raw_send_socket,
+        ), mock.patch(
+            "srv6_mrc.mrc.transport._open_udp_listener",
+            side_effect=tracking_listener,
+        ):
+            t = transport.Srv6RawTransport(
+                tenant="yellow", my_id=0, is_sender=False,
+            )
+        self.addCleanup(_close_transport, t)
+
+        self.assertEqual(
+            calls, [],
+            "is_sender=False must NOT open a UDP listener — the MRC "
+            "daemon (is_sender=True, one per host) owns that bind. "
+            "See AGENTS.md SO_REUSEPORT cascade gotcha.",
+        )
+        self.assertIsNone(
+            t._recv_sock,
+            "receiver-side transport must have _recv_sock=None",
+        )
+
+    def test_receiver_recv_socket_raises(self) -> None:
+        """Calling `recv_socket()` on a receiver-side transport must
+        raise loudly. Any code path that does so on a receiver is a
+        bug — receivers only emit loss reports via the per-plane raw
+        sockets; they have no inbound demuxed UDP stream."""
         with mock.patch(
             "srv6_mrc.mrc.transport.open_raw_send_socket",
             side_effect=_fake_raw_send_socket,
@@ -214,73 +266,49 @@ class ReceiverPrewarmStartupTests(unittest.TestCase):
             side_effect=_fake_udp_listener,
         ):
             t = transport.Srv6RawTransport(
-                tenant="green", my_id=0, is_sender=False,
+                tenant="yellow", my_id=0, is_sender=False,
             )
         self.addCleanup(_close_transport, t)
 
-        # Eager prewarm built one template per (plane, path, dst_leaf)
-        # excluding self (the receiver doesn't reply to its own probes).
-        expected = NUM_PLANES * NUM_SPINES * (NUM_LEAVES - 1)
-        # Allow >= because the implementation may legitimately include
-        # the self-pair (cost-free, simpler logic); the floor is what
-        # matters — the cache must be non-empty and reasonably sized.
-        self.assertGreaterEqual(
-            len(t._reply_templates),
-            NUM_PLANES * NUM_SPINES,  # at least one peer per (plane,path)
-            f"prewarm cache too small; got {len(t._reply_templates)}",
-        )
-        self.assertLessEqual(
-            len(t._reply_templates),
-            NUM_PLANES * NUM_SPINES * NUM_LEAVES,
-            "prewarm cache larger than full (plane,path,leaf) grid",
-        )
-
-        # Each value is (template_bytes, outer_dst_str). Spot-check
-        # one entry has the right shape.
-        any_key = next(iter(t._reply_templates))
-        tpl, outer_dst = t._reply_templates[any_key]
-        self.assertIsInstance(tpl, bytes)
-        self.assertIsInstance(outer_dst, str)
-        # Minimum byte length: 40 outer + 40 inner + 8 UDP + 28 payload.
-        self.assertEqual(len(tpl), 40 + 40 + 8 + 28)
+        with self.assertRaisesRegex(RuntimeError, "no recv socket"):
+            t.recv_socket()
 
     @unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")
-    def test_sender_init_skips_prewarm(self) -> None:
-        """is_sender=True must NOT pre-warm the REPLY template cache.
+    def test_sender_opens_listener_exactly_once(self) -> None:
+        """is_sender=True opens (::, SPRAY_REPORT_PORT) exactly once.
+        The sender-process MrcDaemon owns this single bind per host."""
+        from srv6_mrc.topo import SPRAY_REPORT_PORT
 
-        Senders only build replies in the rare loss-report echo path;
-        the reply cache stays empty on senders. (As of the 2026-05-24
-        probe-emit fast-path commit, senders DO pre-warm a separate
-        PROBE template cache — see TestSenderProbePrewarm below.)
+        calls: list = []
 
-        Scapy-gated because sender __init__ now invokes
-        `_prewarm_probe_templates`, which calls
-        `build_outer_template` -> scapy.
-        """
+        def tracking_listener(**kw):
+            calls.append(kw)
+            return _FakeUdpListener()
+
         with mock.patch(
             "srv6_mrc.mrc.transport.open_raw_send_socket",
             side_effect=_fake_raw_send_socket,
         ), mock.patch(
             "srv6_mrc.mrc.transport._open_udp_listener",
-            side_effect=_fake_udp_listener,
+            side_effect=tracking_listener,
         ):
             t = transport.Srv6RawTransport(
-                tenant="green", my_id=0, is_sender=True,
+                tenant="yellow", my_id=0, is_sender=True,
             )
         self.addCleanup(_close_transport, t)
-        self.assertEqual(len(t._reply_templates), 0)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["bind_addr"], "::")
+        self.assertEqual(calls[0]["bind_port"], SPRAY_REPORT_PORT)
+        self.assertIsNotNone(t._recv_sock)
+
+
 
 
 class SenderPrewarmStartupTests(unittest.TestCase):
     """Sender-side `Srv6RawTransport` must pre-warm the probe template
-    cache. Mirrors `ReceiverPrewarmStartupTests` for the symmetrical
-    fast-path emit shipped to fix the probe-emit GIL contention
-    diagnosed in the "Universal probe failure" investigation.
-
-    Receiver and sender pre-warms are mutually exclusive: a transport
-    either replies to probes (receiver) or emits probes (sender),
-    never both at once. The OTHER side's cache should be empty so
-    bugs in one role can't be hidden behind the other's logic.
+    cache. Receivers (v4 stateless-probes) have NO template cache at
+    all — their role is loss-report TX only, via `_raw_sockets[plane]`.
     """
 
     @unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")
@@ -295,12 +323,11 @@ class SenderPrewarmStartupTests(unittest.TestCase):
             side_effect=_fake_udp_listener,
         ):
             t = transport.Srv6RawTransport(
-                tenant="green", my_id=0, is_sender=True,
+                tenant="yellow", my_id=0, is_sender=True,
             )
         self.addCleanup(_close_transport, t)
 
-        # Same grid shape as the receiver-side reply pre-warm: one
-        # template per (plane, path, dst_leaf) excluding self.
+        # One template per (plane, path, dst_leaf) excluding self.
         self.assertGreaterEqual(
             len(t._probe_templates),
             NUM_PLANES * NUM_SPINES,
@@ -317,15 +344,21 @@ class SenderPrewarmStartupTests(unittest.TestCase):
         tpl, outer_dst = t._probe_templates[any_key]
         self.assertIsInstance(tpl, bytes)
         self.assertIsInstance(outer_dst, str)
-        # Same payload length as reply (PROBE and PROBE_REPLY share
-        # the 28B struct layout):
-        self.assertEqual(len(tpl), 40 + 40 + 8 + 28)
+        # v4 probe payload = PROBE_PAYLOAD_LEN bytes (10 in current
+        # wire format; size constant validated via the wire-format
+        # tests in test_probe.py).
+        from srv6_mrc.mrc.probe import PROBE_PAYLOAD_LEN
+        self.assertEqual(len(tpl), 40 + 40 + 8 + PROBE_PAYLOAD_LEN)
 
-    @unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")
     def test_receiver_init_has_empty_probe_cache(self) -> None:
         """Receivers don't emit probes; the probe cache must stay
         empty so a stray sender-side codepath running on a receiver
-        crashes loudly instead of silently using a stale template."""
+        crashes loudly instead of silently using a stale template.
+
+        Not scapy-gated: `_prewarm_probe_templates` is only called
+        on the sender path (gated by `if is_sender:` at line 208
+        of transport.py), so the receiver init never imports scapy.
+        """
         with mock.patch(
             "srv6_mrc.mrc.transport.open_raw_send_socket",
             side_effect=_fake_raw_send_socket,
@@ -334,7 +367,7 @@ class SenderPrewarmStartupTests(unittest.TestCase):
             side_effect=_fake_udp_listener,
         ):
             t = transport.Srv6RawTransport(
-                tenant="green", my_id=0, is_sender=False,
+                tenant="yellow", my_id=0, is_sender=False,
             )
         self.addCleanup(_close_transport, t)
         self.assertEqual(len(t._probe_templates), 0)
@@ -342,10 +375,9 @@ class SenderPrewarmStartupTests(unittest.TestCase):
 
 class TransportStatsTests(unittest.TestCase):
     """`MrcTransport.stats()` is the public diagnostic surface for
-    fast-path miss counters. Consumed by `MrcDaemon._publish_all_snapshots`
-    so per-host jq diagnostics can spot template-cache holes without
-    code changes / log scraping. See AGENTS.md "Universal probe
-    failure" investigation log.
+    the probe fast-path miss counter. Consumed by
+    `MrcDaemon._publish_all_snapshots` so per-host jq diagnostics
+    can spot template-cache holes without code changes / log scraping.
     """
 
     def test_base_class_default_returns_empty_dict(self) -> None:
@@ -360,8 +392,9 @@ class TransportStatsTests(unittest.TestCase):
 
     @unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")
     def test_srv6_raw_transport_exposes_fast_path_misses(self) -> None:
-        """`Srv6RawTransport.stats()` exposes both probe + reply
-        fast-path miss counters; both should be 0 at construction."""
+        """`Srv6RawTransport.stats()` exposes the probe fast-path
+        miss counter; it should be 0 at construction. (v4 removed
+        the reply-side counter along with `send_probe_reply`.)"""
         with mock.patch(
             "srv6_mrc.mrc.transport.open_raw_send_socket",
             side_effect=_fake_raw_send_socket,
@@ -370,18 +403,16 @@ class TransportStatsTests(unittest.TestCase):
             side_effect=_fake_udp_listener,
         ):
             t = transport.Srv6RawTransport(
-                tenant="green", my_id=0, is_sender=True,
+                tenant="yellow", my_id=0, is_sender=True,
             )
         self.addCleanup(_close_transport, t)
         stats = t.stats()
         self.assertEqual(stats["probe_fast_path_misses"], 0)
-        self.assertEqual(stats["reply_fast_path_misses"], 0)
 
-        # Forcing a cache miss increments the right counter.
+        # Forcing a cache miss increments the counter.
         t._probe_templates.clear()
         t._probe_fast_path_misses += 1  # simulate one miss
         self.assertEqual(t.stats()["probe_fast_path_misses"], 1)
-        self.assertEqual(t.stats()["reply_fast_path_misses"], 0)
 
 
 @unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")
@@ -414,7 +445,7 @@ class ProbeFastPathByteIdentityTests(unittest.TestCase):
             side_effect=_fake_udp_listener,
         ):
             t = transport.Srv6RawTransport(
-                tenant="green", my_id=0, is_sender=True,
+                tenant="yellow", my_id=0, is_sender=True,
             )
             self.addCleanup(_close_transport, t)
 
@@ -465,106 +496,12 @@ class ProbeFastPathByteIdentityTests(unittest.TestCase):
         )
 
 
-@unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")
-class FastPathByteIdentityTests(unittest.TestCase):
-    """`send_probe_reply` fast path produces bytes identical to scapy.
-
-    Regression for the 2026-05-23 lab bug where `udp6_checksum_inplace`
-    was called positionally with `UDP_HEADER_LEN + payload_len` instead
-    of keyword `payload_len=payload_len`. Two ways wrong:
-      - positional into a `*, payload_len` kw-only param -> TypeError;
-      - even if it had taken the value, the inflated length would
-        write a wrong UDP6 pseudo-header length, producing a wrong
-        checksum that the receiver's kernel would drop silently.
-
-    The only honest oracle for "is the checksum right" is byte-identity
-    against the scapy slow path (`_send_encapped` -> `build_outer_packet`).
-    We mock the raw socket's `.sendto` to capture the bytes both paths
-    produce for the same (plane, path, dst_leaf, payload) and assert
-    equality.
-    """
-
-    def test_fast_path_bytes_match_slow_path_for_sample(self) -> None:
-        # Sample inputs: pick the middle of the grid so any off-by-one
-        # in (plane, path, dst_leaf) handling would be visible.
-        plane = 1
-        path = 2
-        dst_leaf = 3
-        # 28-byte payload — the real PROBE_REPLY size, also exercises
-        # the actual production length for the checksum math.
-        payload = bytes(range(28))
-
-        with mock.patch(
-            "srv6_mrc.mrc.transport.open_raw_send_socket",
-            side_effect=_fake_raw_send_socket,
-        ), mock.patch(
-            "srv6_mrc.mrc.transport._open_udp_listener",
-            side_effect=_fake_udp_listener,
-        ):
-            t = transport.Srv6RawTransport(
-                tenant="green", my_id=0, is_sender=False,
-            )
-            self.addCleanup(_close_transport, t)
-
-            # --- Slow path: scapy via _send_encapped ---
-            # Force a cache miss by clearing the prewarmed entry, then
-            # capture the bytes that the scapy slow path produces.
-            cache_key = (plane, path, dst_leaf)
-            self.assertIn(
-                cache_key, t._reply_templates,
-                "prewarm should have built this template",
-            )
-            saved_template = t._reply_templates.pop(cache_key)
-
-            slow_bytes: list[bytes] = []
-            slow_dst: list = []
-
-            def slow_sendto(buf, dst):
-                slow_bytes.append(bytes(buf))
-                slow_dst.append(dst)
-
-            t._raw_sockets[plane].sendto = slow_sendto  # type: ignore[assignment]
-            t.send_probe_reply(
-                plane=plane, path=path, dst_leaf=dst_leaf, payload=payload,
-            )
-            self.assertEqual(
-                len(slow_bytes), 1,
-                "scapy fallback should have sent exactly one packet",
-            )
-
-            # --- Fast path: template splice + udp6_checksum_inplace ---
-            # Restore the cached template and re-send.
-            t._reply_templates[cache_key] = saved_template
-            fast_bytes: list[bytes] = []
-            fast_dst: list = []
-
-            def fast_sendto(buf, dst):
-                fast_bytes.append(bytes(buf))
-                fast_dst.append(dst)
-
-            t._raw_sockets[plane].sendto = fast_sendto  # type: ignore[assignment]
-            t.send_probe_reply(
-                plane=plane, path=path, dst_leaf=dst_leaf, payload=payload,
-            )
-            self.assertEqual(
-                len(fast_bytes), 1,
-                "fast path should have sent exactly one packet",
-            )
-
-        # The two paths must produce byte-identical packets.
-        self.assertEqual(
-            fast_bytes[0], slow_bytes[0],
-            "fast-path bytes diverge from scapy slow-path bytes — "
-            "likely a header field or UDP6 checksum bug",
-        )
-        # And the same destination tuple.
-        self.assertEqual(fast_dst[0], slow_dst[0])
-
-        # Fast path must NOT have incremented the miss counter.
-        self.assertEqual(
-            t._fast_path_misses, 1,
-            "exactly one miss expected (the deliberate pop above)",
-        )
+# (Removed in v4 stateless-probes: FastPathByteIdentityTests used to
+# pin `send_probe_reply` byte-identity against scapy. v4 deleted
+# `send_probe_reply` and `_reply_templates` entirely — the receiver's
+# role in the probe round trip is now pure kernel forwarding, no
+# reply emission. `ProbeFastPathByteIdentityTests` above still pins
+# byte-identity for the surviving `send_probe` fast path.)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -191,9 +191,26 @@ class Srv6RawTransport(MrcTransport):
         # loss reports from peers (magic 0xA7). Bind to `::` so kernel-
         # decap'd inner packets reach us regardless of which per-EV /128
         # the probe was directed at.
-        self._recv_sock: Optional[socket.socket] = _open_udp_listener(
-            bind_addr="::", bind_port=SPRAY_REPORT_PORT,
-            enable_rx_timestamp=True,
+        #
+        # **Receiver-side (`is_sender=False`) MUST NOT open this listener.**
+        # On a host that is both sender AND receiver (every collective-
+        # comm scenario: ring, all-to-all), the sender-process daemon
+        # already owns the (::, SPRAY_REPORT_PORT) socket; a second bind
+        # from the receiver-process transport with SO_REUSEPORT causes
+        # the kernel to hash-steer ~half the returning stateless probes
+        # to the receiver's socket, which has no consumer — the probes
+        # accumulate in the kernel queue while the daemon's dispatcher
+        # sees `window_recv=0` and demotes every EV to assumed_bad.
+        # This is the same class of bug as PR #1's SO_REUSEPORT cascade
+        # on the sender side. See AGENTS.md "Hard invariant: Never bind
+        # (::, SPRAY_REPORT_PORT) with SO_REUSEPORT more than once per
+        # host." Receiver path needs no recv socket — `send_loss_report`
+        # writes through `_raw_sockets[plane]` only.
+        self._recv_sock: Optional[socket.socket] = (
+            _open_udp_listener(
+                bind_addr="::", bind_port=SPRAY_REPORT_PORT,
+                enable_rx_timestamp=True,
+            ) if is_sender else None
         )
 
         # Probe-template cache: per (plane, path, dst_leaf). Outer DA
