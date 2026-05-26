@@ -853,6 +853,37 @@ remaining live EVs cluster on a couple of planes by chance.
     = 560 scapy builds/sec/host, the emit threads are GIL-bound
     and `mrc-reply-rx` is starved.
 
+- **2026-05-26 cycle 16**: receiver-side ceiling + policy-specific cost
+  separated via rate-sweep experiment. User ran manual matrix on
+  `yellow-all-to-all` (4p-4x8, 56 flows × 30s) with varying rate and policy:
+  - **ev_spray**: 20pps/50pps/60pps/70pps all **0% loss**; 80pps first sign
+    of loss (~2.5% max); 100pps ~21% loss. Pins receiver-side processing
+    ceiling at **~70pps × 56 flows = 3920 packets/host inbound**. This is
+    a genuine fabric/host processing limit, independent of policy.
+  - **mrc_snapshot**: 1pps/5pps/10pps all ~18-22% loss; **100pps ~69% loss**.
+    At 10pps × 56 = 560 packets/host (7× below ev_spray's clean ceiling),
+    yet still 22% lossy. **Policy adds a separate, additive cost** on top
+    of whatever receiver-side ceiling exists.
+  Root cause for policy cost: `MrcSnapshot.pick_ev` rebuilt `flat` list
+  (16 floats) + CDF tuple on every packet (lines 603-614 in `policy.py`).
+  At 100pps × 56 flows = ~700 picks/s/host, the per-packet allocation +
+  `_build_cdf` call was 3-5% of per-host CPU on alpine-on-docker-sonic-vs.
+  Plus GIL contention: sender pacing thread + daemon's probe-emit thread +
+  daemon's reply-RX thread + snapshot refresh thread — all fighting the
+  GIL across 8 Python processes per host (7 sender procs + 1 daemon).
+  Fix in `0dfe48c`: cache CDF keyed by `(id(wgrid), spines)`. CDF now
+  built once per (wgrid, spines) pair instead of once per packet. Cache
+  invalidated on every wgrid swap so stale CDFs never survive a weight
+  update. pick_ev hot path: zero allocations, just dict lookup + int arith.
+  Memory: bounded by flow count × wgrid refresh cadence (negligible).
+  Tests: new `TestCDFCache` pins cache population + invalidation contracts;
+  full suite 564/564 pass. **Pending lab confirmation** at `mrc_snapshot @
+  100pps` — if loss drops from 69% to ~21% (matching ev_spray @ same rate),
+  the per-pick CDF rebuild was the answer. If it doesn't move, GIL
+  contention from daemon threads is the binding constraint and the next
+  move is daemon-side: reduce probe interval or batch probe emits into
+  fewer wake-ups.
+
 **Resolved sub-bugs (kept for the trail)**:
 - `200465f`: fast-path probe reply via byte template + manual UDP6
   checksum. Replaces scapy in `Srv6RawTransport.send_probe_reply`.
