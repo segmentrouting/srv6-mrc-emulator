@@ -1,6 +1,15 @@
 # yellow-mrc-plane-latency.yaml — 10ms latency on plane 3,
 # health_aware_mrc, yellow tenant.
 #
+# DEPRECATED: This scenario uses embedded faults: blocks. Use the new
+# srctl fault injection workflow instead:
+#
+#   srctl fault netem "host yellow-host00 plane 3" "delay 10ms"
+#   srctl run yellow-mrc-baseline --duration 10
+#   srctl fault clear --all
+#
+# See AGENTS.md "srctl fault" section for full documentation.
+#
 # Yellow counterpart to green-mrc-plane-latency.yaml. Same design
 # question: does the EV state machine react to latency alone? Same
 # answer: it does not, by current design. MRC consumes loss + probe
