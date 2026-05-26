@@ -28,7 +28,10 @@ flows:
 
 faults: []
 
-mrc: {}
+mrc: 
+  probe_interval_ms: 500          
+  loss_threshold: 0.25
+  loss_demote_consecutive: 3
 
 report:
   out: results/green-all-to-all.json

@@ -69,6 +69,8 @@ faults: []
 # checks, or batched RX with non-blocking drain) is needed.
 mrc:
   probe_timeout_ms: 300
-
+  probe_interval_ms: 500        
+  loss_threshold: 0.25
+  loss_demote_consecutive: 3
 report:
   out: results/yellow-all-to-all.json
