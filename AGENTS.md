@@ -30,6 +30,50 @@ Tenants:
   `2001:db8:cccc:<NN>::2` on all 4 NICs and on `lo` (`nodad`). Mirrors
   green's anycast plan with `bbbb`→`cccc` (Phase 1a).
 
+## Interface naming and topology structure
+
+### Containerlab ↔ SONiC interface mapping
+
+Docker-sonic-vs uses `Ethernet0, Ethernet4, Ethernet8, ...` (increments
+of 4). Containerlab uses `eth1, eth2, eth3, ...` (starting at 1).
+
+**Mapping formula**: `clab eth{N}` → `SONiC Ethernet{(N-1)*4}`
+
+Examples:
+- `eth1` → `Ethernet0`
+- `eth2` → `Ethernet4`
+- `eth9` → `Ethernet32` (leaf downlink to green host)
+- `eth10` → `Ethernet36` (leaf downlink to yellow host)
+
+### Physical topology (4p-4x8)
+
+**Spine connections** (NO direct host connections):
+- `eth1..eth8` → downlinks to 8 leaves within the plane
+- `p0-spine00:eth1` (Ethernet0) ↔ `p0-leaf00:eth1` (Ethernet0)
+- `p0-spine00:eth2` (Ethernet4) ↔ `p0-leaf01:eth1` (Ethernet0)
+- ...
+- `p0-spine00:eth8` (Ethernet28) ↔ `p0-leaf07:eth1` (Ethernet0)
+
+**Leaf connections**:
+- `eth1..eth4` → uplinks to 4 spines (one per plane)
+  - `p0-leaf00:eth1` (Ethernet0) → `p0-spine00`
+  - `p0-leaf00:eth2` (Ethernet4) → `p0-spine01`
+  - `p0-leaf00:eth3` (Ethernet8) → `p0-spine02`
+  - `p0-leaf00:eth4` (Ethernet12) → `p0-spine03`
+- `eth9` (Ethernet32) → green host downlink (in `Vrf-green`)
+- `eth10` (Ethernet36) → yellow host downlink (default VRF)
+
+**Host connections**:
+- `eth1..eth4` → one uplink per plane to corresponding leaf
+  - `green-host00:eth1` → `p0-leaf00:eth9` (plane 0)
+  - `green-host00:eth2` → `p1-leaf00:eth9` (plane 1)
+  - `green-host00:eth3` → `p2-leaf00:eth9` (plane 2)
+  - `green-host00:eth4` → `p3-leaf00:eth9` (plane 3)
+
+All link information is in `topologies/<topo>/topology.clab.yaml` under
+the `links:` section with `endpoints: ["node-a:ethN", "node-b:ethM"]`
+format.
+
 ## Repo layout
 
 ```
