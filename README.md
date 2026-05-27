@@ -1,7 +1,7 @@
 # srv6-mrc-emulator
 
 A topology and traffic generator tool for simulating Multipath Reliable Connection
-(MRC) layered on top of a static SRv6 uSID dataplane. This tool is intended to give engineers 
+(MRC) over an SRv6 uSID dataplane. This tool is intended to give engineers 
 and operators a feel for the multiplanar network design, uSID allocation scheme, host-based
 SRv6 encapsulation and decapsulation operations, and the packet spraying patterns described in 
 the work published by OpenAI, Microsoft, AMD, Broadcom, and Nvidia here:
@@ -16,8 +16,9 @@ simulating hosts.
 The reference topology is a **4-plane × 4-spine × 8-leaf Clos** carrying
 two tenants (`green`, `yellow`) with 8 *hosts* each. 
 
-This repository also includes a topology 
-generator tool so additional topologies can be added under `topologies/<name>/`.
+## Quickstart
+
+[Quickstart](./docs/quickstart.md): Guide to install, deploy and configure a topology, and run MRC-SRv6 traffic simulations
 
 ## Key Elements
 
@@ -50,9 +51,8 @@ generator tool so additional topologies can be added under `topologies/<name>/`.
   performs its own *host-decap* via linux `seg6local End.DT6` policies. 
   For more information see [Multi-Tenant Design Doc](./docs/design-multi-tenant.md)
 
-## Quickstart
-
-[Quickstart](./docs/quickstart.md): Guide to install, deploy and configure a topology, and run MRC-SRv6 traffic simulations
+This repository also includes a topology 
+generator tool so additional topologies can be added under `topologies/<name>/`.
 
 For more detail see design docs under [docs/](./docs/)
 
@@ -119,6 +119,7 @@ results/               scenario JSON output (gitignored)
 ## Requires
 - containerlab
 - docker-sonic-vs: tested with Branch Master docker-sonic-vs.gz from [SONiC Dowloads](https://sonic.software/) site.
+- Alpine SRv6 docker image *`bmcdougall/alpine-srv6-scapy:1.0`*
 - at least 16 vCPU and 32GB of memory (tested with 32 vCPU and 96GB memory)
 
 ## License

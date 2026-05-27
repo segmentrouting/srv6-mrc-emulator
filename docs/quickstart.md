@@ -25,12 +25,12 @@ cd ./srv6-mrc-emulator
 
 4. Pull custom alpine docker image (image has linux SRv6 and has Scapy installed to support the MRC traffic emulation scripts)
 ```bash
-docker pull iejalapeno/alpine-srv6-scapy:1.0 
+docker pull bmcdougall/alpine-srv6-scapy:1.0 
 ```
 
 5. Tag the image for local deployment
 ```bash
-docker tag iejalapeno/alpine-srv6-scapy:1.0 alpine-srv6-scapy:1.0 
+docker tag bmcdougall/alpine-srv6-scapy:1.0 alpine-srv6-scapy:1.0 
 ```
 
 ### Make (deploy, config, host-routes)
