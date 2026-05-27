@@ -28,7 +28,7 @@ cd ./srv6-mrc-emulator
 docker pull iejalapeno/alpine-srv6-scapy:1.0 
 ```
 
-5. Tag the image:
+5. Tag the image for local deployment
 ```bash
 docker tag iejalapeno/alpine-srv6-scapy:1.0 alpine-srv6-scapy:1.0 
 ```
@@ -45,7 +45,7 @@ docker tag iejalapeno/alpine-srv6-scapy:1.0 alpine-srv6-scapy:1.0
 make deploy
 ```
 
-Equivalent to:
+Alternatively you can run the traditional `clab deploy`:
 ```bash
 sudo clab deploy -t topologies/4p-4x8/topology.clab.yaml
 ```
@@ -55,12 +55,12 @@ Other topologies can be deployed (and configured, etc.) by specifying TOPO=<topo
 make TOPO=2p-4x8 deploy 
 ```
 
-3. Run `make config` to apply sonic *`config_db.json`* and *`frr.conf`* configs to each device (under `topologies/4p-4x8/config/`)
+2. Run `make config` to apply sonic *`config_db.json`* and *`frr.conf`* configs to each device (under `topologies/4p-4x8/config/`)
 ```bash
 make config
 ```
 
-Equivalent to:
+Alternatively you can run the `config.sh` shell script:
 ```bash
 scripts/config.sh all
 ```
@@ -81,7 +81,7 @@ It will take a minute or two for the script to fully configure the fabric nodes
 Configuration complete!
 ```
 
-4. Optional: install Green and Yellow Tenant Host Routes (useful for verifying paths/fabric-connectivity, etc.)
+3. Optional: install Green and Yellow Tenant Host Routes (useful for verifying paths/fabric-connectivity, etc.)
 ```bash
 make host-routes
 ```

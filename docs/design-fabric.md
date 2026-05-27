@@ -2,11 +2,11 @@
 
 A SRv6 (uSID) lab built on top of `docker-sonic-vs` +
 Containerlab. Models a small slice of a hyperscale AI backend fabric: 4
-independent network planes, each a 4 × 8 Clos (or 8 x 16), with multi-homed tenant
-hosts uplinked into every plane.
+independent network planes, each a **4 × 8 Clos** (with larger 8 × 16 variant
+available), with multi-homed tenant hosts uplinked into every plane.
 
 
-- **48 SONiC switches** (16 spines + 32 leaves)
+- **48 SONiC switches** (16 spines + 32 leaves) in the default 4p-4x8 topology
 - **16 Alpine hosts** (8 green + 8 yellow), each with 4 NIC uplinks
 - **No BGP, no IGP** — every transit FIB entry is a static route or an SRv6 uA
   SID; the controller installs end-to-end SR policies for tenant traffic.

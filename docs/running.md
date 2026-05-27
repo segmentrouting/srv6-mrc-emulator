@@ -45,12 +45,11 @@ docker exec <host> tc qdisc del dev <nic> root
 ## Bundled scenarios
 
 All scenarios live in `topologies/4p-4x8/scenarios/` for the default
-4p-4x8 topology (and `topologies/4p-8x16/scenarios/` for the full-
-scale reference design — the path differs but the scenario names are
-identical). They split into
-five families based on what part of the system they exercise; the
-"Spray policy" column is the key axis (it picks how packets fan out;
-everything else is window-dressing on top).
+4p-4x8 topology (and `topologies/4p-8x16/scenarios/` for the larger-
+scale variant — the path differs but the scenario names are identical).
+They split into five families based on what part of the system they
+exercise; the "Spray policy" column is the key axis (it picks how packets
+fan out; everything else is window-dressing on top).
 
 Quick-pick guide:
 
@@ -123,7 +122,7 @@ The `ev_spray` policy varies BOTH plane and spine per packet — every
 packet gets a new outer SID rotation, so a single flow walks `4 * N`
 distinct leaf-to-spine paths (entropy values, EVs) where `N` is
 `paths_per_plane`. Default `N = NUM_SPINES` (4 on the default 4p-4x8
-topology, 8 on the full-scale 4p-8x16 reference design).
+topology, 8 on the larger 4p-8x16 variant).
 
 Two ways to enable it:
 

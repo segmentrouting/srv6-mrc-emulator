@@ -202,12 +202,13 @@ over plain UDP/SRv6.
 
 **1. EV Probes (active, OCP-faithful).** Every `probe_interval_ms` the
 sender emits one `PROBE` packet per `(tenant, plane, path)` EV — i.e.
-`NUM_PLANES × NUM_SPINES` probes per round on the 4p-8x16 lab (32
-probes/round). Each probe is built via `srv6_mrc.encap.build_outer_packet`
-and emitted on a plane-bound raw socket — the same code path the
-EV-spray data plane uses. The receiver echoes a `PROBE_REPLY`
-immediately, on the same `(plane, path)` the inbound PROBE arrived on.
-Sender measures RTT.
+`NUM_PLANES × NUM_SPINES` probes per round. On the default 4p-4x8 topology
+this is 16 probes/round (4 planes × 4 spines); on the larger 4p-8x16 variant
+it's 32 probes/round (4 planes × 8 spines). Each probe is built via
+`srv6_mrc.encap.build_outer_packet` and emitted on a plane-bound raw socket
+— the same code path the EV-spray data plane uses. The receiver echoes a
+`PROBE_REPLY` immediately, on the same `(plane, path)` the inbound PROBE
+arrived on. Sender measures RTT.
 
 - `probe_fail_threshold` consecutive timeouts (no reply within
   `probe_timeout_ms`) → plane transitions to `ASSUMED_BAD`.
@@ -439,11 +440,11 @@ It does **not** speak to SONiC at all. Everything MRC-level is host-side.
 | `srv6_mrc/encap.py` (shared raw-socket outer-packet builder) | done |
 | `srv6_mrc/netem.py` | done |
 | `srv6_mrc/mrc/run.py` orchestrator (CLI: `run-scenario`) | done |
-| `topologies/4p-8x16/scenarios/green-mrc-baseline.yaml` (smoke test) | done |
-| `topologies/4p-8x16/scenarios/yellow-baseline.yaml` (smoke; also in 2p-4x8) | done |
-| `topologies/4p-8x16/scenarios/green-mrc-plane-{loss,latency}.yaml` | done, **lab-validated** |
-| `topologies/4p-8x16/scenarios/yellow-mrc-plane-{loss,latency}.yaml` | done, lab-validated |
-| `topologies/4p-8x16/scenarios/{green,yellow}-mrc-ev-spray.yaml` (Phase 1b step 2) | done, lab-validated |
+| `topologies/4p-4x8/scenarios/green-mrc-baseline.yaml` (smoke test) | done |
+| `topologies/4p-4x8/scenarios/yellow-baseline.yaml` (smoke; also in 2p-4x8) | done |
+| `topologies/4p-4x8/scenarios/green-mrc-plane-{loss,latency}.yaml` | done, **lab-validated** (deprecated - use srctl fault) |
+| `topologies/4p-4x8/scenarios/yellow-mrc-plane-{loss,latency}.yaml` | done, lab-validated (deprecated - use srctl fault) |
+| `topologies/4p-4x8/scenarios/{green,yellow}-mrc-ev-spray.yaml` (Phase 1b step 2) | done, lab-validated |
 | `srv6_mrc/mrc/ev_state.py` EVStateTable + state machine | done |
 | `srv6_mrc/mrc/probe.py` PROBE / PROBE_REPLY / LOSS_REPORT wire format | done |
 | `srv6_mrc/policy.py` `health_aware_mrc` wired to EVStateTable | done |
