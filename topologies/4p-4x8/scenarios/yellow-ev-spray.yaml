@@ -1,23 +1,35 @@
-# yellow-ev-spray.yaml — yellow tenant EV-spray, full fan-out.
+# yellow-ev-spray.yaml — full EV fan-out test for yellow tenant
 #
-# Yellow analogue of green-ev-spray.yaml. Same per-packet outer-DA
-# rotation across 4 planes * paths_per_plane spines, but on the yellow
-# tenant — which means each packet's outer SID list has TWO uSIDs
-# (leaf-up `f<S>` + leaf->host `e009`) instead of green's one. This
-# scenario doubles as a regression check that the per-packet spine
-# rotation in the runner correctly rebuilds the SECOND uSID position
-# from `usid_outer_dst("yellow", ...)` on every packet, not just the
-# first.
+# Purpose: Test per-packet outer-DA rotation across all spines (full EV grid)
+#
+# Policy: ev_spray (rotates BOTH plane and spine per packet)
+# EVs used: 16 (4 planes × 4 spines)
+# Paths per plane: 4 (explicit)
+#
+# This is the yellow counterpart to green-ev-spray.yaml. Key differences
+# from yellow-baseline:
+#   - Uses all 16 EVs instead of just 4
+#   - Tests that per-packet spine rotation works correctly
+#   - Validates runner rebuilds outer SID list on every packet
+#   - Regression check: yellow's extra `e009` hop survives per-packet rotation
+#
+# Yellow tenant specifics:
+#   - Outer SID list has TWO variable hextets: `f<S>` (spine) + `e009` (host hop)
+#   - Each packet's `f<S>` rotates (0→1→2→3), `e009` stays constant
+#   - More complex wire format than green (which only has one variable hextet)
+#
+# Use this scenario to:
+#   - Validate full EV data-path works on yellow tenant
+#   - Test per-packet SID list rebuild logic
+#   - Verify outer DA construction for yellow's extra hop
 #
 # What to look for:
-#   - per_plane_sent:  balanced (round-robin still rotates planes
-#                      fastest).
-#   - per_ev_sent:     balanced across all 16 (plane, spine) keys.
-#   - On the wire:     outer DA's `f<S>` hextet rotates packet-by-
-#                      packet, `e009` host-hop stays constant.
+#   - per_plane_sent: balanced across 4 planes (~25% each)
+#   - per_ev_sent: balanced across all 16 (plane, spine) pairs (~6.25% each)
+#   - On wire: outer DA's `f<S>` hextet rotates packet-by-packet
 #
-# Run:
-#   sudo make scenario SCEN=yellow-ev-spray
+# Compare to yellow-baseline: that scenario uses only 4 EVs (round_robin)
+# for quick smoke testing; this uses all 16 EVs for full data-path validation.
 name: yellow-ev-spray
 description: |
   Yellow tenant EV-spray over 4 spines * 4 planes (16 EVs per pair).

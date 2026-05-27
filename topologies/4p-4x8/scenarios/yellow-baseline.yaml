@@ -1,28 +1,25 @@
-# yellow-baseline.yaml — clean fabric, round-robin spray across 4 planes,
-# yellow tenant.
+# yellow-baseline.yaml — minimal smoke test for yellow tenant
 #
-# Counterpart to green-mrc-baseline.yaml (with policy=round_robin instead
-# of health_aware_mrc) and to the 4p-8x16 yellow-baseline scenario.
-# Yellow exercises a meaningfully different data path: decap happens on
-# the destination *host* via a per-NIC `seg6local End.DT6 table 0`
-# policy (installed by `make host-routes`). Phase 1a: yellow mirrors
-# green's anycast addressing exactly with `bbbb`->`cccc` — the inner DA
-# is anycast `2001:db8:cccc:<NN>::2`, configured `nodad` on all 4 NICs
-# *and* on `lo`. The address-plan symmetry means the only remaining
-# tenant-distinguishing feature on the wire is the SID list: yellow's
-# outer DA carries one extra segment compared to green (the host-decap
-# SID `...:d001::`).
+# Purpose: Quick sanity check that yellow tenant works correctly
 #
-# Prerequisites:
-#   make host-routes   # installs the per-NIC End.DT6 policies on yellow hosts
+# Policy: round_robin (rotates across 4 planes only, one spine per plane)
+# EVs used: 4 (one per plane)
+# Paths per plane: 1 (default)
 #
-# Run:
-#   make scenario SCEN=yellow-baseline
+# Yellow exercises a different data path than green:
+#   - Decap happens on the destination *host* via per-NIC `seg6local End.DT6`
+#   - Outer SID list has one extra hop (`e009` leaf→host) compared to green
+#   - Inner dst is anycast `2001:db8:cccc:<NN>::2` on all 4 NICs + lo
 #
-# Expected: behavior comparable to green baseline -- near-zero loss,
-# balanced per-plane counts. Reorder may differ slightly because the
-# extra decap stage runs in software on each yellow host (not in
-# kernel-fastpath through Vrf-green's connected route as in green).
+# Use this scenario to:
+#   - Verify yellow tenant basic functionality (host-side End.DT6 decap works)
+#   - Quick regression test after fabric/routing changes
+#   - Validate yellow wire format is correct
+#
+# Compare to yellow-ev-spray: that scenario tests full 16-EV fan-out and
+# per-packet spine rotation; this tests basic 4-plane round-robin only.
+#
+# Expected: near-zero loss, balanced per-plane counts (each ~25%)
 name: yellow-baseline
 description: |
   All 4 planes healthy, round-robin spray over the well-known yellow

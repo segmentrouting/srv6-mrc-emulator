@@ -1,19 +1,38 @@
-# green-ev-spray.yaml — EV-spray: vary BOTH plane and spine per packet.
+# green-ev-spray.yaml — full EV fan-out test without MRC
 #
-# Phase 1b step 1 baseline (no MRC). Each packet's outer DA rotates
-# through 4 planes * paths_per_plane spines = 4 * paths_per_plane EVs.
-# On 4p-4x8 with paths_per_plane=4 (the default = NUM_SPINES), this
-# fans out across all 16 leaf-spine paths.
+# Purpose: Validate per-packet outer-DA rotation across all spines
+#
+# Policy: ev_spray (rotates BOTH plane and spine per packet)
+# EVs used: 16 (4 planes × 4 spines)
+# Paths per plane: 4 (explicit)
+# MRC enabled: no (pure data-path test, no probes or health awareness)
+#
+# This tests the EV-spray data-path in isolation. Each packet gets a unique
+# outer SID list, walking through all 16 (plane, spine) combinations. This
+# validates the runner's per-packet SID list construction without the
+# complexity of MRC probes and health state.
+#
+# Use this scenario to:
+#   - Test EV-spray data-path works correctly
+#   - Validate per-packet outer-DA rotation logic
+#   - Quick regression for SID list construction
+#   - Baseline for green-mrc-ev-spray (same data-path, adds MRC)
+#
+# Green tenant specifics:
+#   - Leaf-decap via `End.DT6` into `Vrf-green`
+#   - Outer DA has one variable hextet: `f<S>` (spine id)
+#   - Simpler than yellow (no extra `e009` hop)
 #
 # What to look for:
-#   - per_plane_sent: balanced (round-robin still rotates planes fastest)
-#   - per_ev_sent:    balanced across all (plane, spine) keys
-#   - On the wire:    outer DA's `f<S>` hextet rotates packet-by-packet;
-#                     tcpdump on a leaf eth1..eth4 shows multiple
-#                     `fc00:000X:f00Y:...` values with Y ranging 0..3.
+#   - per_plane_sent: balanced across 4 planes (~25% each)
+#   - per_ev_sent: balanced across all 16 EVs (~6.25% each)
+#   - On wire: outer DA's `f<S>` hextet rotates (0→1→2→3) packet-by-packet
+#   - tcpdump on leaf eth1..eth4: see `fc00:000X:f00Y:...` with Y=0..3
 #
-# Run:
-#   sudo make scenario SCEN=green-ev-spray
+# Compare to:
+#   - green-baseline: uses MRC with 4 EVs (one per plane)
+#   - green-mrc-ev-spray: same 16-EV fan-out but with MRC enabled
+#   - yellow-ev-spray: same test pattern but for yellow tenant (extra hop)
 name: green-ev-spray
 description: |
   EV-spray across 4 spines * 4 planes (16 EVs per pair). Validates the

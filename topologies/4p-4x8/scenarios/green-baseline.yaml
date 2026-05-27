@@ -1,4 +1,4 @@
-# green-mrc-baseline.yaml — MRC smoke test with clean fabric (4p-8x16)
+# green-baseline.yaml — MRC smoke test with clean fabric
 #
 # Purpose: Verify MRC functionality works correctly on healthy fabric
 #
@@ -6,15 +6,14 @@
 # EVs used: 4 (one per plane, implied by health_aware_mrc default behavior)
 # MRC enabled: yes (probes + loss feedback active)
 #
-# This is the green tenant MRC sanity check on the larger 4p-8x16 topology.
-# All 4 planes are healthy, so:
+# This is the green tenant MRC sanity check. All 4 planes are healthy, so:
 #   - All EVs should stay in GOOD state
 #   - Traffic should distribute evenly across 4 planes (~25% each)
 #   - Probes should show 0% loss and healthy RTT
 #   - Behavior should match round_robin (since all planes are equally healthy)
 #
 # Use this scenario to:
-#   - Verify MRC control plane works at scale (8 spines per plane)
+#   - Verify MRC control plane works (probes + loss reports functioning)
 #   - Quick regression test after MRC code changes
 #   - Validate green tenant with MRC enabled on clean fabric
 #   - Baseline for comparing against fault scenarios
@@ -30,18 +29,15 @@
 #   - 0% loss, healthy probe RTT
 #
 # Compare to:
-#   - green-ev-spray: tests full 32-EV fan-out without MRC
-#   - green-mrc-ev-spray: tests MRC with full 32-EV fan-out
-#   - 4p-4x8 green-baseline: same test on smaller topology (4 spines)
-
-name: green-mrc-baseline
+#   - green-ev-spray: tests full 16-EV fan-out without MRC
+#   - green-mrc-ev-spray: tests MRC with full 16-EV fan-out
+#   - yellow-baseline: same test pattern but for yellow tenant (no MRC)
+name: green-baseline
 description: |
-  All 4 planes healthy, health_aware_mrc spray over 8 green leaf pairs.
-  Probes and loss reports are exchanged but should not influence the
-  weights — sanity check that enabling MRC is a no-op on a clean fabric.
+  All 4 planes healthy, EV spray over 4 green leaf pairs.
 
 flows:
-  - pairs: green-pairs-8
+  - pairs: green-pairs
     policy: health_aware_mrc
     rate: 500pps
     duration: 5s
