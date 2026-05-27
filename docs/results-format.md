@@ -6,7 +6,7 @@ by `run-scenario --report <path>` (a.k.a.
 there are gitignored by convention — they're test artifacts, not
 source.
 
-For *how* to produce these reports, see `running.md`. For the
+For *how* to produce these reports, see `mrc-scenario-appendix.md`. For the
 underlying per-flow record schema, see `design-mrc.md`.
 
 ## ASCII summary
