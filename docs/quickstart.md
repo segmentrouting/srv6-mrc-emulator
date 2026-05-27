@@ -224,21 +224,28 @@ PLANE  PATH  EV     SID
 srctl run --list
 ```
 
-Partial output
+>[!Note]
+> Use mrc and non-mrc options with a fault in the network to see how probes/mrc logic 
+> causes the transmitting host to deprecate the faulted EV and rebalance traffic 
+> around the fault. Non-mrc mode will simply blackhole a percentage of traffic.
+
+Example output
 ```bash
 $ srctl run --list
 green-all-to-all         # models all-to-all collective for tenant green
 green-allreduce-ring     # models all-reduce collective ring for tenant green
+green-baseline           # basic traffic gen smoke test - 4 hosts communicate as pairs over SRv6 fabric
+green-ev-spray           # basic traffic spray smoke test - 4 hosts communicate as pairs, traffic sprayed across all EVs
 green-mrc-baseline       # a generic 'pairs' traffic pattern with MRC probes to establish base functionality
-green-mrc-ev-spray       # EV packet spray between pairs of hosts and with MRC probes enabled
-green-ev-spray           # Same as the above but without probes. Use mrc and non-mrc options with a fault in the network to see how probes/mrc logic causes the transmitting host to deprecate the faulted EV and rebalance traffic around the fault. Non-mrc mode will simply blackhole a percentage of traffic
+green-mrc-ev-spray       # Same as the above `ev-spray` but with MRC probes enabled. 
 
 # yellow tenant versions of the above
 yellow-all-to-all
 yellow-allreduce-ring
+yellow-baseline
+yellow-ev-spray
 yellow-mrc-baseline
 yellow-mrc-ev-spray
-yellow-ev-spray
 ```
 
 2. Run a traffic scenario:
