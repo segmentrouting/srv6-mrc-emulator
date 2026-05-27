@@ -7,8 +7,8 @@
 #   host00 -> host01
 #   host01 -> host02
 #   ...
-#   host14 -> host15
-#   host15 -> host00      (ring wraps)
+#   host06 -> host07
+#   host07 -> host00      (ring wraps)
 #
 # Real all-reduce is 2(N-1) such steps — reduce-scatter (N-1 steps)
 # followed by all-gather (N-1 steps) — with the "interesting chunk"
@@ -30,11 +30,11 @@
 #     fabric carries N*B bytes total per step.
 #
 # What to look for:
-#   - per_plane_sent: balanced; 16 flows * 32 EVs = 512 EV cells active
-#     across the fabric, plenty of entropy.
-#   - per leaf eth1..eth4: should see roughly 16/16 = 1 flow's worth of
+#   - per_plane_sent: balanced; 8 flows * 16 EVs = 128 EV cells active
+#     across the fabric, good entropy.
+#   - per leaf eth1..eth4: should see roughly 8/8 = 1 flow's worth of
 #     egress + 1 flow's worth of ingress (ring is balanced by design).
-#   - With MRC: a port shutdown affects ~2 of the 16 flows (those whose
+#   - With MRC: a port shutdown affects ~1-2 of the 8 flows (those whose
 #     spine-hash subset includes the broken (plane, spine) cell).
 #
 # Run:
@@ -42,7 +42,7 @@
 
 name: yellow-allreduce-ring
 description: |
-  NCCL-style ring all-reduce (yellow tenant): 16 hosts, 16 concurrent
+  NCCL-style ring all-reduce (yellow tenant): 8 hosts, 8 concurrent
   flows, each host sending to its right neighbor at 100 pps.
   Models one step of a bandwidth-optimal ring all-reduce — the dominant
   pattern in production AI training.

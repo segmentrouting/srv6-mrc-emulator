@@ -1,6 +1,6 @@
 # green-all-to-all.yaml — green tenant all-to-all collective.
 #
-# Green counterpart of yellow-all-to-all.yaml. Same 240-flow collective
+# Green counterpart of yellow-all-to-all.yaml. Same 56-flow collective
 # pattern but on green's simpler one-uSID outer (leaf-decap End.DT6)
 # data path. Use this as the cleaner baseline when debugging all-to-all
 # behavior end-to-end — if green is clean and yellow shows issues, the
@@ -14,8 +14,8 @@
 
 name: green-all-to-all
 description: |
-  Green tenant all-to-all collective: 16 hosts, 240 ordered flows
-  running concurrently at 20 pps each. Companion to yellow-all-to-all
+  Green tenant all-to-all collective: 8 hosts, 56 ordered flows (8*7)
+  running concurrently at 10 pps each. Companion to yellow-all-to-all
   on the simpler green leaf-decap data path.
 
 paths_per_plane: 4

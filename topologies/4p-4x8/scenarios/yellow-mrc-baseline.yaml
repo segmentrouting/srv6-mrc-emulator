@@ -30,10 +30,10 @@
 
 name: yellow-mrc-baseline
 description: |
-  All 4 planes healthy, health_aware_mrc spray over 8 yellow leaf pairs.
+  All 4 planes healthy, health_aware_mrc spray over 4 yellow leaf pairs.
   Yellow data path uses inner anycast cccc:<NN>::2 + host-side End.DT6
   decap onto lo. Sanity check that enabling MRC is a no-op on a clean
-  fabric for the yellow tenant, and that the Phase 1a step 3 collapsed
+  fabric for the yellow tenant, and that the collapsed
   rx socket sees probes arriving via the host-side decap.
 
 flows:

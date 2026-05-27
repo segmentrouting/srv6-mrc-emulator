@@ -1,6 +1,6 @@
-# green-allreduce-ring.yaml — NCCL-style ring all-reduce step (green).
+# green-allreduce-ring.yaml — NCCL-style ring all-reduce step 
 #
-# Green counterpart of yellow-allreduce-ring.yaml. Same 16-flow
+# Green counterpart of yellow-allreduce-ring.yaml. Same 8-flow
 # unidirectional ring pattern on green's leaf-decap data path. See
 # yellow-allreduce-ring.yaml for the full description of the pattern
 # and what to look for.
@@ -10,7 +10,7 @@
 
 name: green-allreduce-ring
 description: |
-  NCCL-style ring all-reduce (green tenant): 16 hosts, 16 concurrent
+  NCCL-style ring all-reduce (green tenant): 8 hosts, 8 concurrent
   flows, each host sending to its right neighbor at 100 pps.
   Companion to yellow-allreduce-ring on the simpler green leaf-decap
   data path.

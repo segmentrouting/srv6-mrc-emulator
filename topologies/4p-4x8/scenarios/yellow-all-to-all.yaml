@@ -2,29 +2,29 @@
 #
 # Emulates an AI all-to-all collective communication pattern: every host
 # in the tenant sends a flow to every other host, all running
-# concurrently. With 16 hosts that's 16*15 = 240 unidirectional flows,
-# every host both sending 15 streams and receiving 15 streams.
+# concurrently. With 8 hosts that's 8*7 = 56 unidirectional flows,
+# every host both sending 7 streams and receiving 7 streams.
 #
-# At 20 pps per flow the aggregate is 4.8 kpps across the fabric;
+# At 10 pps per flow the aggregate is 560 pps across the fabric;
 # docker-sonic-vs handles this comfortably and the receivers don't get
-# CPU-bound. Bump to 50 pps / 12 kpps once you've confirmed the testbed
+# CPU-bound. Bump to 20 pps / 1.1 kpps once you've confirmed the testbed
 # is happy.
 #
 # What to look for:
-#   - per_plane_sent: very balanced; the 32 EVs per pair * 240 pairs
-#     gives huge entropy across the fabric, so plane skew should be
-#     well under 1%.
-#   - per receiver: 15 concurrent senders converging on one leaf's
+#   - per_plane_sent: very balanced; the 16 EVs per pair * 56 pairs
+#     gives good entropy across the fabric, so plane skew should be
+#     well under 5%.
+#   - per receiver: 7 concurrent senders converging on one leaf's
 #     downlink. This is the "incast" condition real all-to-all workloads
 #     hit; queue tension and small loss bursts are expected at higher
 #     rates.
 #   - With MRC enabled (health_aware_mrc): a single port shutdown
-#     anywhere should affect ~30 of the 240 flows (every flow that
+#     anywhere should affect ~7-14 of the 56 flows (every flow that
 #     passes through that (plane, spine) cell). Each of those flows
 #     should independently converge on weight=0 for the broken EV.
 #
-# Failure injection (manual): same recipe as yellow-mrc-ev-spray —
-#   `docker exec p<P>-spine<S> config interface shutdown Ethernet<port>`
+# Failure injection: use srctl fault commands —
+#   `srctl fault shutdown p<P>-spine<S> Ethernet<port>`
 # breaks EV (plane=P, path=S) for every flow that hashes through it.
 #
 # Run:
@@ -32,10 +32,10 @@
 
 name: yellow-all-to-all
 description: |
-  Yellow tenant all-to-all collective: 16 hosts, 240 ordered flows
-  running concurrently at 20 pps each. Emulates the most fabric-stressful
-  AI collective pattern; every host both sends 15 streams and receives
-  15 streams (incast at every leaf downlink).
+  Yellow tenant all-to-all collective: 8 hosts, 56 ordered flows (8*7)
+  running concurrently at 10 pps each. Emulates the most fabric-stressful
+  AI collective pattern; every host both sends 7 streams and receives
+  7 streams (incast at every leaf downlink).
 
 paths_per_plane: 4
 
@@ -49,15 +49,13 @@ flows:
 faults: []
 
 # probe_timeout_ms bumped from the default 100ms to 300ms specifically
-# for all-to-all because at 56-sender scale the agent's reply RX loop
+# for all-to-all because at larger scale the agent's reply RX loop
 # (one Python thread under the GIL, processing both probe replies AND
-# loss reports for ~9000 pps fan-in) cannot keep up with the default
+# loss reports for high fan-in) may not keep up with the default
 # timeout. Replies arrive at the kernel socket on time but the user-
-# space loop is slow enough that the parallel sweep thread (cadence =
-# probe_interval_ms = 200ms) marks 3 consecutive probes as timed-out
-# before the RX loop drains them, demoting the EV to assumed_bad. The
-# wire shows clean bidirectional probe + reply traffic on every plane;
-# the demotes are an agent-side timing race, not a fabric problem.
+# space loop can be slow enough that the parallel sweep thread (cadence =
+# probe_interval_ms = 500ms) marks consecutive probes as timed-out
+# before the RX loop drains them, demoting the EV to assumed_bad.
 #
 # 300ms is a safety margin (3x the default) that should comfortably
 # cover RX-loop latency while still detecting real failed paths within
