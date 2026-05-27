@@ -14,7 +14,7 @@ The **docker-sonic-vs** is pretty lightweight and takes up only 160MB of memory.
 
 2. Install Containerlab: https://containerlab.dev/install/
 
-3. Clone this repo
+3. Clone this repo and cd into the top level directory
 ```bash
 git clone https://github.com/segmentrouting/srv6-mrc-emulator.git
 ```
@@ -23,27 +23,33 @@ git clone https://github.com/segmentrouting/srv6-mrc-emulator.git
 cd ./srv6-mrc-emulator
 ```
 
-### Make (image, deploy, config, host-routes)
+4. Pull custom alpine docker image (image has linux SRv6 and has Scapy installed to support the MRC traffic emulation scripts)
+```bash
+docker pull iejalapeno/alpine-srv6-scapy:1.0 
+```
+
+5. Tag the image:
+```bash
+docker tag iejalapeno/alpine-srv6-scapy:1.0 alpine-srv6-scapy:1.0 
+```
+
+### Make (deploy, config, host-routes)
 
 >[!Note]
-> the `make` commands in the following section default to the 4-plane 8x16 spine-leaf topology. If you wish to work with another topology use `make TOPO=<topology-directory-name> deploy/config/etc.`
+> the `make` commands in the following section default to the 4-plane 4x8 spine-leaf topology. If you wish to work with another topology use `make TOPO=<topology-directory-name> deploy/config/etc.`
 > Example `make TOPO=2p-4x8 deploy` will deploy the smaller 2-plane 4x8 spine-leaf topology
 
-1. Build the Alpine-srv6-scapy docker image for our simulated hosts
-```bash
-make image
-# equivalent to:
-docker build -f host-image/Dockerfile \
-             --build-arg TOPO=topologies/4p-4x8/topo.yaml \
-             -t alpine-srv6-scapy:1.0 .
-```
 
-2. Deploy the topology
+1. Deploy the topology
 ```bash
 make deploy
-# equivalent to:
+```
+
+Equivalent to:
+```bash
 sudo clab deploy -t topologies/4p-4x8/topology.clab.yaml
 ```
+
 Other topologies can be deployed (and configured, etc.) by specifying TOPO=<topology>
 ```bash
 make TOPO=2p-4x8 deploy 
@@ -52,12 +58,14 @@ make TOPO=2p-4x8 deploy
 3. Run `make config` to apply sonic *`config_db.json`* and *`frr.conf`* configs to each device (under `topologies/4p-4x8/config/`)
 ```bash
 make config
-# equivalent to:
+```
+
+Equivalent to:
+```bash
 scripts/config.sh all
 ```
 
-It will take a minute or two for the script to run through the
-fabric routers (48 on the default 4p-4x8, 96 on 4p-8x16)
+It will take a minute or two for the script to fully configure the fabric nodes
 
 ```bash
 ============================================================
@@ -73,7 +81,7 @@ fabric routers (48 on the default 4p-4x8, 96 on 4p-8x16)
 Configuration complete!
 ```
 
-4. Install Green and Yellow Tenant Host Routes (useful for verifying paths/fabric-connectivity, etc.)
+4. Optional: install Green and Yellow Tenant Host Routes (useful for verifying paths/fabric-connectivity, etc.)
 ```bash
 make host-routes
 ```
@@ -157,6 +165,23 @@ srctl --help
 ```
 
 ```bash
+$ srctl -h
+usage: srctl [-h] {get,run,fault} ...
+
+SRv6 fabric emulator control CLI
+
+positional arguments:
+  {get,run,fault}
+    get            inspect topology / hosts / EVs
+    run            execute a traffic scenario by name (or --list)
+    fault          inject/clear/list faults in the fabric
+
+options:
+  -h, --help       show this help message and exit
+```
+
+
+```bash
 srctl get {topology,hosts,evs}
 ```
 
@@ -176,7 +201,7 @@ PLANE  PATH  EV     SID
 
 ### srctl run - running MRC traffic scenarios:
 
-1. List available scenarios for the active topology:
+1. List available traffic scenarios for the active topology:
 ```bash
 srctl run --list
 ```
@@ -187,15 +212,18 @@ $ srctl run --list
 green-all-to-all         # models all-to-all collective for tenant green
 green-allreduce-ring     # models all-reduce collective ring for tenant green
 green-mrc-baseline       # a generic 'pairs' traffic pattern with MRC probes to establish base functionality
-green-mrc-ev-spray       # full path EV packet spray without 
+green-mrc-ev-spray       # EV packet spray between pairs of hosts and with MRC probes enabled
+green-ev-spray           # Same as the above but without probes. Use mrc and non-mrc options with a fault in the network to see how probes/mrc logic causes the transmitting host to deprecate the faulted EV and rebalance traffic around the fault. Non-mrc mode will simply blackhole a percentage of traffic
 
+# yellow tenant versions of the above
 yellow-all-to-all
 yellow-allreduce-ring
 yellow-mrc-baseline
 yellow-mrc-ev-spray
+yellow-ev-spray
 ```
 
-2. Run one (just the scenario stem name, no .yaml):
+2. Run a traffic scenario:
 ```bash
 srctl run yellow-mrc-baseline
 ```
@@ -227,12 +255,10 @@ docker exec -it p2-spine01 tcpdump -ni Ethernet20
 # etc
 ```
 
-### MRC traffic re-balance on failure
+### srctl 'fault' and MRC traffic re-balance on failure
 
-To see MRC rebalance on probe failure, shutdown a fabric interface prior to or while running one of the **mrc** scenarios:
+To see MRC rebalance on probe failure, run one of the `srctl fault` operations prior to or while running one of the **mrc** scenarios:
 
->[!Note]
-> docker-sonic-vs loses its interface ipv6 address after the shutdown procedure below. Until we have a workaround it is recommended to document the interface ip so you can re-add it after bringing the interface back up. Sorry about that.
 
 1. Shutdown an interface - this example should produce a rebalance of the host00 to host15 flow away from the `plane-1-spine00` EV path
 ```bash
