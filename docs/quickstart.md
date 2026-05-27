@@ -12,9 +12,36 @@ The **docker-sonic-vs** is pretty lightweight and takes up only 160MB of memory.
 
 1. Download a **docker-sonic-vs** image that supports SRv6 uSID shift-and-forward. The `Branch Master` version on the public sonic downloads page works well: [docker-sonic-vs.gz](https://artprodcus3.artifacts.visualstudio.com/Af91412a5-a906-4990-9d7c-f697b81fc04d/be1b070f-be15-4154-aade-b1d3bfb17054/_apis/artifact/cGlwZWxpbmVhcnRpZmFjdDovL21zc29uaWMvcHJvamVjdElkL2JlMWIwNzBmLWJlMTUtNDE1NC1hYWRlLWIxZDNiZmIxNzA1NC9idWlsZElkLzExMTc1MDIvYXJ0aWZhY3ROYW1lL3NvbmljLWJ1aWxkaW1hZ2UudnM1/content?format=file&subpath=/target/docker-sonic-vs.gz)
 
-2. Install Containerlab: https://containerlab.dev/install/
+2. Load the docker-sonic-vs image:
+```bash
+docker load -i docker-sonic-vs.gz
+```
 
-3. Clone this repo and cd into the top level directory
+3. Pull custom alpine docker image (image has linux SRv6 and has Scapy installed to support the MRC traffic emulation scripts)
+```bash
+docker pull bmcdougall/alpine-srv6-scapy:1.0 
+```
+
+4. Tag the image for local deployment
+```bash
+docker tag bmcdougall/alpine-srv6-scapy:1.0 alpine-srv6-scapy:1.0 
+```
+
+5. Optional: verify images
+```bash
+docker images
+```
+```bash
+cisco@topology-host:~/images$ docker images
+REPOSITORY                     TAG       IMAGE ID       CREATED         SIZE
+bmcdougall/alpine-srv6-scapy   1.0       e94cbf733792   21 hours ago    102MB
+alpine-srv6-scapy              1.0       e94cbf733792   21 hours ago    102MB
+docker-sonic-vs                latest    ebfc27f6b246   13 days ago     815MB
+```
+
+6. Install Containerlab: https://containerlab.dev/install/
+
+7. Clone this repo and cd into the top level directory
 ```bash
 git clone https://github.com/segmentrouting/srv6-mrc-emulator.git
 ```
@@ -23,20 +50,11 @@ git clone https://github.com/segmentrouting/srv6-mrc-emulator.git
 cd ./srv6-mrc-emulator
 ```
 
-4. Pull custom alpine docker image (image has linux SRv6 and has Scapy installed to support the MRC traffic emulation scripts)
-```bash
-docker pull bmcdougall/alpine-srv6-scapy:1.0 
-```
-
-5. Tag the image for local deployment
-```bash
-docker tag bmcdougall/alpine-srv6-scapy:1.0 alpine-srv6-scapy:1.0 
-```
-
 ### Make (deploy, config, host-routes)
 
 >[!Note]
-> the `make` commands in the following section default to the 4-plane 4x8 spine-leaf topology. If you wish to work with another topology use `make TOPO=<topology-directory-name> deploy/config/etc.`
+> the `make` commands in the following section default to the 4-plane 4x8 spine-leaf topology. 
+> If you wish to work with another topology use `make TOPO=<topology-directory-name> deploy/config/etc.`
 > Example `make TOPO=2p-4x8 deploy` will deploy the smaller 2-plane 4x8 spine-leaf topology
 
 
@@ -114,12 +132,12 @@ listening on Ethernet32, link-type EN10MB (Ethernet), snapshot length 262144 byt
 3. You can tcpdump along the entire path by following the uSID encapsulation pattern.
 
 ```
-fc00:0:f003:e006:d000::
+fc00:0:f003:e007:d000::
 └──┬──┘└┬──┘└┬──┘└┬──┘
-   │    │    │    └──── d000  : tenant-ID green leaf07 uDT Ethernet32
-   │    │    └───────── e007  : spine03 uA Ethernet28 toward leaf07
-   │    └────────────── f003  : leaf00 uA Ethernet8 toward spine03 
-   └─────────────────── 0000  : plane 0 block
+   │    │    │    └──── d000     : tenant-ID green leaf07 uDT Ethernet32
+   │    │    └───────── e007     : spine03 uA Ethernet28 toward leaf07
+   │    └────────────── f003     : leaf00 uA Ethernet8 toward spine03 
+   └─────────────────── fc00:0:  : plane 0 block
 ```
    
 ```bash
