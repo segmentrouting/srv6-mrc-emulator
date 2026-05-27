@@ -28,12 +28,12 @@ set +e
 
 SCOPE="${1:-all}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TOPO_DIR="${TOPO_DIR:-$REPO_ROOT/topologies/4p-8x16}"
+TOPO_DIR="${TOPO_DIR:-$REPO_ROOT/topologies/4p-4x8}"
 CONFIGS_DIR="$TOPO_DIR/config"
 TOPO_YAML="$TOPO_DIR/topo.yaml"
 
 TOPOLOGY_NAME="$(grep -m1 '^name:' "$TOPO_DIR/topology.clab.yaml" 2>/dev/null | awk '{print $2}' | tr -d '\r')"
-TOPOLOGY_NAME="${TOPOLOGY_NAME:-sonic-docker-4p-8x16}"
+TOPOLOGY_NAME="${TOPOLOGY_NAME:-sonic-docker-4p-4x8}"
 
 # Read NUM_PLANES/SPINES/LEAVES from topo.yaml. Lightweight grep avoids
 # a python dep on the lab host for just three integers.
@@ -41,8 +41,8 @@ NUM_PLANES="$(grep -m1 '^planes:' "$TOPO_YAML" 2>/dev/null | awk '{print $2}')"
 NUM_SPINES="$(grep -m1 '^spines_per_plane:' "$TOPO_YAML" 2>/dev/null | awk '{print $2}')"
 NUM_LEAVES="$(grep -m1 '^leaves_per_plane:' "$TOPO_YAML" 2>/dev/null | awk '{print $2}')"
 NUM_PLANES="${NUM_PLANES:-4}"
-NUM_SPINES="${NUM_SPINES:-8}"
-NUM_LEAVES="${NUM_LEAVES:-16}"
+NUM_SPINES="${NUM_SPINES:-4}"
+NUM_LEAVES="${NUM_LEAVES:-8}"
 
 LEAF_NODES=""
 for p in $(seq 0 $((NUM_PLANES - 1))); do
