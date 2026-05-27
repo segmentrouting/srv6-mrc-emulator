@@ -1,22 +1,10 @@
 # green-baseline.yaml — MRC smoke test with clean fabric
 #
-# Purpose: Verify MRC functionality works correctly on healthy fabric
-#
-# Policy: health_aware_mrc (MRC-aware, uses EV health state)
-# EVs used: 4 (one per plane, implied by health_aware_mrc default behavior)
-# MRC enabled: yes (probes + loss feedback active)
-#
 # This is the green tenant MRC sanity check. All 4 planes are healthy, so:
 #   - All EVs should stay in GOOD state
 #   - Traffic should distribute evenly across 4 planes (~25% each)
 #   - Probes should show 0% loss and healthy RTT
 #   - Behavior should match round_robin (since all planes are equally healthy)
-#
-# Use this scenario to:
-#   - Verify MRC control plane works (probes + loss reports functioning)
-#   - Quick regression test after MRC code changes
-#   - Validate green tenant with MRC enabled on clean fabric
-#   - Baseline for comparing against fault scenarios
 #
 # Green tenant specifics:
 #   - Leaf-decap via `End.DT6` into `Vrf-green`
@@ -38,7 +26,7 @@ description: |
 
 flows:
   - pairs: green-pairs
-    policy: health_aware_mrc
+    policy: round_robin
     rate: 500pps
     duration: 5s
 

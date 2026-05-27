@@ -7,15 +7,6 @@
 # report fusion that demotes individual (plane, path) cells of the
 # EVStateTable rather than collapsing to whole-plane verdicts.
 #
-# Why we need it (vs yellow-mrc-baseline.yaml):
-#   yellow-mrc-baseline runs MRC but without paths_per_plane, so the
-#   policy effectively spreads across 4 EVs (one per plane). A single
-#   broken leaf-spine link looks like "100% loss on the affected plane"
-#   and the plane-coarse machinery already in place would have handled
-#   it. This scenario sets paths_per_plane: 4 so a broken link maps to
-#   exactly 1/16 of the EVs and the policy must demote that one cell
-#   while keeping the other 3 EVs on the same plane in service.
-#
 # What to look for:
 #   * `mrc.ev_table.tenants.yellow`: pre-failure, all 16 cells in
 #     state=good (or unknown for the first window). Post-failure, the

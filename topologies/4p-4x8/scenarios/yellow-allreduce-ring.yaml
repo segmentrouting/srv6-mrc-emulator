@@ -1,4 +1,4 @@
-# yellow-allreduce-ring.yaml — NCCL-style ring all-reduce step (yellow).
+# yellow-allreduce-ring.yaml
 #
 # Emulates one step of NCCL's ring all-reduce, the dominant collective
 # pattern in production AI training. Each of the N hosts sends
@@ -12,9 +12,9 @@
 #
 # Real all-reduce is 2(N-1) such steps — reduce-scatter (N-1 steps)
 # followed by all-gather (N-1 steps) — with the "interesting chunk"
-# rotated around the ring each step. We model one step with sustained
+# rotated around the ring each step. The simulator models one step with sustained
 # traffic, which captures the per-link load characteristic without the
-# multi-step orchestration overhead. The wire pattern is what matters
+# multi-step orchestration overhead. The SRv6 spraywire pattern is what matters
 # for fabric/MRC behavior; the application-level reduction is opaque.
 #
 # Why this is interesting:

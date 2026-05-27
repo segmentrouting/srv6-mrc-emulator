@@ -2,10 +2,7 @@
 #
 # Green counterpart of yellow-all-to-all.yaml. Same 56-flow collective
 # pattern but on green's simpler one-uSID outer (leaf-decap End.DT6)
-# data path. Use this as the cleaner baseline when debugging all-to-all
-# behavior end-to-end — if green is clean and yellow shows issues, the
-# bug is in the host-side decap / 2-uSID outer; if both show the same
-# pattern, the bug is in the data plane or MRC.
+# data path.
 #
 # What to look for: identical to yellow-all-to-all.yaml.
 #

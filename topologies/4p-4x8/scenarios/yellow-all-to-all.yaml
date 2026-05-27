@@ -5,11 +5,6 @@
 # concurrently. With 8 hosts that's 8*7 = 56 unidirectional flows,
 # every host both sending 7 streams and receiving 7 streams.
 #
-# At 10 pps per flow the aggregate is 560 pps across the fabric;
-# docker-sonic-vs handles this comfortably and the receivers don't get
-# CPU-bound. Bump to 20 pps / 1.1 kpps once you've confirmed the testbed
-# is happy.
-#
 # What to look for:
 #   - per_plane_sent: very balanced; the 16 EVs per pair * 56 pairs
 #     gives good entropy across the fabric, so plane skew should be
@@ -21,10 +16,10 @@
 #   - With MRC enabled (health_aware_mrc): a single port shutdown
 #     anywhere should affect ~7-14 of the 56 flows (every flow that
 #     passes through that (plane, spine) cell). Each of those flows
-#     should independently converge on weight=0 for the broken EV.
+#     should independently rebalance away from the broken EV.
 #
 # Failure injection: use srctl fault commands —
-#   `srctl fault shutdown p<P>-spine<S> Ethernet<port>`
+#   `srctl fault shutdown p<P>-spine<S> sEthernet<port>`
 # breaks EV (plane=P, path=S) for every flow that hashes through it.
 #
 # Run:

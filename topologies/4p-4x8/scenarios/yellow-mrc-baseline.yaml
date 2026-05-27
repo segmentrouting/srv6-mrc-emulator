@@ -8,23 +8,6 @@
 # the per-plane NIC; this scenario is the lab path that exercises that
 # decap geometry under MRC.
 #
-# What this verifies above and beyond green-mrc-baseline:
-#   * The receiver MRC agent's collapsed rx socket (Phase 1a step 3,
-#     bound to (::, SPRAY_PROBE_PORT) with no SO_BINDTODEVICE) actually
-#     receives probes that arrive via the host's seg6local End.DT6 decap
-#     onto lo. A NIC-bound rx socket would silently miss them; this
-#     scenario fails fast if the collapse regressed.
-#   * Plane attribution (which the receiver derives from probe payload
-#     `plane_id` rather than ingress NIC under the collapsed model)
-#     produces the same uniform-spray steady state as green's leaf-decap
-#     path.
-#
-# Expected: per-plane sent within a few percent of uniform, ~0% loss,
-# all 4 planes in `state=good` weight=0.25 in the EV-state snapshot.
-#
-# Prerequisites:
-#   make host-routes   # installs host-side End.DT6 policies on yellow hosts
-#
 # Run:
 #   make scenario SCEN=yellow-mrc-baseline
 

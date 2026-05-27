@@ -1,4 +1,4 @@
-# green-allreduce-ring.yaml — NCCL-style ring all-reduce step 
+# green-allreduce-ring.yaml — NCCL-style ring all-reduce 
 #
 # Green counterpart of yellow-allreduce-ring.yaml. Same 8-flow
 # unidirectional ring pattern on green's leaf-decap data path. See

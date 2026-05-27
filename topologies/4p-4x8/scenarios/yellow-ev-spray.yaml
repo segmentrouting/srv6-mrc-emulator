@@ -4,7 +4,6 @@
 #
 # Policy: ev_spray (rotates BOTH plane and spine per packet)
 # EVs used: 16 (4 planes × 4 spines)
-# Paths per plane: 4 (explicit)
 #
 # This is the yellow counterpart to green-ev-spray.yaml. Key differences
 # from yellow-baseline:
@@ -28,8 +27,9 @@
 #   - per_ev_sent: balanced across all 16 (plane, spine) pairs (~6.25% each)
 #   - On wire: outer DA's `f<S>` hextet rotates packet-by-packet
 #
-# Compare to yellow-baseline: that scenario uses only 4 EVs (round_robin)
-# for quick smoke testing; this uses all 16 EVs for full data-path validation.
+# Policy: ev_spray (rotates BOTH plane and spine per packet), but does not include MRC probes)
+# A fault during ev_spray will not be detected (no MRC probes), resulting in packet loss
+# over one or more EVs
 name: yellow-ev-spray
 description: |
   Yellow tenant EV-spray over 4 spines * 4 planes (16 EVs per pair).

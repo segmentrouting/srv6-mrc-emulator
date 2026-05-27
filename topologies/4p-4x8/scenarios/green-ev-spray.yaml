@@ -1,4 +1,4 @@
-# green-ev-spray.yaml — full EV fan-out test without MRC
+# green-ev-spray.yaml — full EV fan-out test without MRC probes
 #
 # Purpose: Validate per-packet outer-DA rotation across all spines
 #

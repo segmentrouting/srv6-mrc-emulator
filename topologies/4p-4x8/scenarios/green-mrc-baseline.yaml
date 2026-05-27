@@ -10,6 +10,12 @@
 # Compare against baseline.yaml: per-plane counts should be within a
 # few percent, loss should be ~0, reorder should match baseline.
 #
+# Use this scenario to:
+#   - Verify MRC control plane works (probes + loss reports functioning)
+#   - Quick regression test after MRC code changes
+#   - Validate green tenant with MRC enabled on clean fabric
+#   - Baseline for comparing against fault scenarios
+#
 # Run:
 #   python3 -m srv6_mrc.mrc.run \
 #       topologies/4p-8x16/scenarios/green-mrc-baseline.yaml --verbose
