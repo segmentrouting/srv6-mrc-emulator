@@ -37,8 +37,8 @@ generator tool so additional topologies can be added under `topologies/<name>/`.
   - `srctl get topology` — show fabric dimensions and tenants
   - `srctl get hosts [--tenant green|yellow]` — list hosts
   - `srctl get evs <src> <dst>` — show available EVs for a host pair
-  - `srctl run <scenario>` — execute traffic scenarios (baseline, all-to-all, etc.)
-  - `srctl fault shutdown <node> <interface>` — inject interface failures
+  - `srctl run <scenario>` — execute traffic simulations (baseline, all-to-all, all-reduce, etc.)
+  - `srctl fault shutdown <node> <interface>` — inject interface or node failures
   - `srctl fault netem "<target>" "<spec>"` — inject loss/delay with tc netem
   - `srctl fault list` — show active faults
   - `srctl fault clear --all` — restore fabric state
@@ -48,6 +48,7 @@ generator tool so additional topologies can be added under `topologies/<name>/`.
   configured on all 4 of the host's NICs) simulating multi-plane 
   breakout. The Yellow tenant receives SRv6 encapsulated traffic and 
   performs its own *host-decap* via linux `seg6local End.DT6` policies. 
+  For more information see [Multi-Tenant Design Doc](./docs/design-multi-tenant.md)
 
 ## Quickstart
 
