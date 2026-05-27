@@ -1,13 +1,13 @@
 # Live visibility / Grafana dashboard — design
 
-Status: **design only, no implementation yet**. Skeleton lives under
-`contrib/visibility-poc/`. This document is the authoritative target
-for that skeleton; the next agent should be able to read this end-to-
-end and start filling in `scraper/scraper.py` without making any more
-architectural decisions.
+Status: **PR 1 complete (scraper implemented and tested). PR 2 in progress (integration).**
 
-Companion to the "Roadmap > Live visibility / Grafana dashboard
-(planned)" section of `AGENTS.md`. When the two disagree, AGENTS.md
+Implementation lives under `visibility/`. This document is the authoritative
+design reference. See `visibility/README.md` for implementation status and
+quick start.
+
+Companion to the "Roadmap > Live visibility / Grafana dashboard"
+section of `AGENTS.md`. When the two disagree, AGENTS.md
 wins (it gets updated first when the lab teaches us something).
 
 ---

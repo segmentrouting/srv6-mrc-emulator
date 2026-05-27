@@ -160,7 +160,7 @@ For other quick tests see the [spray-tool.md](./spray-tool.md)
 
 ## srctl command line utility
 *`srctl`* is a simple CLI modeled after K8s `kubectl` and can be used to interact with the MRC-SRv6 emulator. 
-`srctl's ` primary use is to run MRC traffic scenarios over the deployed topology.
+`srctl's` primary use is to run MRC traffic scenarios over the deployed topology.
 
 1. Install `srctl` python packages
 ```bash
@@ -212,6 +212,7 @@ srctl get topology
 ```
 
 **srctl get evs**
+
 Example: `srctl get evs` <src-host> <dst-host>
 ```bash
 srctl get evs yellow-host05 yellow-host02
