@@ -1,7 +1,13 @@
 # srv6-mrc-emulator
 
-A research-grade simulator for Multipath Reliable Connection
-(MRC) layered on top of a static SRv6 uSID dataplane. 
+A topology and traffic generator tool for simulating Multipath Reliable Connection
+(MRC) layered on top of a static SRv6 uSID dataplane. This tool is intended to give engineers 
+and operators a feel for the multiplanar network design, uSID allocation scheme, host-based
+SRv6 encapsulation and decapsulation operations, and the packet spraying patterns described in 
+the work published by OpenAI, Microsoft, AMD, Broadcom, and Nvidia here:
+
+https://cdn.openai.com/pdf/resilient-ai-supercomputer-networking-using-mrc-and-srv6.pdf
+
 
 The simulator uses [containerlab](https://containerlab.dev/) to deploy a multiplane fabric of
 dockerized SONiC-VS instances and SRv6 capable Alpine linux containers 
@@ -15,23 +21,27 @@ generator tool so additional topologies can be added under `topologies/<name>/`.
 
 ## Key Elements
 
-- **Pure-static control plane**: No BGP, no IGP. Every leaf carries its
+- **Static control plane**: No BGP or IGP. Every leaf carries its
   own SRv6 locator + transit SIDs as `static-sids` in FRR. 
   [Example leaf config](./topologies/4p-4x8/config/p0-leaf00/frr.conf)
 - **config.sh shell script**: containerlab deploys the topology,  
   `scripts/config.sh` pushes the sonic nodes' config_db.json and FRR configs.
 - **Userspace MRC traffic simulator** builds uSID-encapsulated
   UDP frames in scapy and sprays them into the fabric so each packet traces a
-  distinct `(plane, path)` EV. Accompanying MRC receiver computes per-flow
+  distinct `(plane, path)` Entropy Value or EV. Accompanying MRC receiver computes per-flow
   reorder-distance histograms (the MRC / SRv6 paper's reorder metric)
   plus loss, latency, and PPS. The MRC control plane (probes + loss
   feedback) rides the same SRv6-encapped raw-socket path as the data
-  packets, with per-`(plane, path)` granularity.
-- **Fault injection.** Scenarios under `topologies/<name>/scenarios/`
-  drive `tc netem` against host veths via `nsenter`, exercising
-  plane-loss, plane-latency, and plane-blackhole failure modes. 
-  Alternatively the user can simply shutdown fabric interfaces with 
-  `docker exec -it <nodename> config interface shutdown <interface>`
+  packets, with per-`(plane, path)` EV granularity.
+- **srctl command-line tool**: Kubectl-style CLI for managing the lab. Key commands:
+  - `srctl get topology` — show fabric dimensions and tenants
+  - `srctl get hosts [--tenant green|yellow]` — list hosts
+  - `srctl get evs <src> <dst>` — show available EVs for a host pair
+  - `srctl run <scenario>` — execute traffic scenarios (baseline, all-to-all, etc.)
+  - `srctl fault shutdown <node> <interface>` — inject interface failures
+  - `srctl fault netem "<target>" "<spec>"` — inject loss/delay with tc netem
+  - `srctl fault list` — show active faults
+  - `srctl fault clear --all` — restore fabric state
 - **Multi-tenancy with two SRv6 patterns.** Both tenants perform
   *host-encap*. The Green tenant is *leaf-decapped* (uDT6 into `Vrf-green` on
   every leaf; the destination is an anycast `2001:db8:bbbb:<NN>::2`
