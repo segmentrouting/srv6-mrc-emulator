@@ -39,4 +39,4 @@ faults: []
 mrc: {}
 
 report:
-  out: results/green-mrc-baseline.json
+  out: results/green-baseline.json

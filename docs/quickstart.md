@@ -172,12 +172,12 @@ pip install -e . --user
 which srctl
 ```
 
-If ~/.local/bin isn't in your PATH:
+If *`~/.local/bin`* isn't in your PATH:
 ```bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 ```
 
-3. `srctl` help
+**`srctl` help**
 ```bash
 srctl --help
 ```
@@ -198,23 +198,45 @@ options:
   -h, --help       show this help message and exit
 ```
 
-
 ```bash
 srctl get {topology,hosts,evs}
 ```
 
-Example: `srctl get evs` <src-host> <dst-host>
+**srctl get topology**
+
+`srctl` auto-discovers scenarios under topologies/<active>/scenarios/ (where "active" is determined by _active_topo_dir(). If you have multiple topologies and want to be explicit, set TOPO=4p-4x8 srctl run … if it honors that, or check srctl get topology to see which one srctl thinks is active.
+
+Quick sanity check to verify it sees your deployed topology:
 ```bash
-srctl get evs green-host00 green-host07
+srctl get topology
 ```
 
+**srctl get evs**
+Example: `srctl get evs` <src-host> <dst-host>
 ```bash
-$ srctl get evs green-host00 green-host07
-PLANE  PATH  EV     SID                       
-0      0     P0:S0  fc00:0000:f000:e007:d000::
-0      1     P0:S1  fc00:0000:f001:e007:d000::
-0      2     P0:S2  fc00:0000:f002:e007:d000::
-<snip>
+srctl get evs yellow-host05 yellow-host02
+```
+
+Will output the list of EVs between any src/dst host pair and their corresponding SRv6 SIDs
+```bash
+$ srctl get evs yellow-host05 yellow-host02
+PLANE  PATH  EV     SID                            
+0      0     P0:S0  fc00:0000:f000:e002:e009:d001::
+0      1     P0:S1  fc00:0000:f001:e002:e009:d001::
+0      2     P0:S2  fc00:0000:f002:e002:e009:d001::
+0      3     P0:S3  fc00:0000:f003:e002:e009:d001::
+1      0     P1:S0  fc00:0001:f000:e002:e009:d001::
+1      1     P1:S1  fc00:0001:f001:e002:e009:d001::
+1      2     P1:S2  fc00:0001:f002:e002:e009:d001::
+1      3     P1:S3  fc00:0001:f003:e002:e009:d001::
+2      0     P2:S0  fc00:0002:f000:e002:e009:d001::
+2      1     P2:S1  fc00:0002:f001:e002:e009:d001::
+2      2     P2:S2  fc00:0002:f002:e002:e009:d001::
+2      3     P2:S3  fc00:0002:f003:e002:e009:d001::
+3      0     P3:S0  fc00:0003:f000:e002:e009:d001::
+3      1     P3:S1  fc00:0003:f001:e002:e009:d001::
+3      2     P3:S2  fc00:0003:f002:e002:e009:d001::
+3      3     P3:S3  fc00:0003:f003:e002:e009:d001::
 ```
 
 ### srctl run - running MRC traffic scenarios:
@@ -250,7 +272,7 @@ yellow-mrc-ev-spray
 
 2. Run a traffic scenario:
 ```bash
-srctl run yellow-mrc-baseline
+srctl run yellow-baseline
 ```
 
 3. Or with options:
@@ -260,16 +282,9 @@ srctl run yellow-allreduce-ring --verbose
 ```bash
 srctl run green-mrc-baseline --dry-run
 ```
-`srctl` auto-discovers scenarios under topologies/<active>/scenarios/ (where "active" is determined by _active_topo_dir(). If you have multiple topologies and want to be explicit, set TOPO=4p-4x8 srctl run … if it honors that, or check srctl get topology to see which one srctl thinks is active.
-
-Quick sanity check to verify it sees your new topology:
-```bash
-srctl get topology
-srctl run --list
-```
 
 >[!Note]
-> When running any traffic scenario the MRC emulator sprays SRv6 encapsulated traffic across all available EVs (paths).
+> When running any traffic scenario the emulator sprays SRv6 encapsulated traffic across all available EVs (paths).
 > You should be able to run tcpdump on any spine interface in the fabric and see some encapsulated traffic
 
 ```bash
@@ -280,9 +295,9 @@ docker exec -it p2-spine01 tcpdump -ni Ethernet20
 # etc
 ```
 
-### srctl 'fault' and MRC traffic re-balance on failure
+### srctl `fault` and MRC traffic re-balance on failure
 
-To see MRC rebalance on probe failure, use `srctl fault` commands to inject failures before or during an MRC scenario run:
+To see MRC rebalance on probe failure, use `srctl fault` commands to inject failures before or during a MRC scenario run:
 
 **Example 1: Shutdown a link and observe MRC rebalance**
 
@@ -292,6 +307,8 @@ srctl fault shutdown p1-spine01 Ethernet0
 
 # Run MRC scenario - should detect failure and route around it
 srctl run green-mrc-ev-spray
+
+# Run a non-MRC scenario - the report should identify where packet loss ocdurred
 
 # View active faults
 srctl fault list
@@ -328,6 +345,8 @@ srctl fault clear --all
 
 For more details on fault injection, see the `srctl fault` section in [AGENTS.md](../AGENTS.md).
 
+## Appendix
+
 ### MRC traffic generation scenarios using `make`
 
 1. Basic EV spray, no MRC state or failure detection
@@ -361,12 +380,6 @@ docker exec -it p1-spine00 tcpdump -ni Ethernet60
 
 # etc.
 ```
-
-### Fault injection with srctl
-
-For interactive fault injection during testing, use the `srctl fault` commands shown in the previous section. 
-
-Legacy embedded `faults:` blocks in older scenario YAMLs (e.g., `*-plane-loss.yaml`, `*-plane-latency.yaml`) are deprecated - use `srctl fault` instead for new testing workflows.
 
 ## Running a different topology
 
