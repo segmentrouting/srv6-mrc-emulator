@@ -257,31 +257,51 @@ docker exec -it p2-spine01 tcpdump -ni Ethernet20
 
 ### srctl 'fault' and MRC traffic re-balance on failure
 
-To see MRC rebalance on probe failure, run one of the `srctl fault` operations prior to or while running one of the **mrc** scenarios:
+To see MRC rebalance on probe failure, use `srctl fault` commands to inject failures before or during an MRC scenario run:
 
+**Example 1: Shutdown a link and observe MRC rebalance**
 
-1. Shutdown an interface - this example should produce a rebalance of the host00 to host15 flow away from the `plane-1-spine00` EV path
 ```bash
-# get ipv6 address first
-docker exec -it p1-spine00 ip addr show Ethernet0 | grep /127
+# Break p1-spine01 ↔ p1-leaf00 link (bidirectional by default)
+srctl fault shutdown p1-spine01 Ethernet0
 
-# shutdown a link
-docker exec -it p1-spine00 config interface shutdown Ethernet0
-```
-
-2. Run any of the *ev-spray* or collective scenarios (all-to-all, allreduce-ring, etc.) 
-```bash
+# Run MRC scenario - should detect failure and route around it
 srctl run green-mrc-ev-spray
-# etc.
+
+# View active faults
+srctl fault list
+
+# Restore the link
+srctl fault clear p1-spine01
 ```
 
-3. You can run tcpdumps as before
-4. Bring the interface back up and re-apply its ip
+**Example 2: Inject partial loss with tc/netem**
+
 ```bash
-docker exec -it p1-spine00 config interface startup Ethernet0
+# Add 5% loss on plane 2 of a specific host
+srctl fault netem "host yellow-host00 plane 2" "loss 5%"
 
-docker exec -it p1-spine00 ip addr add <ip/mask> dev Ethernet0
+# Run scenario - expect MRC to demote affected plane
+srctl run yellow-mrc-baseline --duration 10
+
+# Clean up all faults
+srctl fault clear --all
 ```
+
+**Example 3: Break an entire spine (all downlinks)**
+
+```bash
+# Shut down all interfaces on p0-spine01
+srctl fault shutdown p0-spine01 all
+
+# Run collective communication scenario
+srctl run yellow-all-to-all --duration 30
+
+# Restore everything
+srctl fault clear --all
+```
+
+For more details on fault injection, see the `srctl fault` section in [AGENTS.md](../AGENTS.md).
 
 ### MRC traffic generation scenarios using `make`
 
@@ -317,15 +337,11 @@ docker exec -it p1-spine00 tcpdump -ni Ethernet60
 # etc.
 ```
 
-1. Built in failure/degradation scenarios:
+### Fault injection with srctl
 
-```bash
-make scenario SCEN=green-mrc-plane-loss      # 1% loss on plane 2 (netem fault)
-make scenario SCEN=green-mrc-plane-latency   # +5ms on plane 2 (netem fault)
+For interactive fault injection during testing, use the `srctl fault` commands shown in the previous section. 
 
-make scenario SCEN=yellow-mrc-plane-loss     # 1% loss on plane 2 (yellow)     
-make scenario SCEN=yellow-mrc-plane-latency  # plane 2 +5ms (yellow)  
-```
+Legacy embedded `faults:` blocks in older scenario YAMLs (e.g., `*-plane-loss.yaml`, `*-plane-latency.yaml`) are deprecated - use `srctl fault` instead for new testing workflows.
 
 ## Running a different topology
 
