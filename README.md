@@ -10,21 +10,24 @@ https://cdn.openai.com/pdf/resilient-ai-supercomputer-networking-using-mrc-and-s
 
 
 The simulator uses [containerlab](https://containerlab.dev/) to deploy a multiplane fabric of
-dockerized SONiC-VS instances and SRv6 capable Alpine linux containers 
-simulating hosts.
+dockerized SONiC-VS instances and SRv6 capable Alpine linux containers simulating hosts.
 
-The reference topology is a **4-plane × 4-spine × 8-leaf Clos** carrying
-two tenants (`green`, `yellow`) with 8 *hosts* each. 
+## Design Docs and Configs
+[Fabric Design](./docs/fabric-design.md): describes the multi-planar design elements including IPv6 addressing and SRv6 uSID allocation scheme with pointers to SONiC config examples.
 
-## Quickstart
+[SRv6-Multi-Tenant Design](./docs/srv6-multi-tenant-design.md): whitepaper outlining multi-tenant encap/decap models and security considerations.
+
+[SONiC Configs](./topologies/4p-4x8/config/)
+
+## Quickstart Guide
 
 [Quickstart](./docs/quickstart.md): Guide to install, deploy and configure a topology, and run MRC-SRv6 traffic simulations
 
-## Key Elements
 
-- **Static control plane**: No BGP or IGP. Every leaf carries its
-  own SRv6 locator + transit SIDs as `static-sids` in FRR. 
-  [Example leaf config](./topologies/4p-4x8/config/p0-leaf00/frr.conf)
+## Key MRC-SRv6 Emulator Elements
+
+- **Containerlab topology**: 4-plane × 4-spine × 8-leaf *docker-sonic-vs* Clos carrying
+  two tenants (`green`, `yellow`) with 8 Alpine container *hosts* each. 
 - **config.sh shell script**: containerlab deploys the topology,  
   `scripts/config.sh` pushes the sonic nodes' config_db.json and FRR configs.
 - **Userspace MRC traffic simulator** builds uSID-encapsulated

@@ -1,7 +1,7 @@
 # Architecture — three-role decomposition
 
 This document is the architectural reference for the emulator. It is the
-companion to `design-fabric.md` (the SRv6 substrate), `design-mrc.md` (the
+companion to `fabric-design.md` (the SRv6 substrate), `design-mrc.md` (the
 spray + EV state-machine layer) and `design-multi-tenant.md` (green vs yellow
 tenancy). Where those documents describe **what** each subsystem does, this
 one describes **why the layers are structured the way they are** and how
@@ -74,9 +74,9 @@ Host Decap example:
 ```
 fc00:<P>:f00<S>:e00<L>:e009:d001::
        │   │      │      │
-       │   │      │      └── End.X to host downlink on leaf L
-       │   │      └── leaf uSID
-       │   └── spine uSID
+       │   │      │      └── remote leaf uA to destination host 
+       │   │      └── spine uA to remote leaf
+       │   └── leaf uA to spine
        └── plane index
 ```
 
@@ -146,18 +146,16 @@ Differences worth flagging:
   customer preference; it changes the *encoding* of the uSID list but
   not the *control loop*.
 - **Per-EV path granularity.** The paper has hundreds of EVs per QP,
-  each a distinct path. The emulator's EV-spray data path varies the spine
+  each a distinct path. The emulator's EV-spray data path varies the plane and spine
   per packet, and the MRC control plane (probes + loss reports) tracks the
-  same per-`(plane, path)` EV.
+  same per-`(plane, path)` EV. The emulator is intended to run as a simulation 
+  inside a single host or VM and should not be expected to support large scale.
 - **NIC-firmware vs user-space encap.** The paper does the EV→template
   specialization in NIC firmware on every packet. Our emulator does
   the equivalent specialization in user space (scapy / raw socket)
   inside the sender process. 
 
 ## 4. What we faithfully reproduce vs what we approximate
-
-This is the canonical "where we diverge" table. It supersedes scattered
-remarks in `design-mrc.md` and `design-multi-tenant.md`.
 
 | Concern                          | Paper                                  | Emulator                              | Why                                              |
 |----------------------------------|----------------------------------------|---------------------------------------|--------------------------------------------------|
@@ -166,14 +164,14 @@ remarks in `design-mrc.md` and `design-multi-tenant.md`.
 | Routing                          | Static SRv6 uN                         | Static SRv6 uA                        | Operator preference                              |
 | PFC                              | Disabled                               | N/A (no RDMA)                         | Match in spirit                                  |
 | Transport                        | RoCEv2 + MRC extensions                | Plain UDP spray                       | Verbs unavailable in emulator                    |
-| EV granularity                   | 100–256 EVs per QP                     | Up to NUM_PLANES × paths_per_plane EVs per QP (default 32 on 4p-8x16) | Plane/Path fidelity is enough for the scenarios |
+| EV granularity                   | 100–256 EVs per QP                     | Up to NUM_PLANES × paths_per_plane EVs per QP (default 32 on 4p-8x16) | Plane/Path fidelity is enough for simulation |
 | Spray policy                     | EV[k] rotated per packet               | round_robin / hash5tuple / weighted / ev_spray / health_aware_mrc | Match in spirit at plane/path granularity             |
 | Loss signal — congestion         | Packet trimming → NACK → fast retx     | **Not available**                     | docker-sonic-vs cannot trim                      |
 | Loss signal — failure            | Untrimmed loss → demote EV             | Receiver loss-fusion → demote path   | The only loss signal we have                     |
 | Load-balance signal              | ECN → migrate EV within plane          | **Not implemented**                   | ECN not available in docker-sonic-vs |
-| Probes                           | Background EV resurrection probes      | Emulator probes all EVs every interval | Stronger than paper (we have CPU budget for it) |
+| Probes                           | Background EV resurrection probes      | Emulator probes all EVs every interval | CPU bound, low pps |
 | Fabric health mapping            | Clustermapper (1 ms/link)              | **Not implemented**                   | Out of scope for current phases                  |
-| Reverse-path EV management       | Small reverse EV set + EV probes       | Receiver replies on the same (plane, path) as inbound PROBE | EVs exist symmetrically in both directions |
+| Reverse-path EV management       | Small reverse EV set + EV probes       | Probes constructed with uSID combination that performs full EV round trip with probe sender's address as inner dest | Stateless EV probes, if packets arrive back at sender the EV is up |
 | EV state machine                 | active / backup / inactive             | UNKNOWN / GOOD / ASSUMED_BAD          | Equivalent at plane/path granularity                  |
 | EV demotion threshold            | Binary (first untrimmed loss)          | Configurable per scenario             | We need knobs because we have one signal         |
 

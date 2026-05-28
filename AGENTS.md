@@ -5,7 +5,7 @@ the non-obvious invariants and gotchas that aren't visible from a single
 file or from the README alone.
 
 For the human-facing tour: see `README.md` (overview), `docs/quickstart.md`
-(deploy/run), `docs/design-fabric.md`, `docs/design-mrc.md`,
+(deploy/run), `docs/fabric-design.md`, `docs/design-mrc.md`,
 `docs/spray-protocol.md`, and `docs/design-appendix.md`.
 
 ---

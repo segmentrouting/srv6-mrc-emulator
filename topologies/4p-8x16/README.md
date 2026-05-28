@@ -1,7 +1,7 @@
 # 4p-8x16 topology
 
 Static SRv6 fabric with 4 planes × 8 spines × 16 leaves, 16 green + 16
-yellow hosts. See `docs/design-fabric.md` for the address scheme,
+yellow hosts. See `docs/fabric-design.md` for the address scheme,
 SID-list shape, and general design.
 
 This directory contains:

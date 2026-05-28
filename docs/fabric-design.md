@@ -5,9 +5,9 @@ Containerlab. Models a small slice of a hyperscale AI backend fabric: 4
 independent network planes, each a **4 × 8 Clos** (with larger 8 × 16 variant
 available), with multi-homed tenant hosts uplinked into every plane.
 
-
+### Default topology
 - **48 SONiC switches** (16 spines + 32 leaves) in the default 4p-4x8 topology
-- **16 Alpine hosts** (8 green + 8 yellow), each with 4 NIC uplinks
+- **16 Alpine hosts** (8 green tenant + 8 yellow tenant), each with 4 NIC uplinks
 - **No BGP, no IGP** — every transit FIB entry is a static route or an SRv6 uA
   SID; the controller installs end-to-end SR policies for tenant traffic.
 
@@ -19,19 +19,21 @@ Instructions to quickly deploy and play with the topology can be found in the [q
 The lab demonstrates several patterns that recur in hyperscale GPU fabrics:
 
 1. **Multi-plane Clos** — each plane is an independent failure / scheduling
-   domain. Hosts have one NIC into each plane; flows are pinned to a plane by
-   the controller, not by ECMP.
+   domain. Hosts have one NIC into each plane. In a production deployment the GPU-NIC
+   is broken out across 4 or 8 planes. With containerlab we emulate the breakout 
+   by simply using more veths and assigning the same ipv6 address to each.
 2. **Per-plane uSID block** — each plane gets its own `/32` so plane identity
    is part of the destination prefix, not buried in node bits. Aggregates
    cleanly at the WAN: one `/30` per cluster.
 3. **Function-bit conventions across the fabric** — `f00<S>` always means
-   "this leaf's uA toward spine S", `e00<L>` always means "this spine's uA
-   toward leaf L", `d000`/`d001` are tenant-ID uDT6 SIDs. A controller
-   reading any SID list can tell what each label does without per-node state.
+   "this leaf's uA up toward spine S", `e00<L>` always means "this spine's uA down
+   toward leaf L", or "this leaf's uA down toward host H, `d000`/`d001` are tenant-ID
+   uDT6 SIDs. A controller reading any SID list can tell what each label does 
+   without per-node state.
 4. **Two SRv6 multi-tenancy models**:
     - **Hybrid** (green): host-encap, leaf-decap into `Vrf-green` via uDT6.
     - **Host-based** (yellow): host-encap, host-decap. Leaves are pure transit;
-      yellow hosts run `seg6local End.DT6` on every plane NIC.
+      yellow hosts run their own `seg6local End.DT6` on every plane NIC.
 
 ## Addressing
 
@@ -41,17 +43,15 @@ The lab demonstrates several patterns that recur in hyperscale GPU fabrics:
 |---|---|---|
 | Cluster aggregate | `fc00:0000::/30` | covers all 4 planes |
 | Plane block | `fc00:000<P>::/32` | plane 2 → `fc00:0002::/32` |
-| Spine locator | `fc00:000<P>:1<S>::/48` | p2-spine03 → `fc00:0002:13::/48` |
-| Leaf locator | `fc00:000<P>:2<L>::/48` | p2-leaf10 → `fc00:0002:2a::/48` |
-| Leaf uA → spine | `fc00:000<P>:f00<S>::/48` | p2 leaf, toward spine03 → `fc00:0002:f003::/48` |
-| Spine uA → leaf | `fc00:000<P>:e00<L>::/48` | p2 spine, toward leaf10 → `fc00:0002:e00a::/48` |
-| Green tenant uDT6 | `fc00:000<P>:d000::/48` | per-plane on every leaf, decap into `sonic Vrf-green` |
-| Yellow tenant uDT6 | `fc00:000<P>:d001::/48` | per-plane on every yellow host, `linux End.DT6 table 0` |
+| Spine locator | `fc00:000<P>:1<S>::/48` | p2-spine03 → `fc00:0002:13::/48` [Link](../topologies/4p-4x8/config/p2-spine03/frr.conf#L22) |
+| Leaf locator | `fc00:000<P>:2<L>::/48` | p2-leaf07 → `fc00:0002:7::/48` [Link](../topologies/4p-4x8/config/p2-leaf07/frr.conf#L56)|
+| Leaf uA → spine | `fc00:000<P>:f00<S>::/48` | p2 leaf, toward spine03 → `fc00:0002:f003::/48` [Link](../topologies/4p-4x8/config/p2-leaf07/frr.conf#L60) |
+| Spine uA → leaf | `fc00:000<P>:e00<L>::/48` | p2 spine, toward leaf06 → `fc00:0002:e006::/48` [Link](../topologies/4p-4x8/config/p2-spine03/frr.conf#L29) |
+| Green tenant uDT6 | `fc00:000<P>:d000::/48` | per-plane on every leaf, decap into `sonic Vrf-green` [Link](../topologies/4p-4x8/config/p0-leaf00/frr.conf#L61) |
+| Yellow tenant uDT6 | `fc00:000<P>:d001::/48` | per-plane on every yellow host, `linux End.DT6 table 0` [Note: see host config, not FRR] |
 | Fabric P2P | `2001:db8:fab:<S*16+L>::/127` | reused per plane (planes are L2-isolated) |
 | Green tenant address | `2001:db8:bbbb:<NN>::2` | **anycast** on all 4 host NICs (`nodad`); identical leaf-side `::1/64` on every plane's Ethernet32 in `Vrf-green` |
 | Yellow tenant address | `2001:db8:cccc:<NN>::2` | **anycast** on all 4 host NICs + `lo` (`nodad`); identical leaf-side `::1/64` on every plane's Ethernet36 (Phase 1a: mirrors green's plan with `bbbb`→`cccc`) |
-| Host side (anycast) | `...::2/64` | identical address on `eth1..eth4` (and `lo` for yellow) — nodad |
-| Leaf gateway (anycast) | `...::1/64` | identical address on every plane's host-facing leaf port |
 
 `<P>` = plane 0–3 (hex), `<S>` = spine 0–7, `<L>` = leaf 0–f, `<NN>` = host 00–15 (hex byte).
 
@@ -64,16 +64,16 @@ The lab demonstrates several patterns that recur in hyperscale GPU fabrics:
 
 ### Reading a SR-policy SID list
 
-A path "deliver to p2-leaf10, choose plane 2, egress toward p2-spine03,
-then decap into green at the next hop" encodes as a single uSID-compressed
+A path "deliver to green-host06, via EV plane-2, spine03, leaf06,
+then decap into green VRF" encodes as a single uSID-compressed
 IPv6 destination:
 
 ```
 fc00:0002:f003:e006:d000::
 └──┬───┘ └┬──┘ └┬─┘ └┬─┘
    │      │     │    └─ d000  : tenant-ID green → Vrf-green at egress leaf
-   │      │     └────── e006  : spine03 uA toward leaf06 (in plane 2)
-   │      └──────────── f003  : leaf uA toward spine03 
+   │      │     └────── e006  : spine03 uA toward p2-leaf06 
+   │      └──────────── f003  : p2-leaf uA toward p2-spine03 
    └─────────────────── 0002  : plane 2 block
 ```
 
@@ -102,6 +102,7 @@ sees one socket regardless of which plane delivered it.
 ```
 yellow-host00 NICs eth1..eth4    (inner anycast 2001:db8:cccc:<NN>::2 on all four)                        
    │  encap; outer dst: fc00:000<P>:f00<S>:e00<L>:e009:d001::  <P> = chosen plane
+   │  (e009 is the leaf's uA toward yellow host port [config](../topologies/4p-4x8/config/p0-leaf00/frr.conf#L62))
    ▼
    ─►  fabric (uA hops)  ─►  egress p<P>-leaf<NN>.Ethernet36 (default VRF)
                                ─►  yellow-host<NN>.eth(P+1) [inner 2001:db8:cccc:<NN>::2]
@@ -111,7 +112,7 @@ yellow-host00 NICs eth1..eth4    (inner anycast 2001:db8:cccc:<NN>::2 on all fou
 ```
 
 Each yellow host has 4 `seg6local` entries — one per plane — bound to the
-respective plane NIC. The address present on `lo` (nodad) guarantees table-0 lookup resolves
+respective plane NIC. The address present on `lo` guarantees table-0 lookup resolves
 locally even when no NIC is the egress interface. So a sprayed flow's
 inner dst is plane-independent; plane identity stays in the outer SID
 list and in which NIC the host's seg6local fires on. The leaf is a pure

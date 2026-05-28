@@ -4,7 +4,7 @@ Smaller variant: 2 planes × 4 spines × 8 leaves, 8 green + 8 yellow
 hosts. Useful for faster iteration on resource-constrained hosts; the
 container count is roughly 1/3 of `4p-8x16` (40 vs 128 total).
 
-See `docs/design-fabric.md` for the general design; the address scheme
+See `docs/fabric-design.md` for the general design; the address scheme
 is the same as 4p-8x16 with the plane index running 0..1 and host IDs
 running 0..7.
 
