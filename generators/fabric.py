@@ -652,7 +652,7 @@ end
 # topology.clab.yaml
 # ---------------------------------------------------------------------------
 
-def write_topology_yaml(path: Path) -> None:
+def write_topology_yaml(path: Path, topo_dict: dict) -> None:
     L = []
     L.append(f"name: {TOPOLOGY_NAME}")
     L.append('prefix: ""')
@@ -823,6 +823,50 @@ def write_topology_yaml(path: Path) -> None:
             L.append("")
             mgmt += 1
 
+    # Visibility stack (optional): scraper + Prometheus + Grafana
+    # Controlled by visibility.enabled in topo.yaml.
+    # See visibility/README.md and docs/design-visibility.md.
+    visibility_cfg = topo_dict.get("visibility", {})
+    if visibility_cfg.get("enabled", False):
+        L.append("    # Visibility stack containers")
+        L.append("    srv6-scraper:")
+        L.append("      kind: linux")
+        L.append("      image: srv6-scraper:1.0")
+        L.append("      binds:")
+        L.append("        - /var/run/docker.sock:/var/run/docker.sock")
+        L.append("        - topo.yaml:/etc/srv6_mrc/topo.yaml:ro")
+        L.append("      mgmt-ipv4: 172.20.18.250")
+        L.append("")
+        L.append("    srv6-prometheus:")
+        L.append("      kind: linux")
+        L.append("      image: prom/prometheus:v2.55.0")
+        L.append("      mgmt-ipv4: 172.20.18.251")
+        L.append("      binds:")
+        L.append("        - visibility/prometheus.yml:/etc/prometheus/prometheus.yml:ro")
+        L.append("      ports:")
+        L.append('        - "9090:9090"')
+        L.append("      cmd: >")
+        L.append("        --config.file=/etc/prometheus/prometheus.yml")
+        L.append("        --storage.tsdb.path=/prometheus")
+        L.append("        --storage.tsdb.retention.time=1h")
+        L.append("        --web.listen-address=:9090")
+        L.append("")
+        L.append("    srv6-grafana:")
+        L.append("      kind: linux")
+        L.append("      image: grafana/grafana:11.2.0")
+        L.append("      mgmt-ipv4: 172.20.18.252")
+        L.append("      env:")
+        L.append('        GF_AUTH_ANONYMOUS_ENABLED: "true"')
+        L.append('        GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"')
+        L.append('        GF_AUTH_DISABLE_LOGIN_FORM: "true"')
+        L.append('        GF_USERS_DEFAULT_THEME: "dark"')
+        L.append("      binds:")
+        L.append("        - visibility/grafana/provisioning:/etc/grafana/provisioning:ro")
+        L.append("        - visibility/grafana/dashboards:/var/lib/grafana/dashboards:ro")
+        L.append("      ports:")
+        L.append('        - "3000:3000"')
+        L.append("")
+
     L.append("  links:")
     L.append("")
 
@@ -916,7 +960,7 @@ def main() -> None:
             write_leaf_frr(p, leaf)
 
     topo_clab = TOPO_DIR / "topology.clab.yaml"
-    write_topology_yaml(topo_clab)
+    write_topology_yaml(topo_clab, t)
 
     n_spines = NUM_PLANES * NUM_SPINES
     n_leaves = NUM_PLANES * NUM_LEAVES

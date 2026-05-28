@@ -50,6 +50,9 @@ two tenants (`green`, `yellow`) with 8 *hosts* each.
   breakout. The Yellow tenant receives SRv6 encapsulated traffic and 
   performs its own *host-decap* via linux `seg6local End.DT6` policies. 
   For more information see [Multi-Tenant Design Doc](./docs/design-multi-tenant.md)
+- **Optional live visibility** - Grafana dashboard for real-time per-plane balance,
+  MRC EV health, and fault injection effects. Enable by uncommenting `visibility.enabled`
+  in `topo.yaml`. See [visibility/README.md](./visibility/README.md)
 
 This repository also includes a topology 
 generator tool so additional topologies can be added under `topologies/<name>/`.

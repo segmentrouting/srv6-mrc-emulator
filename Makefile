@@ -57,6 +57,10 @@ test: ## run the full unit test suite
 image: ## build the host container image with srv6_mrc baked in
 	docker build -f host-image/Dockerfile -t $(IMAGE_TAG) .
 
+.PHONY: visibility-image
+visibility-image: ## build the srv6-scraper image for live visibility stack
+	docker build -t srv6-scraper:1.0 visibility/scraper/
+
 # --- generation ------------------------------------------------------------
 
 .PHONY: regen
