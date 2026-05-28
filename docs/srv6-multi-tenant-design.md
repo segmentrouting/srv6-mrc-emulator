@@ -2,8 +2,6 @@
 
 **Bruce McDougall | April 2026**
 
-*CONFIDENTIAL*
-
 ---
 
 **Scope of this document**

@@ -37,20 +37,13 @@ dockerized SONiC-VS instances and SRv6 capable Alpine linux containers simulatin
   plus loss, latency, and PPS. The MRC control plane (probes + loss
   feedback) rides the same SRv6-encapped raw-socket path as the data
   packets, with per-`(plane, path)` EV granularity.
-- **srctl command-line tool**: Kubectl-style CLI for managing the lab. Key commands:
-  - `srctl get topology` — show fabric dimensions and tenants
-  - `srctl get hosts [--tenant green|yellow]` — list hosts
-  - `srctl get evs <src> <dst>` — show available EVs for a host pair
+- **srctl command-line tool**: Kubectl-style CLI for running traffic simulations. Key commands:
+  - `srctl get {topology, hosts, evs}` — show fabric dimensions, tenants EVs, etc.
   - `srctl run <scenario>` — execute traffic simulations (baseline, all-to-all, all-reduce, etc.)
-  - `srctl fault shutdown <node> <interface>` — inject interface or node failures
-  - `srctl fault netem "<target>" "<spec>"` — inject loss/delay with tc netem
-  - `srctl fault list` — show active faults
-  - `srctl fault clear --all` — restore fabric state
+  - `srctl fault` — inject interface or node failures to demonstrate MRC traffic rebalance  
 - **Multi-tenancy with two SRv6 patterns.** Both tenants perform
   *host-encap*. The Green tenant is *leaf-decapped* (uDT6 into `Vrf-green` on
-  every leaf; the destination is an anycast `2001:db8:bbbb:<NN>::2`
-  configured on all 4 of the host's NICs) simulating multi-plane 
-  breakout. The Yellow tenant receives SRv6 encapsulated traffic and 
+  every leaf. The Yellow tenant receives SRv6 encapsulated traffic and 
   performs its own *host-decap* via linux `seg6local End.DT6` policies. 
   For more information see [Multi-Tenant Design Doc](./docs/design-multi-tenant.md)
 - **Optional live visibility** - Grafana dashboard for real-time per-plane balance,
