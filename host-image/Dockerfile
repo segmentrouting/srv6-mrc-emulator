@@ -2,6 +2,7 @@
 #
 # Lab host image. Provides:
 #   - kernel SRv6 utilities (from upstream alpine-srv6 base)
+#   - iperf3 (throughput/latency benchmarking between hosts)
 #   - Python 3 + scapy (for spray.py userspace SRv6/uSID packet gen)
 #   - the srv6_mrc Python package, pip-installed so its console
 #     scripts (`spray`, `routes`, `run-scenario`) land in /usr/local/bin
@@ -24,7 +25,8 @@ FROM iejalapeno/alpine-srv6:1.0
 RUN apk add --no-cache \
         python3 \
         py3-pip \
-        tcpdump
+        tcpdump \
+        iperf3
 
 # Install srv6_mrc and its runtime deps (scapy, PyYAML).
 # Copy the minimal set: pyproject + package source + a README stub
