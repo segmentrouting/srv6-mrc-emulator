@@ -110,7 +110,7 @@ make host-routes
 
 1. Run a ping from *`green-host00`* to *`green-host07`*
 ```bash
-docker exec -it green-host00 ping 2001:db8:bbbb:7::2 -i .3
+docker exec -it green-host00 ping 2001:db8:bbbb:7::2 -i .3 -I 2001:db8:bbbb::2
 ```
 
 2. In another terminal session run tcpdump on the sonic nodes' interfaces along the path:
@@ -150,9 +150,9 @@ docker exec -it p0-spine00 tcpdump -ni Ethernet28
 
 ### Quick test - Tenant Yellow - Host SRv6 Encap and Decap
 
-1. Run a ping from *`yellow-host01`* to *`yellow-host14`* . Packet capture/tcpdump procedure is the same.
+1. Run a ping from *`yellow-host01`* to *`yellow-host04`* . Packet capture/tcpdump procedure is the same.
 ```bash
-docker exec -it yellow-host01 ping 2001:db8:cccc:e::2 -i .3 
+docker exec -it yellow-host01 ping 2001:db8:cccc:4::2 -i .3 -I 2001:db8:cccc:1::2
 ```
 
 For other quick tests see the [spray-tool.md](./spray-tool.md)

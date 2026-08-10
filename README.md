@@ -10,7 +10,7 @@ https://cdn.openai.com/pdf/resilient-ai-supercomputer-networking-using-mrc-and-s
 
 
 The simulator uses [containerlab](https://containerlab.dev/) to deploy a multiplane fabric of
-dockerized SONiC-VS instances and SRv6 capable Alpine linux containers simulating hosts.
+dockerized SONiC-VS instances and SRv6 capable Alpine linux containers simulating hosts. 
 
 ## Design Docs and Configs
 [Fabric Design](./docs/fabric-design.md): describes the multi-planar design elements including IPv6 addressing and SRv6 uSID allocation scheme with pointers to SONiC config examples.
@@ -119,7 +119,7 @@ results/               scenario JSON output (gitignored)
 - containerlab
 - docker-sonic-vs: tested with Branch Master docker-sonic-vs.gz from [SONiC Dowloads](https://sonic.software/) site.
 - Alpine SRv6 docker image *`bmcdougall/alpine-srv6-scapy:1.0`*
-- at least 16 vCPU and 32GB of memory (tested with 32 vCPU and 96GB memory)
+- at least 16 vCPU and 32GB of memory (tested with 32 vCPU and 96GB memory on Ubuntu 22.04)
 
 ## License
 

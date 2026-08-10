@@ -91,12 +91,12 @@ log = logging.getLogger(__name__)
 
 # --- defaults --------------------------------------------------------------
 
-DEFAULT_PROBE_INTERVAL_MS = 200
+DEFAULT_PROBE_INTERVAL_MS = 500
 # Retained for AgentConfig back-compat; not used by the stateless path
 # (no per-probe timeout). Kept so existing scenario JSON / env blobs
 # with ``probe_timeout_ms`` keep loading without ValueError.
-DEFAULT_PROBE_TIMEOUT_MS = 200
-DEFAULT_LOSS_WINDOW_MS = 200
+DEFAULT_PROBE_TIMEOUT_MS = 500
+DEFAULT_LOSS_WINDOW_MS = 300
 DEFAULT_MAX_WINDOW_SKEW_MS = 500
 
 

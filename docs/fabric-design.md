@@ -16,22 +16,22 @@ Instructions to quickly deploy and play with the topology can be found in the [q
 
 ## Fabric design
 
-The lab demonstrates several patterns that recur in hyperscale GPU fabrics:
+High level architecture:
 
 1. **Multi-plane Clos** — each plane is an independent failure / scheduling
    domain. Hosts have one NIC into each plane. In a production deployment the GPU-NIC
    is broken out across 4 or 8 planes. With containerlab we emulate the breakout 
    by simply using more veths and assigning the same ipv6 address to each.
-2. **Per-plane uSID block** — each plane gets its own `/32` so plane identity
-   is part of the destination prefix, not buried in node bits. Aggregates
+2. **Per-plane uSID block** — each plane gets its own IPv6 `/32` so plane identity
+   is part of the destination prefix, not buried in node bits. This can also aggregate
    cleanly at the WAN: one `/30` per cluster.
-3. **Function-bit conventions across the fabric** — `f00<S>` always means
-   "this leaf's uA up toward spine S", `e00<L>` always means "this spine's uA down
-   toward leaf L", or "this leaf's uA down toward host H, `d000`/`d001` are tenant-ID
-   uDT6 SIDs. A controller reading any SID list can tell what each label does 
-   without per-node state.
+3. **Function-bit conventions across the fabric**:
+    — `f000 - f0ff`: reserved for northbound uA allocation (leaf up to spine, spine up to super-spine, etc.)
+    - `e000 - e0ff`: reserved for southbound uA allocation (spine down to leaf, leaf down to host, etc.)
+    - `d000 - dfff`: reserved for tenant-ID uDT6 SIDs. 
+    - These allocations are a reference design and could certainly be adjusted depending on the deployment
 4. **Two SRv6 multi-tenancy models**:
-    - **Hybrid** (green): host-encap, leaf-decap into `Vrf-green` via uDT6.
+    - **Hybrid** (green): host-encap, leaf-decap into `Vrf-green` via uDT6. Note Aug. 10, 2026: As deployments and operational models mature we may see this option deprecated
     - **Host-based** (yellow): host-encap, host-decap. Leaves are pure transit;
       yellow hosts run their own `seg6local End.DT6` on every plane NIC.
 
@@ -79,7 +79,7 @@ fc00:0002:f003:e006:d000::
 
 ## Tenant models in this lab
 
-### Green (hybrid SRv6)
+### Green (hybrid: host-encap, egress-leaf-decap)
 
 ```
 green-host00 NICs eth1..eth4   (anycast 2001:db8:bbbb:<NN>::2 on all four)
@@ -139,12 +139,11 @@ each tenant's decap happens:
 
 ## What this lab is *not*
 
-- **Not a performance benchmark.** `docker-sonic-vs` runs a software ASIC; you
-  will not see line-rate. The point is correctness of the SRv6 control plane
-  and forwarding behavior.
+- **Not a performance benchmark.** `docker-sonic-vs` runs a software ASIC; expect a
+  maximum of a few hundred pps per EV. The goal is to demonstrate MRC-style per-EV packet spray and SRv6 forwarding behavior.
 - **Not a full controller.** No PCEP/BGP-LS/path-computation engine is
-  included. The static SIDs and routes give you a substrate; programming
-  end-to-end SR policies is left to whatever controller you wire up.
+  included. The static SIDs and routes provide a template; a controller for programming
+  end-to-end SR policies (per-EV SID calculation) has yet to be developed
 
 
 
