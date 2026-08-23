@@ -9,9 +9,15 @@ Subcommand surface (v1):
 
     srctl get topology
     srctl get hosts [--tenant T]
-    srctl get evs <src-host> <dst-host> [-n N] [-o table|json|yaml|sid]
-    srctl run <scenario> [--verbose] [--dry-run]
+    srctl get evs <src-host> <dst-host> [-n N] [-o table|json|yaml|sid] [--sid uA|uN]
+    srctl run <scenario> [--verbose] [--dry-run] [--sid uA|uN]
     srctl run --list
+
+`--sid` selects the outer uSID construction: `uA` (default) uses
+per-adjacency SIDs that force each fabric hop onto one specific
+physical link; `uN` uses each hop's own node locator instead, letting
+the underlay's (already-provisioned) static routes pick the link. See
+`srv6_mrc.topo.usid_outer_dst` for the addressing detail.
 
 `<scenario>` is resolved by name against the active topology's
 `scenarios/` directory: `srctl run green-mrc-ev-spray` finds
@@ -319,7 +325,7 @@ def _cmd_get_evs(args: argparse.Namespace) -> int:
 
     EVs are derived from `select_spines(src_id, dst_id, n)` × all planes,
     so the result is `NUM_PLANES * n` entries. Each EV's outer-DA SID is
-    computed via `usid_outer_dst(tenant, plane, spine, dst_id)`.
+    computed via `usid_outer_dst(tenant, plane, spine, dst_id, sid_mode)`.
 
     Cross-tenant pairs are rejected (each tenant has its own SID space;
     a green→yellow flow has no defined outer SID).
@@ -354,14 +360,16 @@ def _cmd_get_evs(args: argparse.Namespace) -> int:
         print(f"{args.src_host} -> {args.dst_host}")
         for spine in spines:
             for plane in range(_topo.NUM_PLANES):
-                sid = _topo.usid_outer_dst(tenant, plane, spine, dst_id)
+                sid = _topo.usid_outer_dst(tenant, plane, spine, dst_id,
+                                           sid_mode=args.sid)
                 print(f"      P{plane}:S{spine}  {sid}")
         return 0
 
     rows: list[dict[str, Any]] = []
     for spine in spines:
         for plane in range(_topo.NUM_PLANES):
-            sid = _topo.usid_outer_dst(tenant, plane, spine, dst_id)
+            sid = _topo.usid_outer_dst(tenant, plane, spine, dst_id,
+                                       sid_mode=args.sid)
             rows.append({
                 "plane": plane,
                 "path": spine,
@@ -451,6 +459,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         forwarded.append("--dry-run")
     if args.duration is not None:
         forwarded.extend(["--duration", args.duration])
+    if args.sid is not None:
+        forwarded.extend(["--sid", args.sid])
     return run_main(forwarded)
 
 
@@ -696,6 +706,11 @@ def _build_parser() -> argparse.ArgumentParser:
                        choices=("table", "json", "yaml", "sid"),
                        default="table",
                        help="output format ('sid' = scenario-style indented")
+    g_evs.add_argument("--sid", choices=("uA", "uN"), default="uA",
+                       help="outer uSID construction: uA (default) per-"
+                            "adjacency, forces each fabric hop onto one "
+                            "specific physical link; uN uses each hop's "
+                            "own node locator instead")
     g_evs.set_defaults(func=_cmd_get_evs)
 
     # --- run ----------------------------------------------------------
@@ -709,6 +724,10 @@ def _build_parser() -> argparse.ArgumentParser:
     r.add_argument("--dry-run", action="store_true")
     r.add_argument("--duration", default=None, metavar="DUR",
                    help="override every flow's duration (e.g. '5s', '500ms'); "
+                        "forwarded to run-scenario")
+    r.add_argument("--sid", choices=("uA", "uN"), default=None,
+                   help="override the scenario's outer uSID construction "
+                        "(uA=per-adjacency default, uN=node-locator); "
                         "forwarded to run-scenario")
     r.set_defaults(func=_cmd_run)
 

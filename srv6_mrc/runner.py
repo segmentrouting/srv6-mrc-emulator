@@ -105,6 +105,10 @@ class SenderResult:
     # compatibility, but the meaningful per-packet picks live in
     # per_ev_sent.
     spine: int = 0
+    # Outer uSID construction used for every packet in this run: "uA"
+    # (per-adjacency, default) or "uN" (node-locator). See
+    # `topo.usid_outer_dst` for the addressing rationale.
+    sid_mode: str = "uA"
 
     def to_dict(self) -> dict:
         return {
@@ -115,6 +119,7 @@ class SenderResult:
             "rate_pps": self.rate_pps,
             "duration_s": self.duration_s,
             "spine": self.spine,
+            "sid_mode": self.sid_mode,
             "sent": self.sent,
             "elapsed_s": round(self.elapsed_s, 3),
             "per_plane_sent": dict(sorted(self.per_plane_sent.items())),
@@ -231,7 +236,8 @@ def run_sender(flow: FlowEndpoint,
                duration_s: float,
                *,
                stop_event: Optional[threading.Event] = None,
-               progress_cb=None) -> SenderResult:
+               progress_cb=None,
+               sid_mode: str = "uA") -> SenderResult:
     """Run a single-flow sender loop with the given policy.
 
     Args:
@@ -242,6 +248,8 @@ def run_sender(flow: FlowEndpoint,
         stop_event: optional Event for external cancellation
         progress_cb: optional fn(seq, plane, path) called per packet
             (debug / sender-side MRC bookkeeping)
+        sid_mode: "uA" (default) or "uN" — outer uSID construction for
+            every packet; see `topo.usid_outer_dst`.
 
     Returns: SenderResult
     """
@@ -272,12 +280,14 @@ def run_sender(flow: FlowEndpoint,
             src_u = host_underlay_addr(flow.tenant, p, flow.src_id)
             plane_src_underlay[p] = src_u
             # Legacy fixed-spine precompute used by non-EV policies.
-            outer_d_fixed = usid_outer_dst(flow.tenant, p, spine, flow.dst_id)
+            outer_d_fixed = usid_outer_dst(flow.tenant, p, spine, flow.dst_id,
+                                           sid_mode=sid_mode)
             plane_meta[p] = (src_u, outer_d_fixed, (outer_d_fixed, 0, 0, 0))
 
         result = SenderResult(
             flow=flow, policy=policy.name,
             rate_pps=rate_pps, duration_s=duration_s, spine=spine,
+            sid_mode=sid_mode,
         )
 
         interval = 1.0 / rate_pps if rate_pps > 0 else 0.0
@@ -299,7 +309,8 @@ def run_sender(flow: FlowEndpoint,
                         )
                     src_u = plane_src_underlay[plane]
                     outer_d = usid_outer_dst(
-                        flow.tenant, plane, ev_spine, flow.dst_id
+                        flow.tenant, plane, ev_spine, flow.dst_id,
+                        sid_mode=sid_mode,
                     )
                     sa = (outer_d, 0, 0, 0)
                 else:

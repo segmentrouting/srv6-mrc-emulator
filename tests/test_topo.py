@@ -299,6 +299,35 @@ class TestUsidOuterDst(unittest.TestCase):
             dst = topo.usid_outer_dst("green", p, 0, 0)
             self.assertTrue(dst.startswith(f"fc00:000{p:x}:"))
 
+    def test_default_sid_mode_is_ua(self):
+        self.assertEqual(
+            topo.usid_outer_dst("green", 0, 0, 15),
+            topo.usid_outer_dst("green", 0, 0, 15, sid_mode="uA"),
+        )
+
+    def test_un_green_shape(self):
+        # uN swaps the adjacency hops (f00<S>, e00<L>) for node locators
+        # (1<S>, 2<L>); the decap tail is unaffected.
+        self.assertEqual(
+            topo.usid_outer_dst("green", 0, 0, 15, sid_mode="uN"),
+            "fc00:0000:10:2f:d000::",
+        )
+
+    def test_un_yellow_shape_keeps_host_hop_and_decap(self):
+        self.assertEqual(
+            topo.usid_outer_dst("yellow", 2, 3, 9, sid_mode="uN"),
+            "fc00:0002:13:29:e009:d001::",
+        )
+
+    def test_un_plane_encoded_in_block(self):
+        for p in range(topo.NUM_PLANES):
+            dst = topo.usid_outer_dst("green", p, 0, 0, sid_mode="uN")
+            self.assertTrue(dst.startswith(f"fc00:000{p:x}:"))
+
+    def test_bad_sid_mode_rejected(self):
+        with self.assertRaises(ValueError):
+            topo.usid_outer_dst("green", 0, 0, 15, sid_mode="uB")
+
 
 class TestValidation(unittest.TestCase):
     def test_bad_tenant(self):

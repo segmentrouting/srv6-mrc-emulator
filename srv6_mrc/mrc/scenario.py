@@ -26,6 +26,7 @@ Validates the full scenario shape laid out in mrc/README.md:
         spec: <netem-spec-string>
     report:                          # optional
       out: <path>
+    sid: uA|uN                       # optional; default uA (see below)
 
 The validator is intentionally strict — unknown keys raise. This catches
 typos like `paris:` vs `pairs:` before a long lab run.
@@ -53,7 +54,8 @@ from typing import Any
 
 from ..netem import normalize_spec, parse_target
 from ..policy import policy_from_spec
-from ..topo import NUM_LEAVES, NUM_SPINES, TENANTS, current_topology, host_name
+from ..topo import (NUM_LEAVES, NUM_SPINES, SID_MODES, TENANTS,
+                   current_topology, host_name)
 
 
 # --- public dataclasses -----------------------------------------------------
@@ -159,6 +161,12 @@ class Scenario:
     # by the spray CLI (via SRV6_PATHS_PER_PLANE env var or the
     # --paths-per-plane CLI flag).
     paths_per_plane: int | None = None
+    # Outer uSID construction for every flow in this scenario: "uA"
+    # (per-adjacency, default) or "uN" (node-locator). None means
+    # "use the uA default". Plumbed through to spray.py via the
+    # SRV6_SID_MODE env var or the --sid CLI flag (mrc/run.py main()
+    # overrides the scenario value the same way --duration does).
+    sid: str | None = None
 
 
 # --- named pair sets --------------------------------------------------------
@@ -269,7 +277,7 @@ def validate(doc: Any) -> Scenario:
 
     _require_keys(doc, "$", required={"name", "flows"},
                   optional={"description", "faults", "report", "mrc",
-                            "paths_per_plane"})
+                            "paths_per_plane", "sid"})
 
     name = _require_str(doc, "$.name")
     description = _opt_str(doc, "$.description", default="")
@@ -293,6 +301,8 @@ def validate(doc: Any) -> Scenario:
         doc.get("paths_per_plane"), "$.paths_per_plane"
     )
 
+    sid = _validate_sid_mode(doc.get("sid"), "$.sid")
+
     return Scenario(
         name=name,
         description=description,
@@ -301,6 +311,7 @@ def validate(doc: Any) -> Scenario:
         report=report,
         mrc=mrc,
         paths_per_plane=paths_per_plane,
+        sid=sid,
     )
 
 
@@ -442,6 +453,21 @@ def _validate_paths_per_plane(value: Any, path: str) -> int | None:
             path,
             f"must be 1..{NUM_SPINES} (NUM_SPINES on this topology), "
             f"got {value}"
+        )
+    return value
+
+
+def _validate_sid_mode(value: Any, path: str) -> str | None:
+    """Validate top-level scenario `sid: uA|uN` if present.
+
+    Returns None when absent (means "use the uA default at runtime");
+    raises ScenarioError on any value outside topo.SID_MODES.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in SID_MODES:
+        raise ScenarioError(
+            path, f"must be one of {SID_MODES}, got {value!r}"
         )
     return value
 
@@ -607,6 +633,18 @@ def override_duration(scenario: "Scenario", duration_s: float) -> "Scenario":
         dataclasses.replace(fs, duration_s=duration_s) for fs in scenario.flows
     )
     return dataclasses.replace(scenario, flows=new_flows)
+
+
+def override_sid_mode(scenario: "Scenario", sid_mode: str) -> "Scenario":
+    """Return a copy of `scenario` with `sid` set to `sid_mode`.
+
+    `sid` is scenario-level (not per-flow), so unlike `override_duration`
+    this is a single top-level `dataclasses.replace`. Caller (mrc/run.py
+    main()) validates `sid_mode` against topo.SID_MODES via the --sid
+    argparse `choices=` before calling this.
+    """
+    import dataclasses
+    return dataclasses.replace(scenario, sid=sid_mode)
 
 
 def _load_pyyaml():

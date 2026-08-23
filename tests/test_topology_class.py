@@ -146,12 +146,19 @@ class _ParityBase(unittest.TestCase):
             for plane in range(self.T.planes):
                 for spine in range(self.T.spines_per_plane):
                     for dst_leaf in range(self.T.leaves_per_plane):
-                        self.assertEqual(
-                            self.T.usid_outer_dst(
-                                tenant, plane, spine, dst_leaf),
-                            self.topo.usid_outer_dst(
-                                tenant, plane, spine, dst_leaf),
-                        )
+                        for sid_mode in ("uA", "uN"):
+                            self.assertEqual(
+                                self.T.usid_outer_dst(
+                                    tenant, plane, spine, dst_leaf,
+                                    sid_mode=sid_mode),
+                                self.topo.usid_outer_dst(
+                                    tenant, plane, spine, dst_leaf,
+                                    sid_mode=sid_mode),
+                            )
+
+    def test_usid_outer_dst_bad_sid_mode_rejected(self):
+        with self.assertRaises(ValueError):
+            self.T.usid_outer_dst("green", 0, 0, 0, sid_mode="uB")
 
     # --- selection ---------------------------------------------------
 

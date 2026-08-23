@@ -120,6 +120,28 @@ class TestGetEvs(unittest.TestCase):
         self.assertIn("e009", rows[0]["sid"])
         self.assertIn(":d001::", rows[0]["sid"])
 
+    def test_sid_flag_defaults_to_ua(self):
+        rc, out, _ = _run(["get", "evs", "green-host00", "green-host15",
+                           "-o", "json"])
+        self.assertEqual(rc, 0)
+        rows = json.loads(out)
+        self.assertTrue(rows[0]["sid"].startswith("fc00:0000:f000:e00f:d000"))
+
+    def test_sid_flag_un_uses_node_locators(self):
+        rc, out, _ = _run(["get", "evs", "green-host00", "green-host15",
+                           "-o", "json", "--sid", "uN"])
+        self.assertEqual(rc, 0)
+        rows = json.loads(out)
+        # plane=0 spine=0 dst_leaf=15(0xf): node locators 1<S>=10, 2<L>=2f.
+        self.assertTrue(rows[0]["sid"].startswith("fc00:0000:10:2f:d000"))
+
+    def test_sid_flag_un_in_sid_output_format(self):
+        rc, out, _ = _run(["get", "evs", "yellow-host00", "yellow-host15",
+                           "-o", "sid", "--sid", "uN"])
+        self.assertEqual(rc, 0)
+        self.assertIn("e009", out)
+        self.assertNotIn("f000", out)
+
     def test_n_subset_shrinks_grid(self):
         rc, out, _ = _run(["get", "evs", "green-host00", "green-host15",
                            "-n", "4", "-o", "json"])
@@ -217,6 +239,22 @@ class TestRun(unittest.TestCase):
         with mock.patch("srv6_mrc.mrc.run.main", return_value=0) as m:
             rc, _, _ = _run(["run", "green-mrc-baseline"])
         self.assertEqual(rc, 0)
+
+    def test_sid_flag_forwarded(self):
+        with mock.patch("srv6_mrc.mrc.run.main", return_value=0) as m:
+            rc, _, _ = _run(["run", "green-mrc-baseline", "--sid", "uN"])
+        self.assertEqual(rc, 0)
+        argv = m.call_args[0][0]
+        self.assertIn("--sid", argv)
+        i = argv.index("--sid")
+        self.assertEqual(argv[i + 1], "uN")
+
+    def test_sid_flag_absent_when_unset(self):
+        with mock.patch("srv6_mrc.mrc.run.main", return_value=0) as m:
+            rc, _, _ = _run(["run", "green-mrc-baseline"])
+        self.assertEqual(rc, 0)
+        argv = m.call_args[0][0]
+        self.assertNotIn("--sid", argv)
         argv = m.call_args[0][0]
         self.assertNotIn("--duration", argv)
 

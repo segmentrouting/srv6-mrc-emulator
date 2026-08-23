@@ -28,6 +28,8 @@ Run inside any lab host container:
 
 Optional flags:
     --policy {round_robin,hash5tuple,weighted:0.4,0.3,0.2,0.1,health_aware_mrc}
+    --sid {uA,uN}       outer uSID construction (default uA); see
+                        `srv6_mrc.topo.usid_outer_dst`
     --mrc               (recv) start MRC receiver agent (probe responder +
                         per-plane loss reporter); sender side auto-starts
                         a SenderMrcAgent when --policy=health_aware_mrc
@@ -79,6 +81,28 @@ def parse_duration(s: str) -> float:
         raise argparse.ArgumentTypeError(f"bad --duration: {s!r}")
     val = float(m.group(1))
     return val / 1000.0 if m.group(2) == "ms" else val
+
+
+def _resolve_sid_mode(args) -> tuple[str | None, int]:
+    """Resolve --sid: CLI flag wins over SRV6_SID_MODE env, env wins
+    over the "uA" default. Mirrors the --paths-per-plane / env
+    precedence in cmd_send.
+
+    Returns (sid_mode, exit_code). On a bad env value, sid_mode is
+    None and exit_code is nonzero — caller should `return` it
+    immediately.
+    """
+    mode = "uA"
+    env_mode = os.environ.get("SRV6_SID_MODE")
+    if env_mode:
+        if env_mode not in ("uA", "uN"):
+            print(f"spray.py: SRV6_SID_MODE={env_mode!r} must be 'uA' or 'uN'",
+                  file=sys.stderr)
+            return None, 2
+        mode = env_mode
+    if getattr(args, "sid", None) is not None:
+        mode = args.sid
+    return mode, 0
 
 
 def parse_policy(s: str, *, tenant: str, ev_config=None,
@@ -286,6 +310,10 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
     if getattr(args, "paths_per_plane", None) is not None:
         ppp = args.paths_per_plane
 
+    sid_mode, rc = _resolve_sid_mode(args)
+    if rc:
+        return rc
+
     policy = parse_policy(
         args.policy, tenant=tenant, ev_config=ev_cfg, paths_per_plane=ppp,
         src_host_id=my_id,
@@ -307,6 +335,7 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
             dst_id=args.dst_id,
             table=policy.table,
             config=agent_cfg,
+            sid_mode=sid_mode,
         )
         progress_cb = lambda _seq, plane, path: mrc_agent.record_sent(plane, path)
 
@@ -317,12 +346,13 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
         print(f"spray.py SEND  tenant={tenant}  "
               f"src=host{my_id:02d}  dst=host{args.dst_id:02d}")
         print(f"               spine=p<P>-spine{spine:02d}  "
-              f"policy={policy.name}  "
+              f"policy={policy.name}  sid={sid_mode}  "
               f"rate={args.rate}pps  duration={args.duration}s")
         print(f"               inner: {src_inner} -> {dst_inner}")
         for p in range(NUM_PLANES):
             src_outer = host_underlay_addr(tenant, p, my_id)
-            dst_outer = usid_outer_dst(tenant, p, spine, args.dst_id)
+            dst_outer = usid_outer_dst(tenant, p, spine, args.dst_id,
+                                       sid_mode=sid_mode)
             print(f"                 plane {p}: {src_outer} -> {dst_outer}"
                   f"  via {PLANE_NICS[p]}")
 
@@ -332,7 +362,7 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
     try:
         result = run_sender(
             flow, policy, args.rate, args.duration,
-            progress_cb=progress_cb,
+            progress_cb=progress_cb, sid_mode=sid_mode,
         )
     finally:
         # Capture EV-state + fusion-stats BEFORE stop() so the snapshot
@@ -404,10 +434,14 @@ def cmd_recv(args, tenant: str, my_id: int) -> int:
         except ValueError as e:
             print(f"spray.py: {e}", file=sys.stderr)
             return 2
+        sid_mode, rc = _resolve_sid_mode(args)
+        if rc:
+            return rc
         mrc_agent = ReceiverMrcAgent(
             tenant=tenant,
             my_id=my_id,
             config=agent_cfg,
+            sid_mode=sid_mode,
         )
 
         def _on_packet(flow_key, plane: int, path: int, seq: int) -> None:
@@ -569,6 +603,10 @@ def cmd_mrc_daemon(args, tenant: str, my_id: int) -> int:
         print(f"spray.py: {e}", file=sys.stderr)
         return 2
 
+    sid_mode, rc = _resolve_sid_mode(args)
+    if rc:
+        return rc
+
     snapshot_dir = args.snapshot_dir or DEFAULT_SNAPSHOT_DIR
 
     # Detect src_host name from container env if available; fall back
@@ -580,6 +618,7 @@ def cmd_mrc_daemon(args, tenant: str, my_id: int) -> int:
         src_host=src_host, src_id=my_id, flows=flows,
         agent_cfg=agent_cfg, ev_cfg=ev_cfg,
         snapshot_dir=snapshot_dir,
+        sid_mode=sid_mode,
     )
 
     # Wire SIGTERM (orchestrator's shutdown signal) and SIGINT (Ctrl-C
@@ -664,6 +703,14 @@ def main() -> int:
                         "field propagate via env without rewriting the "
                         "policy string. CLI flag wins over env; env wins "
                         "over policy default.")
+    p.add_argument("--sid", choices=("uA", "uN"), default=None,
+                   help="(send/recv/mrc-daemon) outer uSID construction: "
+                        "uA (default) uses per-adjacency SIDs that force "
+                        "one specific physical link per fabric hop; uN "
+                        "uses each hop's own node locator instead, "
+                        "letting the already-provisioned underlay static "
+                        "routes pick the link. CLI flag wins over "
+                        "SRV6_SID_MODE env, env wins over 'uA'.")
     p.add_argument("--idle-timeout", type=parse_duration,
                    default=parse_duration("6s"),
                    help="(recv) auto-exit after this much silence "

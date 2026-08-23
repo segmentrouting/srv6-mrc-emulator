@@ -680,17 +680,60 @@ def probe_ev_from_inner_dst(addr: str) -> tuple[str, int, int, int] | None:
 
 # --- uSID outer destination -------------------------------------------------
 
-def usid_outer_dst(tenant: str, plane: int, spine: int, dst_leaf: int) -> str:
+# Two ways to encode the leaf<->spine transit hops of the outer uSID
+# list. Both are provisioned by the generator on every node (see
+# generators/fabric.py write_leaf_frr / write_spine_frr) so either can
+# be selected at send time with no config changes:
+#
+#   uA (default): per-adjacency SIDs (f00<S> on the leaf, e00<L> on the
+#     spine). Each SID is bound to one specific interface+nexthop, so
+#     the chosen spine is forced onto one specific physical link
+#     regardless of what the underlay's routing table would otherwise
+#     pick. This is what MRC needs for deterministic per-path
+#     measurement.
+#
+#   uN: node-locator SIDs (1<S> = spine S's own locator, 2<L> = leaf
+#     L's own locator). Each hop is a plain node lookup; the generator
+#     also emits a static route to every other node's locator that
+#     happens to be single-path in this topology (each leaf has
+#     exactly one link to each spine, and vice versa), so uN mode
+#     produces the same physical path as uA here — the difference is
+#     that forwarding is decided by the underlay's FIB at each hop
+#     instead of being pinned directly in the SID.
+SID_MODES: tuple[str, ...] = ("uA", "uN")
+
+
+def _check_sid_mode(v: str) -> None:
+    if v not in SID_MODES:
+        raise ValueError(f"sid_mode must be one of {SID_MODES}, got {v!r}")
+
+
+def usid_outer_dst(tenant: str, plane: int, spine: int, dst_leaf: int,
+                   sid_mode: str = "uA") -> str:
     """Outer IPv6 destination = compressed uSID list.
 
-    Green : fc00:000<P>:f00<S>:e00<L>:d000::
-    Yellow: fc00:000<P>:f00<S>:e00<L>:e009:d001::
+    uA (default):
+      Green : fc00:000<P>:f00<S>:e00<L>:d000::
+      Yellow: fc00:000<P>:f00<S>:e00<L>:e009:d001::
+
+    uN:
+      Green : fc00:000<P>:1<S>:2<L>:d000::
+      Yellow: fc00:000<P>:1<S>:2<L>:e009:d001::
+
+    The host-facing hop (`e009`, yellow only) and the decap tail
+    (`d000` / `e009:d001`) are unaffected by `sid_mode` — there is no
+    node locator for the alpine host container, so that hop is always
+    an adjacency SID.
     """
     _check_tenant(tenant)
     _check_plane(plane)
     _check_spine(spine)
     _check_host(dst_leaf)
-    head = f"fc00:000{plane:x}:f00{spine:x}:e00{dst_leaf:x}"
+    _check_sid_mode(sid_mode)
+    if sid_mode == "uA":
+        head = f"fc00:000{plane:x}:f00{spine:x}:e00{dst_leaf:x}"
+    else:
+        head = f"fc00:000{plane:x}:1{spine:x}:2{dst_leaf:x}"
     return f"{head}:d000::" if tenant == "green" else f"{head}:e009:d001::"
 
 

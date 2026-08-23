@@ -83,7 +83,8 @@ _infer_srv6_topo_from_argv()
 from srv6_mrc.netem import Fault, Netem
 from srv6_mrc.report import ScenarioReport
 from srv6_mrc.mrc.scenario import (
-    MrcSpec, Scenario, from_yaml_file, override_duration, parse_duration_str,
+    MrcSpec, Scenario, from_yaml_file, override_duration, override_sid_mode,
+    parse_duration_str,
 )
 from srv6_mrc.topo import (current_topology, inner_addr,
                               select_spines_for_addrs, usid_outer_dst)
@@ -273,23 +274,29 @@ def _recv_argv(idle_timeout_s: float, *, mrc: bool) -> list[str]:
 
 
 def _scenario_env(mrc: MrcSpec | None,
-                  paths_per_plane: int | None) -> dict[str, str] | None:
+                  paths_per_plane: int | None,
+                  sid_mode: str | None = None) -> dict[str, str] | None:
     """Build the env dict passed to docker exec for a scenario run.
 
-    Bundles both MRC tunables (SRV6_MRC_CONFIG_JSON) and the EV-spray
-    fan-out override (SRV6_PATHS_PER_PLANE). Returns None when neither
-    knob is set, so non-MRC scenarios without EV-spray see no -e flags
-    and the on-wire behavior is identical to pre-EV runs.
+    Bundles MRC tunables (SRV6_MRC_CONFIG_JSON), the EV-spray fan-out
+    override (SRV6_PATHS_PER_PLANE), and the outer-uSID mode
+    (SRV6_SID_MODE). Returns None when none of these are set, so plain
+    scenarios see no -e flags and the on-wire behavior is unchanged.
 
-    paths_per_plane is propagated even when MRC is disabled, because
-    EV-spray is a sender-side concern independent of the MRC probe/EV
-    state machine.
+    paths_per_plane and sid_mode are propagated even when MRC is
+    disabled, because EV-spray fan-out and uSID construction are
+    sender/receiver-side concerns independent of the MRC probe/EV
+    state machine. sid_mode also reaches receivers (and any MRC
+    daemon), since loss-report traffic uses the same usid_outer_dst
+    call as data packets.
     """
     env: dict[str, str] = {}
     if mrc is not None:
         env["SRV6_MRC_CONFIG_JSON"] = mrc.to_env_json()
     if paths_per_plane is not None:
         env["SRV6_PATHS_PER_PLANE"] = str(paths_per_plane)
+    if sid_mode is not None:
+        env["SRV6_SID_MODE"] = sid_mode
     # Passthrough diagnostic flags from the orchestrator's env into the
     # sender/receiver containers. Used today only for transition
     # logging; opt-in (only forwarded when set on the host).
@@ -403,6 +410,7 @@ def run_flows(flows: list[FlowRun], *,
               settle_s: float = RECEIVER_SETTLE_S,
               mrc: MrcSpec | None = None,
               paths_per_plane: int | None = None,
+              sid_mode: str | None = None,
               verbose: bool = False) -> tuple[list[dict], list[dict], list[dict]]:
     """Run all flows concurrently. Returns (sender_records, receiver_records,
     daemon_records).
@@ -444,7 +452,7 @@ def run_flows(flows: list[FlowRun], *,
     max_dur = max((f.duration_s for f in flows), default=0.0)
     recv_max_wait = max_dur + idle_timeout_s + 30.0
 
-    env = _scenario_env(mrc, paths_per_plane)
+    env = _scenario_env(mrc, paths_per_plane, sid_mode)
     mrc_enabled = mrc is not None
 
     if verbose:
@@ -751,7 +759,8 @@ def _ev_spray_n(policy_cli: str,
 
 
 def _print_ev_preview(flows: list[FlowRun],
-                      scenario_ppp: int | None) -> None:
+                      scenario_ppp: int | None,
+                      sid_mode: str | None = None) -> None:
     """Verbose-mode preview: for each EV-spray flow, print the spine
     subset and the resolved outer-DA per (plane, spine).
 
@@ -786,7 +795,8 @@ def _print_ev_preview(flows: list[FlowRun],
         for spine in spines:
             for plane in range(topo_t.planes):
                 outer = usid_outer_dst(flow.tenant, plane, spine,
-                                       flow.dst_id)
+                                       flow.dst_id,
+                                       sid_mode=sid_mode or "uA")
                 print(f"      P{plane}:S{spine}  {outer}")
 
 
@@ -803,12 +813,13 @@ def run_scenario(scenario: Scenario, *,
             print("    (disabled)")
         else:
             print(f"    enabled, env=SRV6_MRC_CONFIG_JSON={scenario.mrc.to_env_json()}")
+        print(f"  sid: {scenario.sid or 'uA'}")
         print(f"  flows:")
         for fr in flows:
             print(f"    {fr.src_host} -> {fr.dst_host}  "
                   f"policy={fr.policy_cli}  rate={fr.rate_pps}pps  "
                   f"dur={fr.duration_s}s")
-        _print_ev_preview(flows, scenario.paths_per_plane)
+        _print_ev_preview(flows, scenario.paths_per_plane, scenario.sid)
         print(f"  faults:")
         if not scenario.faults:
             print("    (none)")
@@ -849,7 +860,8 @@ def run_scenario(scenario: Scenario, *,
     if verbose:
         if scenario.mrc is not None:
             print(f"  mrc: enabled (env={scenario.mrc.to_env_json()})")
-        _print_ev_preview(flows, scenario.paths_per_plane)
+        print(f"  sid: {scenario.sid or 'uA'}")
+        _print_ev_preview(flows, scenario.paths_per_plane, scenario.sid)
         if scenario.faults:
             print(f"  applying {len(scenario.faults)} fault(s)...")
 
@@ -860,6 +872,7 @@ def run_scenario(scenario: Scenario, *,
         sender_records, receiver_records, daemon_records = run_flows(
             flows, mrc=scenario.mrc,
             paths_per_plane=scenario.paths_per_plane,
+            sid_mode=scenario.sid,
             verbose=verbose,
         )
     finally:
@@ -900,6 +913,12 @@ def main(argv: list[str] | None = None) -> int:
                    metavar="DUR",
                    help="override every flow's duration (e.g. '5s', '500ms'); "
                         "applied after YAML parse, before run")
+    p.add_argument("--sid", choices=("uA", "uN"), default=None,
+                   help="override the scenario's outer uSID construction: "
+                        "uA (default) forces each fabric hop onto one "
+                        "specific physical link via per-adjacency SIDs; "
+                        "uN uses each hop's own node locator instead. "
+                        "Applied after YAML parse, before run.")
     args = p.parse_args(argv)
 
     try:
@@ -914,6 +933,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.duration is not None:
         scenario = override_duration(scenario, args.duration)
+    if args.sid is not None:
+        scenario = override_sid_mode(scenario, args.sid)
 
     try:
         report = run_scenario(scenario, dry_run=args.dry_run,

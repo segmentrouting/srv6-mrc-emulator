@@ -265,18 +265,34 @@ class Topology:
             return f"2001:db8:bbbb:{host_id:02x}::2"
         return f"2001:db8:cccc:{host_id:02x}::2"
 
+    def check_sid_mode(self, sid_mode: str) -> None:
+        if sid_mode not in ("uA", "uN"):
+            raise ValueError(
+                f"sid_mode must be one of ('uA', 'uN'), got {sid_mode!r}"
+            )
+
     def usid_outer_dst(self, tenant: str, plane: int, spine: int,
-                       dst_leaf: int) -> str:
+                       dst_leaf: int, sid_mode: str = "uA") -> str:
         """Outer IPv6 destination = compressed uSID list.
 
-        Green : fc00:000<P>:f00<S>:e00<L>:d000::
-        Yellow: fc00:000<P>:f00<S>:e00<L>:e009:d001::
+        uA (default):
+          Green : fc00:000<P>:f00<S>:e00<L>:d000::
+          Yellow: fc00:000<P>:f00<S>:e00<L>:e009:d001::
+
+        uN (node-locator hops instead of adjacency hops; see
+        `topo.usid_outer_dst` for the full rationale):
+          Green : fc00:000<P>:1<S>:2<L>:d000::
+          Yellow: fc00:000<P>:1<S>:2<L>:e009:d001::
         """
         self.check_tenant(tenant)
         self.check_plane(plane)
         self.check_spine(spine)
         self.check_host(dst_leaf)
-        head = f"fc00:000{plane:x}:f00{spine:x}:e00{dst_leaf:x}"
+        self.check_sid_mode(sid_mode)
+        if sid_mode == "uA":
+            head = f"fc00:000{plane:x}:f00{spine:x}:e00{dst_leaf:x}"
+        else:
+            head = f"fc00:000{plane:x}:1{spine:x}:2{dst_leaf:x}"
         return (f"{head}:d000::" if tenant == "green"
                 else f"{head}:e009:d001::")
 

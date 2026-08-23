@@ -180,6 +180,7 @@ class MrcDaemon:
         transport: Optional[MrcTransport] = None,
         snapshot_dir: str = DEFAULT_SNAPSHOT_DIR,
         clock_ns: Callable[[], int] = time.monotonic_ns,
+        sid_mode: str = "uA",
     ) -> None:
         if not flows:
             raise ValueError("MrcDaemon requires at least one flow")
@@ -201,6 +202,7 @@ class MrcDaemon:
                 tenant=flows[0].tenant,
                 my_id=src_id,
                 is_sender=True,
+                sid_mode=sid_mode,
             )
         self.transport = transport
 

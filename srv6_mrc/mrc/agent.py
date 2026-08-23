@@ -197,6 +197,7 @@ class SenderMrcAgent:
         config: AgentConfig,
         transport: Optional[MrcTransport] = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
+        sid_mode: str = "uA",
     ) -> None:
         if table.num_planes != NUM_PLANES:
             raise ValueError(
@@ -242,6 +243,7 @@ class SenderMrcAgent:
         if transport is None:
             transport = Srv6RawTransport(
                 tenant=tenant, my_id=src_id, is_sender=True,
+                sid_mode=sid_mode,
             )
         self.transport = transport
 
@@ -517,6 +519,7 @@ class ReceiverMrcAgent:
         config: AgentConfig,
         transport: Optional[MrcTransport] = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
+        sid_mode: str = "uA",
     ) -> None:
         self.tenant = tenant
         self.my_id = my_id
@@ -539,6 +542,7 @@ class ReceiverMrcAgent:
         if transport is None:
             transport = Srv6RawTransport(
                 tenant=tenant, my_id=my_id, is_sender=False,
+                sid_mode=sid_mode,
             )
         self.transport = transport
 

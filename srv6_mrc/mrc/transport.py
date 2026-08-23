@@ -164,10 +164,16 @@ class Srv6RawTransport(MrcTransport):
         tenant: str,
         my_id: int,
         is_sender: bool = True,
+        sid_mode: str = "uA",
     ) -> None:
         self.tenant = tenant
         self.my_id = my_id
         self._is_sender = is_sender
+        # Outer uSID construction for loss-report TX ("uA" or "uN").
+        # Stateless PROBE round trips (send_probe / probe_outer_dst)
+        # are unaffected — that scheme is a fixed adjacency-based
+        # round trip, not a sid_mode choice. See topo.usid_outer_dst.
+        self._sid_mode = sid_mode
 
         # One raw send socket per plane. Used for probe emit and loss-
         # report TX.
@@ -280,6 +286,7 @@ class Srv6RawTransport(MrcTransport):
         # data-path uSIDs (one-way; no round-trip).
         outer_dst = usid_outer_dst(
             self.tenant, plane=plane, spine=path, dst_leaf=dst_leaf,
+            sid_mode=self._sid_mode,
         )
         pkt = build_outer_packet(
             src_underlay=self._loss_inner_src,
