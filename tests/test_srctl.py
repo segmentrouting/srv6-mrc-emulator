@@ -139,7 +139,10 @@ class TestGetEvs(unittest.TestCase):
         rc, out, _ = _run(["get", "evs", "yellow-host00", "yellow-host15",
                            "-o", "sid", "--sid", "uN"])
         self.assertEqual(rc, 0)
-        self.assertIn("e009", out)
+        # uN mode carries only node-locator SIDs + the d001 decap tail;
+        # no uA adjacency hops (e009, f000...) anywhere in the list.
+        self.assertIn("d001", out)
+        self.assertNotIn("e009", out)
         self.assertNotIn("f000", out)
 
     def test_n_subset_shrinks_grid(self):

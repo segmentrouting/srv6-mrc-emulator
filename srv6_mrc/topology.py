@@ -280,9 +280,11 @@ class Topology:
           Yellow: fc00:000<P>:f00<S>:e00<L>:e009:d001::
 
         uN (node-locator hops instead of adjacency hops; see
-        `topo.usid_outer_dst` for the full rationale):
+        `topo.usid_outer_dst` for the full rationale — uN skips the
+        `e009` host-facing hop for yellow, relying on a plain FIB
+        route on the leaf straight to the locally-attached host):
           Green : fc00:000<P>:1<S>:2<L>:d000::
-          Yellow: fc00:000<P>:1<S>:2<L>:e009:d001::
+          Yellow: fc00:000<P>:1<S>:2<L>:d001::
         """
         self.check_tenant(tenant)
         self.check_plane(plane)
@@ -291,10 +293,12 @@ class Topology:
         self.check_sid_mode(sid_mode)
         if sid_mode == "uA":
             head = f"fc00:000{plane:x}:f00{spine:x}:e00{dst_leaf:x}"
+            yellow_tail = "e009:d001::"
         else:
             head = f"fc00:000{plane:x}:1{spine:x}:2{dst_leaf:x}"
+            yellow_tail = "d001::"
         return (f"{head}:d000::" if tenant == "green"
-                else f"{head}:e009:d001::")
+                else f"{head}:{yellow_tail}")
 
     def leaf_gateway_addr(self, tenant: str, plane: int,
                           host_id: int) -> str:

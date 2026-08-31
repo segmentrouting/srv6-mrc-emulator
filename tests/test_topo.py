@@ -313,10 +313,14 @@ class TestUsidOuterDst(unittest.TestCase):
             "fc00:0000:10:2f:d000::",
         )
 
-    def test_un_yellow_shape_keeps_host_hop_and_decap(self):
+    def test_un_yellow_shape_skips_host_hop(self):
+        # uN mode drops the e009 adjacency hop entirely: the leaf routes
+        # straight to the host via a plain FIB entry for d001 (see
+        # generators/fabric.py::write_leaf_frr), so the packet only ever
+        # carries uN SIDs.
         self.assertEqual(
             topo.usid_outer_dst("yellow", 2, 3, 9, sid_mode="uN"),
-            "fc00:0002:13:29:e009:d001::",
+            "fc00:0002:13:29:d001::",
         )
 
     def test_un_plane_encoded_in_block(self):

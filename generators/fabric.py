@@ -557,6 +557,15 @@ def write_leaf_frr(plane: int, leaf: int) -> None:
         for s in range(NUM_SPINES):
             nh = f"{p2p_prefix(s, leaf)}::0"
             static_routes.append(f"ipv6 route {leaf_locator(plane, other)} {nh}")
+    # uN-mode direct-to-host route for yellow's `d001` uDT6 SID. In uA
+    # mode the outer SID list forces the leaf through the `e009`
+    # adjacency SID above to reach the host; uN mode's SID list omits
+    # that hop and lands directly on `d001`, which isn't a leaf-local
+    # SID (the host owns it via its own seg6local route) — so the leaf
+    # just needs an ordinary FIB entry pointing at its locally-attached
+    # yellow host. Harmless to provision unconditionally: it doesn't
+    # overlap any other configured prefix, so uA mode is unaffected.
+    static_routes.append(f"ipv6 route {yellow_udt_sid(plane)} {yellow_host_nh}")
     static_routes_block = "\n".join(static_routes)
 
     txt = f"""hostname {hostname}

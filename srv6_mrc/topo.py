@@ -718,12 +718,23 @@ def usid_outer_dst(tenant: str, plane: int, spine: int, dst_leaf: int,
 
     uN:
       Green : fc00:000<P>:1<S>:2<L>:d000::
-      Yellow: fc00:000<P>:1<S>:2<L>:e009:d001::
+      Yellow: fc00:000<P>:1<S>:2<L>:d001::
 
-    The host-facing hop (`e009`, yellow only) and the decap tail
-    (`d000` / `e009:d001`) are unaffected by `sid_mode` — there is no
-    node locator for the alpine host container, so that hop is always
-    an adjacency SID.
+    Green's decap (`d000`) always lands directly at the destination
+    leaf — no host-facing hop needed, since the leaf uDT6-decaps
+    straight into Vrf-green where the host is directly connected.
+
+    Yellow is host-decapped (the host itself owns `d001` via its own
+    seg6local route), so it needs to get the still-encapsulated packet
+    from the egress leaf to the host:
+      - uA mode inserts an explicit adjacency hop (`e009`) that forces
+        the leaf to forward out its host-facing interface.
+      - uN mode skips that hop: the generator instead gives every leaf
+        a plain FIB route for the `d001` prefix pointing at its own
+        locally-attached yellow host (see
+        generators/fabric.py::write_leaf_frr), so once the leaf's own
+        node locator is consumed the remaining `d001` slot is just an
+        ordinary routing decision, not another SID hop.
     """
     _check_tenant(tenant)
     _check_plane(plane)
@@ -732,9 +743,11 @@ def usid_outer_dst(tenant: str, plane: int, spine: int, dst_leaf: int,
     _check_sid_mode(sid_mode)
     if sid_mode == "uA":
         head = f"fc00:000{plane:x}:f00{spine:x}:e00{dst_leaf:x}"
+        yellow_tail = "e009:d001::"
     else:
         head = f"fc00:000{plane:x}:1{spine:x}:2{dst_leaf:x}"
-    return f"{head}:d000::" if tenant == "green" else f"{head}:e009:d001::"
+        yellow_tail = "d001::"
+    return f"{head}:d000::" if tenant == "green" else f"{head}:{yellow_tail}"
 
 
 # --- flow identity ----------------------------------------------------------

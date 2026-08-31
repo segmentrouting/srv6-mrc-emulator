@@ -33,6 +33,14 @@ Invariants pinned:
       in its frr.conf, pointing into vrf default (Linux table
       main). Missing it kills the round trip at the sender's leaf;
       pointing into a VRF would deliver to the wrong RIB.
+
+  G6. Every leaf in every plane has exactly one plain `ipv6 route`
+      for that plane's `d001` prefix, pointing at the leaf's own
+      locally-attached yellow host. This is what lets `--sid uN`
+      data traffic skip the `e009` adjacency hop (see
+      `srv6_mrc.topo.usid_outer_dst`): without this route the leaf
+      has no FIB entry for `d001` once uN mode omits `e009`, and
+      uN yellow traffic silently black-holes at the egress leaf.
 """
 
 from __future__ import annotations
@@ -234,6 +242,33 @@ class StatelessProbeGeneratorInvariants(unittest.TestCase):
                     len(matches), 1,
                     f"p{plane}-leaf{leaf:02d} frr.conf has "
                     f"{len(matches)} dfff static-sid lines; expected 1",
+                )
+                seen += 1
+        self.assertEqual(seen, leaf_count)
+
+    # G6 ----------------------------------------------------------------
+    def test_d001_direct_route_present_on_every_leaf(self) -> None:
+        leaf_count = self.fab.NUM_PLANES * self.fab.NUM_LEAVES
+        seen = 0
+        for plane in range(self.fab.NUM_PLANES):
+            for leaf in range(self.fab.NUM_LEAVES):
+                frr = (
+                    TOPO_4P_4X8 / "config" / f"p{plane}-leaf{leaf:02d}"
+                    / "frr.conf"
+                )
+                txt = frr.read_text()
+                expected_nh = f"{self.fab.yellow_host_anycast_prefix(leaf)}::2"
+                pat = re.compile(
+                    rf"ipv6 route fc00:000{plane:x}:d001::/48 "
+                    rf"{re.escape(expected_nh)}$",
+                    re.MULTILINE,
+                )
+                matches = pat.findall(txt)
+                self.assertEqual(
+                    len(matches), 1,
+                    f"p{plane}-leaf{leaf:02d} frr.conf has "
+                    f"{len(matches)} d001 direct-to-host routes "
+                    f"(expected 1, nexthop {expected_nh})",
                 )
                 seen += 1
         self.assertEqual(seen, leaf_count)
