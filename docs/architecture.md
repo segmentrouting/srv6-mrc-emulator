@@ -17,7 +17,7 @@ which the MRC emulator captures or models:
 |-----------------|--------------------------------------------|---------------------------------------------------|
 | **Workload**    | CCL / NCCL / `ib_write_bw` on the GPU host | srv6_mrc traffic generator                  |
 | **NIC**         | MRC firmware on CX-8 / Pollara / Thor Ultra| Per-host MRC agent + raw-socket encap fast-path   |
-| **Fabric**      | T0 / T1 switches running SRv6 (uN)         | docker-sonic-vs nodes with static SRv6 (uA) routes|
+| **Fabric**      | T0 / T1 switches running SRv6 (uN)         | docker-sonic-vs nodes with static SRv6 (uA and uN, `--sid` selectable) routes|
 
 These roles have very different addressing concerns:
 
@@ -70,7 +70,7 @@ so "select EV" reduces to "select plane". For each `(inner_address, plane)`
 pair the NIC emits a packet whose outer destination is a uSID list
 encoding the chosen plane's path to the destination T0:
 
-Host Decap example:
+Host Decap example (uA, default):
 ```
 fc00:<P>:f00<S>:e00<L>:e009:d001::
        │   │      │      │
@@ -79,6 +79,19 @@ fc00:<P>:f00<S>:e00<L>:e009:d001::
        │   └── leaf uA to spine
        └── plane index
 ```
+
+The same example in uN (node-locator) mode, selected via `--sid uN`:
+```
+fc00:<P>:1<S>:2<L>:d001::
+       │   │    │
+       │   │    └── remote leaf's own uN locator; leaf then routes
+       │   │        directly to the host (no e009 hop needed)
+       │   └── spine's own uN locator
+       └── plane index
+```
+Both modes decode to the same physical path and the same `d001` host
+decap — uN just resolves each hop via the underlay FIB instead of
+pinning it in the SID. See `fabric-design.md` for the full rationale.
 
 The per-host underlay addresses (`cccc:<NN>::2` on yellow eth(P+1),
 `bbbb:<NN>::2` on green eth(P+1)) are **NIC-internal**. They are the
@@ -141,10 +154,11 @@ on the wire is still NIC-bound via `SO_BINDTODEVICE` on `eth(P+1)`
 
 Differences worth flagging:
 
-- **uA vs uN.** The paper uses uN (each switch named, End behavior). We
-  use uA (segments encode adjacencies, End.X behavior). This is a
-  customer preference; it changes the *encoding* of the uSID list but
-  not the *control loop*.
+- **uA vs uN.** The paper uses uN (each switch named, End behavior). The
+  emulator supports both, selectable per run via `--sid uA|uN` (default
+  `uA`, a customer preference for deterministic per-path pinning); `uN`
+  matches the paper's encoding. Either way it only changes the
+  *encoding* of the uSID list, not the *control loop*.
 - **Per-EV path granularity.** The paper has hundreds of EVs per QP,
   each a distinct path. The emulator's EV-spray data path varies the plane and spine
   per packet, and the MRC control plane (probes + loss reports) tracks the
@@ -161,7 +175,7 @@ Differences worth flagging:
 |----------------------------------|----------------------------------------|---------------------------------------|--------------------------------------------------|
 | Topology                         | 2-tier multi-plane Clos                | 2-tier 4-plane Clos                   | Match                                           |
 | Switch fabric                    | Hardware, line rate                    | docker-sonic-vs                       | Lab constraint                                   |
-| Routing                          | Static SRv6 uN                         | Static SRv6 uA                        | Operator preference                              |
+| Routing                          | Static SRv6 uN                         | Static SRv6 uA (default) or uN, both always provisioned, `--sid` selects per run | uA default is an operator preference for deterministic per-path pinning; uN available to match the paper |
 | PFC                              | Disabled                               | N/A (no RDMA)                         | Match in spirit                                  |
 | Transport                        | RoCEv2 + MRC extensions                | Plain UDP spray                       | Verbs unavailable in emulator                    |
 | EV granularity                   | 100–256 EVs per QP                     | Up to NUM_PLANES × paths_per_plane EVs per QP (default 32 on 4p-8x16) | Plane/Path fidelity is enough for simulation |

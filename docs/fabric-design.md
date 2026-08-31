@@ -8,8 +8,12 @@ available), with multi-homed tenant hosts uplinked into every plane.
 ### Default topology
 - **48 SONiC switches** (16 spines + 32 leaves) in the default 4p-4x8 topology
 - **16 Alpine hosts** (8 green tenant + 8 yellow tenant), each with 4 NIC uplinks
-- **No BGP, no IGP** — every transit FIB entry is a static route or an SRv6 uA
-  SID; the controller installs end-to-end SR policies for tenant traffic.
+- **No BGP, no IGP** — every transit FIB entry is a static route, an SRv6 uA
+  SID, or an SRv6 uN SID; the controller installs end-to-end SR policies for
+  tenant traffic. Every node is provisioned with **both** uA (adjacency) and
+  uN (node-locator) SIDs at once, so traffic tools pick between them per run
+  via `--sid uA|uN` (default `uA`) with no config regeneration required — see
+  [Reading a SR-policy SID list](#reading-a-sr-policy-sid-list).
 
 ## Quickstart
 Instructions to quickly deploy and play with the topology can be found in the [quickstart.md](./quickstart.md) guide
@@ -28,6 +32,7 @@ High level architecture:
 3. **Function-bit conventions across the fabric**:
     — `f000 - f0ff`: reserved for northbound uA allocation (leaf up to spine, spine up to super-spine, etc.)
     - `e000 - e0ff`: reserved for southbound uA allocation (spine down to leaf, leaf down to host, etc.)
+    - `1000 - 1fff` / `2000 - 2fff`: node locators (a node's own `behavior uN` SID — spines use `1<S>`, leaves use `2<L>`). This is the uN alternative to the `f00<S>`/`e00<L>` uA hops above: same physical path in this topology (each leaf has exactly one link to each spine), but forwarding is decided by the underlay FIB at each hop instead of being pinned in the SID.
     - `d000 - dfff`: reserved for tenant-ID uDT6 SIDs. 
     - These allocations are a reference design and could certainly be adjusted depending on the deployment
 4. **Two SRv6 multi-tenancy models**:
@@ -43,12 +48,13 @@ High level architecture:
 |---|---|---|
 | Cluster aggregate | `fc00:0000::/30` | covers all 4 planes |
 | Plane block | `fc00:000<P>::/32` | plane 2 → `fc00:0002::/32` |
-| Spine locator | `fc00:000<P>:1<S>::/48` | p2-spine03 → `fc00:0002:13::/48` [Link](../topologies/4p-4x8/config/p2-spine03/frr.conf#L22) |
-| Leaf locator | `fc00:000<P>:2<L>::/48` | p2-leaf07 → `fc00:0002:7::/48` [Link](../topologies/4p-4x8/config/p2-leaf07/frr.conf#L56)|
-| Leaf uA → spine | `fc00:000<P>:f00<S>::/48` | p2 leaf, toward spine03 → `fc00:0002:f003::/48` [Link](../topologies/4p-4x8/config/p2-leaf07/frr.conf#L60) |
+| Spine locator | `fc00:000<P>:1<S>::/48` | p2-spine03 → `fc00:0002:13::/48`; also the spine's uN SID [Link](../topologies/4p-4x8/config/p2-spine03/frr.conf#L22) |
+| Leaf locator | `fc00:000<P>:2<L>::/48` | p2-leaf07 → `fc00:0002:7::/48`; also the leaf's uN SID [Link](../topologies/4p-4x8/config/p2-leaf07/frr.conf#L57)|
+| Leaf uA → spine | `fc00:000<P>:f00<S>::/48` | p2 leaf, toward spine03 → `fc00:0002:f003::/48` [Link](../topologies/4p-4x8/config/p2-leaf07/frr.conf#L61) |
 | Spine uA → leaf | `fc00:000<P>:e00<L>::/48` | p2 spine, toward leaf06 → `fc00:0002:e006::/48` [Link](../topologies/4p-4x8/config/p2-spine03/frr.conf#L29) |
-| Green tenant uDT6 | `fc00:000<P>:d000::/48` | per-plane on every leaf, decap into `sonic Vrf-green` [Link](../topologies/4p-4x8/config/p0-leaf00/frr.conf#L61) |
+| Green tenant uDT6 | `fc00:000<P>:d000::/48` | per-plane on every leaf, decap into `sonic Vrf-green` [Link](../topologies/4p-4x8/config/p0-leaf00/frr.conf#L62) |
 | Yellow tenant uDT6 | `fc00:000<P>:d001::/48` | per-plane on every yellow host, `linux End.DT6 table 0` [Note: see host config, not FRR] |
+| Yellow uN direct-to-host route | `fc00:000<P>:d001::/48` | plain (non-SRv6) FIB route on every leaf, next-hop = its own locally-attached yellow host. Only needed in `--sid uN` mode, where the SID list lands on `d001` directly with no `e009` hop to forward it there first [Link](../topologies/4p-4x8/config/p0-leaf00/frr.conf#L52) |
 | Fabric P2P | `2001:db8:fab:<S*16+L>::/127` | reused per plane (planes are L2-isolated) |
 | Green tenant address | `2001:db8:bbbb:<NN>::2` | **anycast** on all 4 host NICs (`nodad`); identical leaf-side `::1/64` on every plane's Ethernet32 in `Vrf-green` |
 | Yellow tenant address | `2001:db8:cccc:<NN>::2` | **anycast** on all 4 host NICs + `lo` (`nodad`); identical leaf-side `::1/64` on every plane's Ethernet36 (Phase 1a: mirrors green's plan with `bbbb`→`cccc`) |
@@ -66,7 +72,10 @@ High level architecture:
 
 A path "deliver to green-host06, via EV plane-2, spine03, leaf06,
 then decap into green VRF" encodes as a single uSID-compressed
-IPv6 destination:
+IPv6 destination. This is the default **uA** encoding — each hextet
+after the plane block is an adjacency SID, pinning the path onto one
+specific physical link at every hop (what MRC needs for deterministic
+per-path measurement):
 
 ```
 fc00:0002:f003:e006:d000::
@@ -77,6 +86,26 @@ fc00:0002:f003:e006:d000::
    └─────────────────── 0002  : plane 2 block
 ```
 
+The same path is also reachable via **uN** node-locator SIDs
+(`srctl ... --sid uN` / `sid: uN` in a scenario YAML). Each hop is a
+plain node lookup instead of a pinned adjacency, but since every leaf
+in this topology has exactly one link to each spine, the underlay FIB
+resolves to the same physical path:
+
+```
+fc00:0002:13:27:d000::
+└──┬───┘ └┬┘ └┬┘ └┬─┘
+   │      │   │   └─ d000 : tenant-ID green → Vrf-green at egress leaf (unchanged)
+   │      │   └───── 27   : p2-leaf07's own uN locator
+   │      └───────── 13   : p2-spine03's own uN locator
+   └──────────────── 0002 : plane 2 block
+```
+
+Yellow's tail differs by mode because yellow decaps on the *host*, not
+the leaf (see [Tenant models](#tenant-models-in-this-lab) below) — uA
+needs an explicit `e009` hop to get the packet from leaf to host, uN
+skips it via a plain FIB route.
+
 ## Tenant models in this lab
 
 ### Green (hybrid: host-encap, egress-leaf-decap)
@@ -84,9 +113,10 @@ fc00:0002:f003:e006:d000::
 ```
 green-host00 NICs eth1..eth4   (anycast 2001:db8:bbbb:<NN>::2 on all four)
    │ (encap by host or upstream controller; one of 4 NICs picked per packet)
-   │  outer dst: fc00:000<P>:f00<S>:e00<L>:d000::      <P> = chosen plane
+   │  outer dst: fc00:000<P>:f00<S>:e00<L>:d000::      <P> = chosen plane  (uA, default)
+   │         or: fc00:000<P>:1<S>:2<L>:d000::           <P> = chosen plane  (uN, --sid uN)
    ▼
-   ─►  fabric (uA hops)  ─►  egress p<P>-leaf<L>.Ethernet32 (Vrf-green)
+   ─►  fabric (uA or uN hops — same physical path either way)  ─►  egress p<P>-leaf<L>.Ethernet32 (Vrf-green)
                               uDT6 d000 → decap → connected /64 → host
 ```
 
@@ -101,15 +131,26 @@ sees one socket regardless of which plane delivered it.
 
 ```
 yellow-host00 NICs eth1..eth4    (inner anycast 2001:db8:cccc:<NN>::2 on all four)                        
-   │  encap; outer dst: fc00:000<P>:f00<S>:e00<L>:e009:d001::  <P> = chosen plane
-   │  (e009 is the leaf's uA toward yellow host port [config](../topologies/4p-4x8/config/p0-leaf00/frr.conf#L62))
+   │  encap; outer dst (uA, default): fc00:000<P>:f00<S>:e00<L>:e009:d001::  <P> = chosen plane
+   │  (e009 is the leaf's uA toward yellow host port [config](../topologies/4p-4x8/config/p0-leaf00/frr.conf#L63))
+   │
+   │  encap; outer dst (uN, --sid uN): fc00:000<P>:1<S>:2<L>:d001::          <P> = chosen plane
+   │  (no e009 hop — the leaf instead has a plain FIB route for d001,
+   │   next-hop its own locally-attached yellow host
+   │   [config](../topologies/4p-4x8/config/p0-leaf00/frr.conf#L52))
    ▼
-   ─►  fabric (uA hops)  ─►  egress p<P>-leaf<NN>.Ethernet36 (default VRF)
+   ─►  fabric (uA or uN hops)  ─►  egress p<P>-leaf<NN>.Ethernet36 (default VRF)
                                ─►  yellow-host<NN>.eth(P+1) [inner 2001:db8:cccc:<NN>::2]
                                     seg6local End.DT6 table 0 → decap →
                                     table-0 lookup hits 2001:db8:cccc:<NN>::2
                                     (present on eth1..eth4 + lo, nodad)
 ```
+
+Both modes deliver the still-SRv6-encapsulated packet to the host in the
+same way (the host, not the leaf, owns the `d001` decap) — they only
+differ in *how* the leaf gets it there: uA forces it out a specific
+interface via an adjacency SID, uN just routes it there like any other
+destination once the SID list runs out of node hops.
 
 Each yellow host has 4 `seg6local` entries — one per plane — bound to the
 respective plane NIC. The address present on `lo` guarantees table-0 lookup resolves

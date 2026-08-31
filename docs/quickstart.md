@@ -218,6 +218,9 @@ Example: `srctl get evs` <src-host> <dst-host>
 srctl get evs yellow-host05 yellow-host02
 ```
 
+> Note: srctl get evs defaults to uA SIDs. To see EVs with uN sids add the --sid uN command line argument:
+> `srctl get evs yellow-host05 yellow-host02 --sid uN`
+
 Will output the list of EVs between any src/dst host pair and their corresponding SRv6 SIDs
 ```bash
 $ srctl get evs yellow-host05 yellow-host02
@@ -238,6 +241,29 @@ PLANE  PATH  EV     SID
 3      1     P3:S1  fc00:0003:f001:e002:e009:d001::
 3      2     P3:S2  fc00:0003:f002:e002:e009:d001::
 3      3     P3:S3  fc00:0003:f003:e002:e009:d001::
+```
+
+uN EVs:
+
+```bash
+cisco@topology-host:~/srv6-mrc-emulator$ srctl get evs yellow-host05 yellow-host02 --sid uN
+PLANE  PATH  EV     SID                   
+0      0     P0:S0  fc00:0000:10:22:d001::
+0      1     P0:S1  fc00:0000:11:22:d001::
+0      2     P0:S2  fc00:0000:12:22:d001::
+0      3     P0:S3  fc00:0000:13:22:d001::
+1      0     P1:S0  fc00:0001:10:22:d001::
+1      1     P1:S1  fc00:0001:11:22:d001::
+1      2     P1:S2  fc00:0001:12:22:d001::
+1      3     P1:S3  fc00:0001:13:22:d001::
+2      0     P2:S0  fc00:0002:10:22:d001::
+2      1     P2:S1  fc00:0002:11:22:d001::
+2      2     P2:S2  fc00:0002:12:22:d001::
+2      3     P2:S3  fc00:0002:13:22:d001::
+3      0     P3:S0  fc00:0003:10:22:d001::
+3      1     P3:S1  fc00:0003:11:22:d001::
+3      2     P3:S2  fc00:0003:12:22:d001::
+3      3     P3:S3  fc00:0003:13:22:d001::
 ```
 
 ### srctl run - running MRC traffic scenarios:
@@ -276,7 +302,12 @@ yellow-mrc-ev-spray
 srctl run yellow-baseline
 ```
 
-3. Or with options:
+3. Run with uN sids
+```bash
+srctl run yellow-all-to-all --sid uN
+```
+
+5. Other options:
 ```bash
 srctl run yellow-allreduce-ring --verbose
 ```

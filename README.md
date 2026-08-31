@@ -30,7 +30,7 @@ dockerized SONiC-VS instances and SRv6 capable Alpine linux containers simulatin
   two tenants (`green`, `yellow`) with 8 Alpine container *hosts* each. 
 - **config.sh shell script**: containerlab deploys the topology,  
   `scripts/config.sh` pushes the sonic nodes' config_db.json and FRR configs.
-- **Userspace MRC traffic simulator** builds uSID-encapsulated
+- **Userspace MRC traffic simulator** builds uSID-encapsulated (uA or uN flavored)
   UDP frames in scapy and sprays them into the fabric so each packet traces a
   distinct `(plane, path)` Entropy Value or EV. Accompanying MRC receiver computes per-flow
   reorder-distance histograms (the MRC / SRv6 paper's reorder metric)
