@@ -4,7 +4,7 @@ The default 4-plane topology deploys with 4 spines and 8 leafs in each plane (48
 
 Example: *`green-host00`* has 4 uplinks, one to *`leaf00`* in each of the 4 planes.
 
-![Topology](./4p-4x8-topology.png)
+<img src=./4p-4x8-topology.png width="400" height="400" alt="Figure 1">
 
 The **docker-sonic-vs** is pretty lightweight and takes up only 160MB of memory. That said, the lab has been tested on Ubuntu 22.04 and 24.04 virtual machines with 32 vCPU and 96GB of memory, which appears to be more than sufficient.
 
