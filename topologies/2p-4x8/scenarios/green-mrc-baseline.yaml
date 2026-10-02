@@ -1,0 +1,33 @@
+# green-mrc-baseline.yaml — clean fabric, health_aware_mrc spray (2p-4x8).
+#
+# 2-plane counterpart of 4p-4x8/scenarios/green-mrc-baseline.yaml. With
+# both planes healthy the EV state machine should hold all 8 EVs
+# (2 planes x 4 spines) in UNKNOWN/GOOD and never demote one: probes,
+# loss windows and loss reports all run but must not perturb the spray.
+#
+# Checks worth making on the daemon record in the JSON report:
+#   - every EV ends GOOD, with transitions == 1 (UNKNOWN -> GOOD)
+#   - loss_fusion.planes_updated > 0 (loss reports are being fused)
+#
+# Run:
+#   make TOPO=2p-4x8 SCEN=green-mrc-baseline scenario
+
+name: green-mrc-baseline
+description: |
+  Both planes healthy, health_aware_mrc spray over 4 green leaf pairs.
+  Probes and loss reports are exchanged but should not influence the
+  weights — sanity check that enabling MRC is a no-op on a clean fabric.
+
+flows:
+  - pairs: green-pairs-4
+    policy: health_aware_mrc
+    rate: 100pps
+    duration: 20s
+
+faults: []
+
+# The empty block enables MRC with defaults (see 4p-4x8 counterpart).
+mrc: {}
+
+report:
+  out: results/green-mrc-baseline.json
