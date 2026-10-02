@@ -202,10 +202,9 @@ class LossWindowTable:
                 for path in range(self._num_paths):
                     counters = flow.evs[plane][path]
                     # Skip EVs with zero activity to keep the wire
-                    # message small; the sender treats absence as "no
-                    # data this window for this EV" (which means we
-                    # can't tell loss vs not-spraying-this-EV, but the
-                    # state machine handles UNKNOWN naturally).
+                    # message small. The sender tells "blackholed" from
+                    # "not sprayed" using its own sent counts; see
+                    # loss_compute.apply_loss_report (absent EVs).
                     if counters.seen == 0:
                         continue
                     if counters.min_seq < 0:

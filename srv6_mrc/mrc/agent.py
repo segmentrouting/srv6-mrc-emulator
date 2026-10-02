@@ -198,6 +198,9 @@ class SenderMrcAgent:
         transport: Optional[MrcTransport] = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
         sid_mode: str = "uA",
+        sent_source: Optional[
+            Callable[[], Optional[Tuple[Tuple[int, ...], ...]]]
+        ] = None,
     ) -> None:
         if table.num_planes != NUM_PLANES:
             raise ValueError(
@@ -264,6 +267,12 @@ class SenderMrcAgent:
         ]
         self._current_window_start_ns: int = self.clock_ns()
         self._current_window_id: int = 0
+        # Out-of-process sent counts. In the daemon split the data
+        # sender is another process and never calls record_sent();
+        # `sent_source()` returns the per-EV sent delta since its last
+        # call (see sent_counters.SentCounterReader), folded in at each
+        # window rotation.
+        self._sent_source = sent_source
 
     # --- public API ----------------------------------------------------
 
@@ -452,8 +461,19 @@ class SenderMrcAgent:
 
     def _rotate_window(self) -> None:
         """Snapshot + reset the current sent counters."""
+        delta = None
+        if self._sent_source is not None:
+            try:
+                delta = self._sent_source()
+            except Exception as e:  # never kill the window thread
+                log.debug("mrc.agent: sent_source raised: %s", e)
         now_ns = self.clock_ns()
         with self._lock:
+            if delta:
+                for plane, row in enumerate(delta[:NUM_PLANES]):
+                    cur = self._current_window_sent[plane]
+                    for path, n in enumerate(row[:NUM_SPINES]):
+                        cur[path] += n
             sent = tuple(tuple(row) for row in self._current_window_sent)
             start = self._current_window_start_ns
             wid = self._current_window_id

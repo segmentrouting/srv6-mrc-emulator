@@ -366,6 +366,20 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
         )
         progress_cb = lambda _seq, plane, path: mrc_agent.record_sent(plane, path)
 
+    # Daemon split: the SenderMrcAgent lives in the MrcDaemon, which
+    # can't see our TX. Publish per-EV sent counts next to the snapshot
+    # we read so its loss fusion has a denominator.
+    sent_writer = None
+    if isinstance(policy, MrcSnapshot):
+        from srv6_mrc.mrc.sent_counters import (
+            SentCounterWriter, sent_counters_path,
+        )
+        sent_writer = SentCounterWriter(
+            sent_counters_path(policy.snapshot_path),
+            num_planes=NUM_PLANES, num_paths=NUM_SPINES,
+        )
+        progress_cb = lambda _seq, plane, path: sent_writer.record(plane, path)
+
     if not args.json:
         spine = spine_for(my_id, args.dst_id)
         src_inner = inner_addr(tenant, my_id)
@@ -386,6 +400,8 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
 
     if mrc_agent is not None:
         mrc_agent.start()
+    if sent_writer is not None:
+        sent_writer.start()
     mrc_diag = None
     try:
         result = run_sender(
@@ -393,6 +409,8 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
             progress_cb=progress_cb, sid_mode=sid_mode, transport=transport,
         )
     finally:
+        if sent_writer is not None:
+            sent_writer.stop()
         # Capture EV-state + fusion-stats BEFORE stop() so the snapshot
         # reflects the live counters that produced the per-plane spray
         # distribution we just ran. Stop drains background threads;
