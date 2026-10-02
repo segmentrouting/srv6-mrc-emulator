@@ -571,9 +571,15 @@ class EVStateTable:
         if new_state is EVState.GOOD:
             rec.consecutive_healthy_windows = 0
         # On demote, reset the same counter so a recovery streak starts
-        # fresh once the EV starts succeeding again.
+        # fresh once the EV starts succeeding again. Also clear the
+        # loss streak: the demote has consumed that evidence, and a
+        # weight-0 EV carries no data, so no clean loss window would
+        # ever arrive to clear it and the recovery gate in
+        # `_evaluate_locked` would stay shut forever. Loss seen after
+        # the demote (stragglers) still re-arms the gate.
         if new_state is EVState.ASSUMED_BAD:
             rec.consecutive_healthy_windows = 0
+            rec.consecutive_loss_demote_windows = 0
         self._rebuild_weights_locked(tenant)
         if self._on_transition is not None:
             self._on_transition(tenant, plane, path, old, new_state)

@@ -202,7 +202,14 @@ class TestProbePath(unittest.TestCase):
         _drive_healthy(t, "green", [(3, 0)], ticks=1)
         self.assertIs(t.state("green", 3, 0), EVState.GOOD)
 
-    def test_recovery_blocked_by_recent_loss_demote(self):
+    def test_loss_demoted_ev_recovers_via_probes(self):
+        """A loss-demoted EV must be resurrectable by probes alone.
+
+        Once demoted, the EV has weight 0 so the sender stops spraying
+        data on it and no further loss windows arrive for it. Recovery
+        therefore cannot wait for a clean loss window — it has to come
+        from the probe path.
+        """
         cfg = EVStateConfig(
             probe_window_ticks=2, probe_min_samples=3,
             probe_fail_ratio=0.5, probe_recover_ratio=0.9,
@@ -215,16 +222,50 @@ class TestProbePath(unittest.TestCase):
         t.record_loss_window("green", 3, 0, seen=900, expected=1000)
         t.record_loss_window("green", 3, 0, seen=900, expected=1000)
         self.assertIs(t.state("green", 3, 0), EVState.ASSUMED_BAD)
-        # Probes go clean for many ticks — but the loss-demote-counter
-        # is still non-zero, so recovery must NOT fire.
+        # Probes go clean; no loss windows arrive (weight 0 => no data).
+        _drive_healthy(t, "green", [(3, 0)])
+        self.assertIs(t.state("green", 3, 0), EVState.GOOD)
+
+    def test_recovery_blocked_by_loss_after_demote(self):
+        """Loss evidence that arrives *after* the demote still gates
+        recovery until a clean loss window clears it."""
+        cfg = EVStateConfig(
+            probe_window_ticks=2, probe_min_samples=3,
+            probe_fail_ratio=0.5, probe_recover_ratio=0.9,
+            probe_recover_ticks=2,
+            loss_threshold=0.05, loss_demote_consecutive=2,
+        )
+        t = _table(cfg=cfg)
+        _drive_healthy(t, "green", [(0, 0), (1, 0), (2, 0)])
+        t.record_loss_window("green", 3, 0, seen=900, expected=1000)
+        t.record_loss_window("green", 3, 0, seen=900, expected=1000)
+        self.assertIs(t.state("green", 3, 0), EVState.ASSUMED_BAD)
+        # Straggler data on the demoted EV shows loss again.
+        t.record_loss_window("green", 3, 0, seen=900, expected=1000)
         _drive_healthy(t, "green", [(3, 0)], ticks=10)
         self.assertIs(t.state("green", 3, 0), EVState.ASSUMED_BAD)
-        # A clean loss window resets the loss counter.
+        # A clean loss window opens the gate; the healthy-window latch
+        # has been climbing, so the next healthy tick promotes.
         t.record_loss_window("green", 3, 0, seen=1000, expected=1000)
-        # Probe path is already clean and consecutive_healthy_windows
-        # has been climbing; one more healthy tick crosses the latch
-        # now that the loss gate is open.
         _drive_healthy(t, "green", [(3, 0)], ticks=1)
+        self.assertIs(t.state("green", 3, 0), EVState.GOOD)
+
+    def test_probe_demoted_ev_with_stale_loss_counter_recovers(self):
+        """A partial loss streak from before a probe-driven demote must
+        not pin the EV in ASSUMED_BAD once probes recover."""
+        cfg = EVStateConfig(
+            probe_window_ticks=2, probe_min_samples=3,
+            probe_fail_ratio=0.5, probe_recover_ratio=0.9,
+            probe_recover_ticks=2,
+            loss_threshold=0.05, loss_demote_consecutive=3,
+        )
+        t = _table(cfg=cfg)
+        _drive_healthy(t, "green", [(0, 0), (1, 0), (2, 0)])
+        # One lossy window (below the demote streak), then probes fail.
+        t.record_loss_window("green", 3, 0, seen=900, expected=1000)
+        _drive_failing(t, "green", 3, 0)
+        self.assertIs(t.state("green", 3, 0), EVState.ASSUMED_BAD)
+        _drive_healthy(t, "green", [(3, 0)])
         self.assertIs(t.state("green", 3, 0), EVState.GOOD)
 
     def test_partial_recv_holds_state(self):

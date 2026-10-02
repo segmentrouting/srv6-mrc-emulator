@@ -268,13 +268,12 @@ def apply_loss_report(
             stats.fell_back_to_receiver_expected += 1
             continue
 
-        # NB: once a plane is demoted to weight=0, the sender stops
-        # spraying it, so subsequent SentWindows have sent[plane]=0
-        # and we hit the `denominator == 0` skip above. The plane
-        # stays demoted via the consecutive-counter ratchet from when
-        # it was first demoted; recovery happens via the probe path
-        # (consecutive_probe_successes >= probe_recover_threshold),
-        # not via this loss-window path.
+        # NB: once an EV is demoted to weight=0, the sender stops
+        # spraying it, so subsequent SentWindows have sent=0 for it
+        # and we hit the `denominator == 0` skip above. The demote
+        # clears the EV's loss streak, so recovery happens via the
+        # probe path (probe_recover_ticks healthy windows), not via
+        # this loss-window path.
 
         # EVStateTable.record_loss_window takes (seen, expected) and
         # does the ratio internally; we keep compute_loss_ratio public
