@@ -40,7 +40,7 @@ The `MrcDaemon` class:
 - Runs a `_dispatch_loop` thread on the shared recv socket that demuxes inbound packets by magic byte:
   - `0xA5` = returning stateless PROBE → `agent.record_probe_recv(plane, path)`
   - `0xA7` = LOSS_REPORT from peer receiver → `agent._handle_loss_report(payload)`
-- Runs a `_snapshot_loop` thread that writes per-flow snapshots to `/dev/shm/srv6-mrc/<host>/<tenant>_<dst_id>.json` every `probe_interval_ms` (default 200ms)
+- Runs a `_snapshot_loop` thread that writes per-flow snapshots to `/dev/shm/srv6-mrc/<host>/<tenant>_<dst_id>.json` every `probe_interval_ms` (default 500 ms)
 
 Each `SenderMrcAgent` (owned by the daemon, one per flow):
 - Runs TWO daemon threads:
@@ -50,11 +50,11 @@ Each `SenderMrcAgent` (owned by the daemon, one per flow):
 - Shares the daemon's transport (no per-agent socket binds)
 
 Data sender processes consume EV health via the `mrc_snapshot` policy, which:
-- Reads `/dev/shm/srv6-mrc/<host>/<tenant>_<dst>.json` at startup and every `loss_window_ms`
+- Reads `/dev/shm/srv6-mrc/<host>/<tenant>_<dst>.json` at startup and every 200 ms (`MrcSnapshot.refresh_interval_ms`)
 - Builds a weighted CDF from the snapshot's per-EV weights (cached; invalidated on weight changes)
 - Picks EVs identically to the live `health_aware_mrc` but from frozen snapshot data
 
-Staleness ≤ 200ms is well under any demote threshold (probe or loss path), so steering decisions remain timely.
+Staleness is at most one snapshot interval plus one refresh (500 ms + 200 ms by default), well under any demote latency (probe or loss path), so steering decisions remain timely.
 
 ## Why a separate daemon (not one all-in-one process)
 
@@ -107,7 +107,7 @@ per-probe timeout sweep.
 **EV health derivation:**
 
 Per-EV sliding window tracks `(sent, recv)` counts over the last
-`probe_window_ticks` ticks (default 5 × 200ms = 1 second). The agent's
+`probe_window_ticks` ticks (default 5 × 500 ms = 2.5 s). The agent's
 `_window_loop` calls `EVStateTable.tick(tenant)` once per
 `probe_interval_ms` to rotate buckets. Health decision:
 
@@ -194,15 +194,15 @@ The `mrc_snapshot` policy and `report.py` both accept this wrapped shape.
 
 Data senders use `--policy mrc_snapshot:/dev/shm/srv6-mrc/<host>`, which:
 - Loads the wrapped snapshot from the daemon's published path at startup
-- Re-loads it every `loss_window_ms` (default 200ms)
+- Re-loads it every `refresh_interval_ms` (default 200 ms)
 - Unwraps `.ev_state` and builds a per-EV weighted grid
 - Drives EV picks identically to `health_aware_mrc.choose_ev()` but
   using the snapshot's frozen view instead of a live `EVStateTable`
 - Caches the CDF keyed by `(id(wgrid), spines)` to avoid per-packet
   allocations (invalidated on wgrid swap)
-- Does NOT report per-EV sent counters into a ring (v3 design artifact;
-  removed in v4 — the loss-feedback path uses the daemon's own
-  `SenderMrcAgent.sent_ring`)
+- Is paired with a `SentCounterWriter` in the data sender that
+  publishes cumulative per-EV sent counts to the `.sent` sidecar (see
+  "Loss-feedback path" below)
 
 Backward compatibility: the `health_aware_mrc` policy (live in-process
 EVStateTable) continues to work for single-flow / non-daemon scenarios.
@@ -220,11 +220,22 @@ When a receiver's LOSS_REPORT arrives (magic `0xA7`), the daemon's
 dispatcher calls `agent._handle_loss_report(payload)` → `apply_loss_report`
 → `EVStateTable.record_loss_window(tenant, plane, path, seen, expected)`.
 
-Data senders do NOT write per-EV sent counters to `/dev/shm`. The v3
-design's "sender writes `.sent.json`, daemon reads it" flow was removed
-in v4 because the daemon already owns the sent-window ring through its
-per-flow agents. The only cross-process snapshot is the EV health
-(`.ev_state`), not the sent counts.
+The ring's denominators come from the data sender, which is a separate
+process and never calls `agent.record_sent()`. Without them every
+LOSS_REPORT is skipped (`loss_fusion.fell_back_to_receiver_expected`
+climbs, `planes_updated` stays 0) and only probes can demote an EV.
+So the data sender (`spray --role send` on an `mrc_snapshot` policy)
+runs a `SentCounterWriter` (`srv6_mrc/mrc/sent_counters.py`) that
+publishes cumulative per-EV counts every 50 ms to
+`/dev/shm/srv6-mrc/<host>/<tenant>_<dd>.sent`, next to the snapshot it
+reads. Each daemon agent holds a `SentCounterReader` on that file and
+folds the delta since its last read into the current window at every
+`_rotate_window()`. The `.sent` suffix keeps the file out of scrapers
+that glob `*.json` snapshots.
+
+Once an EV is demoted it carries no data, so no further loss windows
+arrive for it; the demote clears its loss streak and recovery is left
+to the probe path (`EVStateTable._transition_locked`).
 
 ## Lifecycle (v4)
 

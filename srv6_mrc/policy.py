@@ -427,8 +427,8 @@ class MrcSnapshot:
     `/dev/shm/srv6-mrc/<host>/<tenant>_<dst_id>.json`. Each data sender
     constructs `MrcSnapshot(snapshot_path, tenant, ...)` pointing at
     *its* flow's snapshot, and the policy's background refresh thread
-    reloads the file every `refresh_interval_ms` (default 200 ms,
-    matching the daemon's snapshot cadence).
+    reloads the file every `refresh_interval_ms` (default 200 ms; the
+    daemon rewrites it every probe_interval_ms, default 500 ms).
 
     The data sender's hot loop is unchanged: it calls `pick_ev(seq,
     flow)` exactly the same way it would call `HealthAwareMrc.pick_ev`,

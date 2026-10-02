@@ -43,7 +43,9 @@ from srv6_mrc.mrc.agent import (
     SenderMrcAgent,
 )
 from srv6_mrc.mrc.daemon import DaemonFlow, MrcDaemon
-from srv6_mrc.mrc.ev_state import EVStateTable
+from srv6_mrc.mrc.ev_state import EVState, EVStateTable
+from srv6_mrc.mrc.probe import PlaneLossRecord, encode_loss_report
+from srv6_mrc.mrc.sent_counters import SentCounterWriter, sent_counters_path
 from srv6_mrc.mrc.transport import LoopbackUdpTransport
 from srv6_mrc.topo import (
     NUM_PLANES,
@@ -739,6 +741,72 @@ class MrcDaemonDispatchRxBucketsTests(unittest.TestCase):
             f"kernel_rx_dwell bucket sum {dwell_total} != recv "
             f"({ds['packets_received']})",
         )
+
+
+class MrcDaemonCrossProcessLossFusionTests(unittest.TestCase):
+    """In the daemon split the data sender is a separate process running
+    `mrc_snapshot`; it never calls `agent.record_sent`. The daemon must
+    still fuse LOSS_REPORTs against that sender's per-EV counts, or the
+    loss signal is silently dropped (every EV skipped for lack of a
+    denominator)."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="mrc-daemon-test-")
+        sender_xport, self.receiver_xport = _build_loopback_pair(
+            sender_report_port=PORTS.take(1),
+            receiver_probe_port=PORTS.take(1),
+        )
+        self.daemon = MrcDaemon(
+            src_host="green-host00",
+            src_id=0,
+            flows=[DaemonFlow(tenant="green", dst_id=15)],
+            agent_cfg=FAST_CONFIG,
+            transport=sender_xport,
+            snapshot_dir=self.tmpdir,
+        )
+        self.agent = self.daemon.agents[("green", 15)]
+        # Same file the data sender derives from its mrc_snapshot path.
+        snap = Path(self.tmpdir) / "green-host00" / "green_15.json"
+        self.writer = SentCounterWriter(
+            sent_counters_path(snap),
+            num_planes=NUM_PLANES, num_paths=NUM_SPINES,
+        )
+
+    def tearDown(self) -> None:
+        for x in (self.daemon.transport, self.receiver_xport):
+            try:
+                x.close()
+            except Exception:
+                pass
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _loss_window(self, *, bad_seen: int) -> None:
+        # Data sender sprays 10 packets on each of two EVs this window.
+        for _ in range(10):
+            self.writer.record(0, 0)
+            self.writer.record(2, 1)
+        self.writer.publish()
+        self.agent._rotate_window()
+        self.agent._handle_loss_report(encode_loss_report(0, [
+            PlaneLossRecord(plane_id=0, path_id=0, seen=10,
+                            expected=10, max_gap=0),
+            PlaneLossRecord(plane_id=2, path_id=1, seen=bad_seen,
+                            expected=10, max_gap=0),
+        ]))
+
+    def test_loss_reports_fused_against_data_sender_counts(self) -> None:
+        self._loss_window(bad_seen=10)
+        self.assertEqual(self.agent.stats.planes_updated, 2)
+        self.assertEqual(self.agent.stats.fell_back_to_receiver_expected, 0)
+
+    def test_loss_on_one_ev_demotes_it(self) -> None:
+        for _ in range(3):  # default loss_demote_consecutive
+            self._loss_window(bad_seen=0)
+        self.assertIs(self.agent.table.state("green", 2, 1),
+                      EVState.ASSUMED_BAD)
+        self.assertIsNot(self.agent.table.state("green", 0, 0),
+                         EVState.ASSUMED_BAD)
 
 
 if __name__ == "__main__":  # pragma: no cover

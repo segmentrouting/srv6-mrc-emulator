@@ -89,8 +89,8 @@ class EVStateConfig:
 
     - `probe_window_ticks`: how many ticks (one tick per probe slot,
       i.e. one per `probe_interval_ms` on the agent) the sliding
-      window covers. With probe_interval_ms=200 and window_ticks=5
-      that's a 1-second window — long enough to average over the
+      window covers. With the default probe_interval_ms=500 and
+      window_ticks=5 that's a 2.5-second window — long enough to average over the
       jitter floor, short enough to react to a hard EV failure in
       ~1 round of the demote threshold.
     - `probe_min_samples`: minimum probes sent in the window before
@@ -118,10 +118,11 @@ class EVStateConfig:
     # loss_threshold: minimum loss ratio that counts as a "bad window"
     # for the consecutive-bad-window demote counter. Set above the
     # window-edge straggle noise floor: with packet-level EV spray over
-    # 16 EVs at typical lab rates, each EV sees ~5 packets per 200ms
-    # loss window; a single packet straddling the window boundary
+    # 16 EVs at typical lab rates, each EV sees only a few packets per
+    # 300 ms loss window (the default; ~2 at 100 pps over 16 EVs, ~9 at
+    # 500 pps); a single packet straddling the window boundary
     # (sent in window N but received in window N+1, or vice versa)
-    # produces an apparent 20% loss on a healthy EV. 5% is below that
+    # produces an apparent 10-50% loss on a healthy EV. 5% is below that
     # floor; 25% is well above it.
     loss_threshold: float = 0.25
     # loss_demote_consecutive: how many consecutive >loss_threshold
@@ -130,6 +131,16 @@ class EVStateConfig:
     # `mrc_min_active_evs`: floor below which the state machine refuses
     # to demote further. None = `max(1, (num_planes * num_paths) // 2)`.
     min_active_evs: int | None = None
+
+    # Loss-demote backoff. When the loss path demotes an EV, probes may
+    # be unable to see the fault (green probes never cross the egress
+    # leaf -> host hop), so their recovery re-exposes a dead path. Each
+    # loss demote that follows a loss-driven recovery within
+    # `loss_backoff_reset_ticks` doubles the next recovery hold
+    # (`probe_recover_ticks << level`), up to `loss_backoff_max_level`.
+    # Probe-driven demotes always recover at the base hold.
+    loss_backoff_max_level: int = 3
+    loss_backoff_reset_ticks: int = 60
 
     def resolve_min_active(self, num_planes: int, num_paths: int) -> int:
         total = num_planes * num_paths
@@ -168,6 +179,10 @@ class _EVRecord:
     # Counters surfaced in reports.
     transitions: int = 0
     demotes_suppressed_by_floor: int = 0
+    # Loss-demote backoff (see EVStateConfig.loss_backoff_*).
+    loss_demoted: bool = False
+    loss_backoff_level: int = 0
+    last_loss_recover_tick: int | None = None
 
 
 # --- table -----------------------------------------------------------------
@@ -248,6 +263,8 @@ class EVStateTable:
         self._weights_cache: dict[str, tuple[tuple[float, ...], ...]] = {}
         for tenant in self._tenants:
             self._rebuild_weights_locked(tenant)
+        # Per-tenant tick count; the clock for the loss-demote backoff.
+        self._ticks: dict[str, int] = {tenant: 0 for tenant in self._tenants}
 
     # ------------------------------------------------------------------
     # Configuration / shape introspection
@@ -326,6 +343,7 @@ class EVStateTable:
         """
         self._check_tenant(tenant)
         with self._guard():
+            self._ticks[tenant] += 1
             for plane in range(self._num_planes):
                 for path in range(self._num_paths):
                     rec = self._evs[tenant][plane][path]
@@ -366,15 +384,18 @@ class EVStateTable:
         if ratio < cfg.probe_fail_ratio:
             rec.consecutive_healthy_windows = 0
             if rec.state is not EVState.ASSUMED_BAD:
-                self._try_demote_locked(tenant, plane, path)
+                self._try_demote_locked(tenant, plane, path, by_loss=False)
             return
 
         if ratio >= cfg.probe_recover_ratio:
             rec.consecutive_healthy_windows += 1
+            hold = cfg.probe_recover_ticks
+            if rec.loss_demoted:
+                hold <<= rec.loss_backoff_level
             if (
                 rec.state is not EVState.GOOD
                 and rec.consecutive_loss_demote_windows == 0
-                and rec.consecutive_healthy_windows >= cfg.probe_recover_ticks
+                and rec.consecutive_healthy_windows >= hold
             ):
                 self._transition_locked(
                     tenant, plane, path, EVState.GOOD,
@@ -423,7 +444,7 @@ class EVStateTable:
                     and rec.consecutive_loss_demote_windows
                         >= self._cfg.loss_demote_consecutive
                 ):
-                    self._try_demote_locked(tenant, plane, path)
+                    self._try_demote_locked(tenant, plane, path, by_loss=True)
             elif ratio <= self._cfg.loss_threshold / 2:
                 rec.consecutive_loss_demote_windows = 0
 
@@ -455,6 +476,7 @@ class EVStateTable:
             "last_loss_ratio": rec.last_loss_ratio,
             "transitions": rec.transitions,
             "demotes_suppressed_by_floor": rec.demotes_suppressed_by_floor,
+            "loss_backoff_level": rec.loss_backoff_level,
         }
 
     def weights_ev(self, tenant: str) -> tuple[tuple[float, ...], ...]:
@@ -482,6 +504,9 @@ class EVStateTable:
                 "loss_threshold": self._cfg.loss_threshold,
                 "loss_demote_consecutive": self._cfg.loss_demote_consecutive,
                 "min_active_evs": self._min_active,
+                "loss_backoff_max_level": self._cfg.loss_backoff_max_level,
+                "loss_backoff_reset_ticks":
+                    self._cfg.loss_backoff_reset_ticks,
             },
             "num_planes": self._num_planes,
             "num_paths": self._num_paths,
@@ -512,6 +537,7 @@ class EVStateTable:
                         "transitions": rec.transitions,
                         "demotes_suppressed_by_floor":
                             rec.demotes_suppressed_by_floor,
+                        "loss_backoff_level": rec.loss_backoff_level,
                         "weight": wcache[plane][path],
                     })
             out["tenants"][tenant] = evs_out
@@ -543,7 +569,7 @@ class EVStateTable:
         return self._lock
 
     def _try_demote_locked(
-        self, tenant: str, plane: int, path: int,
+        self, tenant: str, plane: int, path: int, *, by_loss: bool,
     ) -> None:
         usable_after = 0
         for p in range(self._num_planes):
@@ -556,6 +582,20 @@ class EVStateTable:
             rec = self._evs[tenant][plane][path]
             rec.demotes_suppressed_by_floor += 1
             return
+        rec = self._evs[tenant][plane][path]
+        if by_loss:
+            last = rec.last_loss_recover_tick
+            recent = (
+                last is not None
+                and self._ticks[tenant] - last
+                    < self._cfg.loss_backoff_reset_ticks
+            )
+            rec.loss_backoff_level = (
+                min(rec.loss_backoff_level + 1,
+                    self._cfg.loss_backoff_max_level)
+                if recent else 0
+            )
+        rec.loss_demoted = by_loss
         self._transition_locked(tenant, plane, path, EVState.ASSUMED_BAD)
 
     def _transition_locked(
@@ -570,10 +610,19 @@ class EVStateTable:
         # On promote, clear healthy-window counter for the next round.
         if new_state is EVState.GOOD:
             rec.consecutive_healthy_windows = 0
+            if rec.loss_demoted:
+                rec.last_loss_recover_tick = self._ticks[tenant]
+                rec.loss_demoted = False
         # On demote, reset the same counter so a recovery streak starts
-        # fresh once the EV starts succeeding again.
+        # fresh once the EV starts succeeding again. Also clear the
+        # loss streak: the demote has consumed that evidence, and a
+        # weight-0 EV carries no data, so no clean loss window would
+        # ever arrive to clear it and the recovery gate in
+        # `_evaluate_locked` would stay shut forever. Loss seen after
+        # the demote (stragglers) still re-arms the gate.
         if new_state is EVState.ASSUMED_BAD:
             rec.consecutive_healthy_windows = 0
+            rec.consecutive_loss_demote_windows = 0
         self._rebuild_weights_locked(tenant)
         if self._on_transition is not None:
             self._on_transition(tenant, plane, path, old, new_state)

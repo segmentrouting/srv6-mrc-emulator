@@ -70,6 +70,7 @@ class _EvCounters:
     max_seq: int = -1
     max_gap: int = 0
     last_seq: int = -1  # for max_gap computation
+    trimmed: int = 0    # header-only arrivals (opt-in trimming)
 
 
 @dataclass
@@ -175,6 +176,29 @@ class LossWindowTable:
                     counters.max_gap = gap
             counters.last_seq = seq
 
+    def record_trimmed(self, flow_key, plane: int, path: int) -> None:
+        """Account for one trimmed (header-only) arrival on EV (plane, path).
+
+        Trimmed packets carry no payload, so they are not `seen`; the
+        sender adds them back when fusing loss, so congestion trims
+        never read as path failure.
+        """
+        if not 0 <= plane < self._num_planes:
+            raise ValueError(
+                f"plane {plane} out of range [0, {self._num_planes})"
+            )
+        if not 0 <= path < self._num_paths:
+            raise ValueError(
+                f"path {path} out of range [0, {self._num_paths})"
+            )
+        with self._lock:
+            flow = self._flows.get(flow_key)
+            if flow is None:
+                flow = _FlowWindow()
+                flow.reset(self._num_planes, self._num_paths)
+                self._flows[flow_key] = flow
+            flow.evs[plane][path].trimmed += 1
+
     def snapshot_and_reset(self, flow_key) -> LossReport:
         """Close the current window for `flow_key`; return + reset.
 
@@ -202,11 +226,10 @@ class LossWindowTable:
                 for path in range(self._num_paths):
                     counters = flow.evs[plane][path]
                     # Skip EVs with zero activity to keep the wire
-                    # message small; the sender treats absence as "no
-                    # data this window for this EV" (which means we
-                    # can't tell loss vs not-spraying-this-EV, but the
-                    # state machine handles UNKNOWN naturally).
-                    if counters.seen == 0:
+                    # message small. The sender tells "blackholed" from
+                    # "not sprayed" using its own sent counts; see
+                    # loss_compute.apply_loss_report (absent EVs).
+                    if counters.seen == 0 and counters.trimmed == 0:
                         continue
                     if counters.min_seq < 0:
                         expected_local = 0
@@ -224,6 +247,7 @@ class LossWindowTable:
                         seen=seen_capped,
                         expected=expected_local,
                         max_gap=max_gap_capped,
+                        trimmed=min(counters.trimmed, 0xFFFFFFFF),
                     ))
             flow.reset(self._num_planes, self._num_paths)
             return LossReport(window_id=window_id, planes=tuple(records))

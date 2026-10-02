@@ -1,3 +1,4 @@
+import dataclasses
 import unittest
 
 from srv6_mrc.mrc import scenario
@@ -287,12 +288,16 @@ class TestMrc(unittest.TestCase):
             "probe_timeout_ms": 25,
             "loss_window_ms": 100,
             "max_window_skew_ms": 200,
-            "probe_fail_threshold": 2,
-            "probe_recover_threshold": 4,
+            "probe_window_ticks": 4,
+            "probe_min_samples": 2,
+            "probe_fail_ratio": 0.4,
+            "probe_recover_ratio": 0.8,
+            "probe_recover_ticks": 3,
             "loss_threshold": 0.02,
             "loss_demote_consecutive": 3,
             "min_active_evs": 1,
-            "rtt_ring_size": 64,
+            "loss_backoff_max_level": 0,
+            "loss_backoff_reset_ticks": 30,
         }}
         s = scenario.validate(doc)
         self.assertEqual(s.mrc.probe_interval_ms, 50)
@@ -302,8 +307,31 @@ class TestMrc(unittest.TestCase):
         env = json.loads(s.mrc.to_env_json())
         self.assertEqual(env["probe_interval_ms"], 50)
         self.assertEqual(env["loss_threshold"], 0.02)
-        # All 10 fields present
-        self.assertEqual(len(env), 10)
+        # Every field present
+        self.assertEqual(len(env), len(dataclasses.fields(scenario.MrcSpec)))
+
+    def test_every_field_reaches_the_runtime_configs(self):
+        # Drift guard: each MrcSpec knob must survive SRV6_MRC_CONFIG_JSON
+        # into AgentConfig / EVStateConfig. Stale names (from the old
+        # stateful-probe design) used to validate here and then crash
+        # every host process at startup.
+        from srv6_mrc.mrc.agent import load_configs_from_env
+        values = {"probe_fail_ratio": 0.4, "probe_recover_ratio": 0.8,
+                  "loss_threshold": 0.02, "loss_backoff_max_level": 0}
+        kwargs = {f.name: values.get(f.name, 7)
+                  for f in dataclasses.fields(scenario.MrcSpec)}
+        agent_cfg, ev_cfg = load_configs_from_env(
+            scenario.MrcSpec(**kwargs).to_env_json())
+        for name, v in kwargs.items():
+            target = agent_cfg if hasattr(agent_cfg, name) else ev_cfg
+            self.assertEqual(getattr(target, name), v, name)
+
+    def test_stale_knobs_rejected(self):
+        for knob in ("probe_fail_threshold", "probe_recover_threshold",
+                     "rtt_ring_size"):
+            with self.subTest(knob=knob), \
+                    self.assertRaises(scenario.ScenarioError):
+                scenario.validate({**MINIMAL, "mrc": {knob: 3}})
 
     def test_unknown_subkey_rejected(self):
         doc = {**MINIMAL, "mrc": {"made_up_knob": 1}}

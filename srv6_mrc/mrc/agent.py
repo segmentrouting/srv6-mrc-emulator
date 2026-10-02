@@ -64,9 +64,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from ..topo import (
     NUM_PLANES,
     NUM_SPINES,
+    nack_port,
     tenant_id as topo_tenant_id,
 )
-from .ev_state import EVStateTable
+from .ev_state import EVStateConfig, EVStateTable
 from .loss_compute import (
     LossFusionStats,
     SentWindow,
@@ -75,9 +76,11 @@ from .loss_compute import (
 )
 from .loss_window import LossWindowTable
 from .probe import (
+    Nack,
     ProbeDecodeError,
     decode_loss_report,
     encode_loss_report,
+    encode_nack,
     encode_probe,
 )
 from .transport import (
@@ -121,16 +124,15 @@ class AgentConfig:
 # tunables into per-container spray.py invocations.
 MRC_CONFIG_ENV = "SRV6_MRC_CONFIG_JSON"
 
-_AGENT_CONFIG_FIELDS = frozenset({
-    "probe_interval_ms", "probe_timeout_ms",
-    "loss_window_ms", "max_window_skew_ms",
-})
-_EV_STATE_CONFIG_FIELDS = frozenset({
-    "probe_window_ticks", "probe_min_samples",
-    "probe_fail_ratio", "probe_recover_ratio", "probe_recover_ticks",
-    "loss_threshold", "loss_demote_consecutive",
-    "min_active_evs", "rtt_ring_size",
-})
+# Keys SRV6_MRC_CONFIG_JSON may carry, derived from the config
+# dataclasses so a renamed or added tunable can't drift out of sync.
+def _config_fields(cls) -> frozenset:
+    import dataclasses
+    return frozenset(f.name for f in dataclasses.fields(cls))
+
+
+_AGENT_CONFIG_FIELDS = _config_fields(AgentConfig) - {"use_loopback"}
+_EV_STATE_CONFIG_FIELDS = _config_fields(EVStateConfig)
 
 
 def load_configs_from_env(
@@ -198,6 +200,9 @@ class SenderMrcAgent:
         transport: Optional[MrcTransport] = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
         sid_mode: str = "uA",
+        sent_source: Optional[
+            Callable[[], Optional[Tuple[Tuple[int, ...], ...]]]
+        ] = None,
     ) -> None:
         if table.num_planes != NUM_PLANES:
             raise ValueError(
@@ -264,6 +269,12 @@ class SenderMrcAgent:
         ]
         self._current_window_start_ns: int = self.clock_ns()
         self._current_window_id: int = 0
+        # Out-of-process sent counts. In the daemon split the data
+        # sender is another process and never calls record_sent();
+        # `sent_source()` returns the per-EV sent delta since its last
+        # call (see sent_counters.SentCounterReader), folded in at each
+        # window rotation.
+        self._sent_source = sent_source
 
     # --- public API ----------------------------------------------------
 
@@ -417,10 +428,9 @@ class SenderMrcAgent:
           - every loss_window_ms: rotate the sent-window for the
             loss-fusion path.
 
-        We loop at the GCD of the two cadences. In practice both
-        defaults are 200ms so a single timer fires both events; if a
-        scenario YAML overrides one but not the other, we just tick
-        independently with two separate deadlines.
+        The defaults differ (probe_interval_ms 500, loss_window_ms
+        300), so the loop keeps two separate deadlines and fires each
+        event on its own cadence.
         """
         probe_interval_s = self.cfg.probe_interval_ms / 1000.0
         loss_window_s = self.cfg.loss_window_ms / 1000.0
@@ -452,8 +462,19 @@ class SenderMrcAgent:
 
     def _rotate_window(self) -> None:
         """Snapshot + reset the current sent counters."""
+        delta = None
+        if self._sent_source is not None:
+            try:
+                delta = self._sent_source()
+            except Exception as e:  # never kill the window thread
+                log.debug("mrc.agent: sent_source raised: %s", e)
         now_ns = self.clock_ns()
         with self._lock:
+            if delta:
+                for plane, row in enumerate(delta[:NUM_PLANES]):
+                    cur = self._current_window_sent[plane]
+                    for path, n in enumerate(row[:NUM_SPINES]):
+                        cur[path] += n
             sent = tuple(tuple(row) for row in self._current_window_sent)
             start = self._current_window_start_ns
             wid = self._current_window_id
@@ -538,6 +559,10 @@ class ReceiverMrcAgent:
         # is alive between me and that sender" is the data-arrival EV.
         self._senders: Dict[Tuple[int, int], _SenderAddr] = {}
         self._senders_lock = threading.Lock()
+        # Opt-in trimming counters (stay 0 unless trims arrive).
+        self.trimmed_seen = 0
+        self.nacks_sent = 0
+        self.nack_send_errors = 0
 
         if transport is None:
             transport = Srv6RawTransport(
@@ -586,6 +611,40 @@ class ReceiverMrcAgent:
                         last_path=path,
                     )
 
+    def record_trimmed(self, flow_key, plane: int, path: int,
+                       seq: int) -> None:
+        """Hook for a trimmed (header-only) data arrival: count it for
+        the loss report and NACK it at once so the sender retransmits.
+
+        The NACK rides the same reverse EV as loss reports (the last EV
+        that delivered full data from that sender), falling back to the
+        trimmed packet's own EV before any full packet has arrived.
+        """
+        self.loss_table.record_trimmed(flow_key, plane=plane, path=path)
+        self.trimmed_seen += 1
+        if not (isinstance(flow_key, tuple) and len(flow_key) >= 2):
+            return
+        tid, src_id = flow_key[0], flow_key[1]
+        with self._senders_lock:
+            sender = self._senders.get((tid, src_id))
+        rev_plane, rev_path = (
+            (sender.last_plane, sender.last_path) if sender is not None
+            else (plane, path)
+        )
+        payload = encode_nack(Nack(
+            plane_id=plane, path_id=path, tenant_id=tid,
+            src_id=src_id, dst_id=self.my_id, seq=seq,
+        ))
+        try:
+            self.transport.send_nack(
+                plane=rev_plane, path=rev_path, dst_leaf=src_id,
+                dport=nack_port(self.my_id), payload=payload,
+            )
+            self.nacks_sent += 1
+        except OSError as e:
+            self.nack_send_errors += 1
+            log.debug("mrc.recv: nack send failed: %s", e)
+
     def known_senders(self) -> Tuple[Tuple[int, int], ...]:
         """Test/diagnostic accessor for the sender cache."""
         with self._senders_lock:
@@ -597,8 +656,15 @@ class ReceiverMrcAgent:
         The receiver-side probe-RX instrumentation is gone with the
         stateless-probe design; this method is retained so callers
         relying on its presence (the CLI's JSON output) keep working.
+        Carries trimming counters only once a trim has arrived.
         """
-        return {}
+        if not self.trimmed_seen:
+            return {}
+        return {"trim": {
+            "trimmed_seen": self.trimmed_seen,
+            "nacks_sent": self.nacks_sent,
+            "nack_send_errors": self.nack_send_errors,
+        }}
 
     # --- thread bodies -------------------------------------------------
 

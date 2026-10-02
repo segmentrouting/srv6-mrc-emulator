@@ -366,6 +366,20 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
         )
         progress_cb = lambda _seq, plane, path: mrc_agent.record_sent(plane, path)
 
+    # Daemon split: the SenderMrcAgent lives in the MrcDaemon, which
+    # can't see our TX. Publish per-EV sent counts next to the snapshot
+    # we read so its loss fusion has a denominator.
+    sent_writer = None
+    if isinstance(policy, MrcSnapshot):
+        from srv6_mrc.mrc.sent_counters import (
+            SentCounterWriter, sent_counters_path,
+        )
+        sent_writer = SentCounterWriter(
+            sent_counters_path(policy.snapshot_path),
+            num_planes=NUM_PLANES, num_paths=NUM_SPINES,
+        )
+        progress_cb = lambda _seq, plane, path: sent_writer.record(plane, path)
+
     if not args.json:
         spine = spine_for(my_id, args.dst_id)
         src_inner = inner_addr(tenant, my_id)
@@ -386,13 +400,25 @@ def cmd_send(args, tenant: str, my_id: int) -> int:
 
     if mrc_agent is not None:
         mrc_agent.start()
+    if sent_writer is not None:
+        sent_writer.start()
+    # Opt-in trimming: set by mrc/run.py from a scenario's `trim:` block.
+    from srv6_mrc.trim import TrimSpec
+    try:
+        trim_spec = TrimSpec.from_env()
+    except (ValueError, KeyError) as e:
+        print(f"spray.py: bad SRV6_TRIM_JSON: {e}", file=sys.stderr)
+        return 2
     mrc_diag = None
     try:
         result = run_sender(
             flow, policy, args.rate, args.duration,
             progress_cb=progress_cb, sid_mode=sid_mode, transport=transport,
+            **({"trim": trim_spec} if trim_spec is not None else {}),
         )
     finally:
+        if sent_writer is not None:
+            sent_writer.stop()
         # Capture EV-state + fusion-stats BEFORE stop() so the snapshot
         # reflects the live counters that produced the per-plane spray
         # distribution we just ran. Stop drains background threads;
@@ -448,6 +474,7 @@ def cmd_recv(args, tenant: str, my_id: int) -> int:
     # non-MRC path free of MRC deps.
     mrc_agent = None
     on_packet = None
+    on_trimmed = None
     if args.mrc:
         from srv6_mrc.mrc.agent import (
             ReceiverMrcAgent, load_configs_from_env,
@@ -492,7 +519,19 @@ def cmd_recv(args, tenant: str, my_id: int) -> int:
                 agent_flow_key, plane=plane, path=path, seq=seq,
             )
 
+        def _on_trimmed(flow_key, plane: int, path: int, seq: int) -> None:
+            # Opt-in trimming: same flow-key translation as data, then
+            # the agent counts the trim and NACKs it.
+            parsed = host_id_from_inner_addr(flow_key.src_addr)
+            if parsed is None or parsed[0] != tenant:
+                return
+            mrc_agent.record_trimmed(
+                (topo_tenant_id(parsed[0]), parsed[1], my_id),
+                plane=plane, path=path, seq=seq,
+            )
+
         on_packet = _on_packet
+        on_trimmed = _on_trimmed
 
     if not args.json:
         idle_msg = (
@@ -519,6 +558,7 @@ def cmd_recv(args, tenant: str, my_id: int) -> int:
             tenant=tenant,
             idle_timeout_s=args.idle_timeout,
             on_packet=on_packet,
+            on_trimmed=on_trimmed,
         )
     finally:
         if mrc_agent is not None:

@@ -46,15 +46,26 @@ attributed using receiver's seq-span estimate".
 
 Invariants
 ----------
+- Trimmed arrivals (opt-in trimming, LOSS_REPORT v3) count as delivered
+  for EV health: loss = 1 - (seen + trimmed) / sent. A trim is congestion,
+  recovered by NACK + retransmit; only untrimmed loss demotes an EV.
 - A `seen > expected` report for a plane is treated as 0% loss (clamped),
   not negative loss. This can legitimately happen when packets sent in
   the prior window arrive in this one (i.e., the receiver is using a
   broader window than the sender). No state change is more correct than
   a fake "below 0% loss" signal.
-- A plane absent from the report (because seen==0) is treated as
-  "no data this window". We do NOT call record_loss_window for it; the
-  EV state machine continues to operate from probe data alone for that
-  plane this window.
+- The receiver omits EVs with seen==0, so a fully blackholed EV never
+  appears in a report. When the report is non-empty (the receiver is
+  alive and hearing this flow) and pairs with a SentWindow in which we
+  sent at least `MIN_SENT_FOR_ABSENT_LOSS` packets on an EV that is
+  absent from it, that EV is recorded as 100% loss. A single send can
+  straddle the receiver's window edge, so it carries no signal. The whole inference is skipped unless the report's total
+  `seen` covers at least `MIN_COVERAGE_FOR_ABSENT_LOSS` of the paired
+  window's total sent: a receiver window that caught only a slice of
+  the sender's (window-phase skew, a burst straddling the boundary)
+  omits healthy EVs too. EVs already ASSUMED_BAD are skipped: right after a demote the
+  paired window still shows sends on them, and re-counting would re-arm
+  the loss gate that blocks their probe recovery.
 - A report with zero records means the receiver saw no traffic at all
   in the window. We skip the table update entirely (vs telling it every
   plane had 0 loss, which would clear the bad-window counters).
@@ -67,8 +78,24 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Optional, Tuple
 
-from .ev_state import EVStateTable
+from .ev_state import EVState, EVStateTable
 from .probe import LossReport
+
+
+# Minimum packets sent on an EV in the paired window before its absence
+# from a non-empty LOSS_REPORT counts as total loss. A lone packet can
+# land entirely in the receiver's neighbouring window. The committed MRC
+# scenarios run 100 pps over 16 EVs, ~1.9 packets per EV per 300 ms
+# window, so anything above 2 would leave a blackhole undetected there;
+# loss_demote_consecutive (3) absorbs the occasional straddle (see
+# tests/test_mrc_agent_logic.py::TestLossPathTimeline).
+MIN_SENT_FOR_ABSENT_LOSS = 2
+# Minimum report.seen / paired.sent (all EVs) before absent EVs are
+# inferred lost. Below this the two windows don't cover the same
+# traffic, so absence says nothing. At most half the EVs can be demoted
+# anyway (EVStateConfig.min_active_evs default), and probes still cover
+# larger fabric failures.
+MIN_COVERAGE_FOR_ABSENT_LOSS = 0.5
 
 
 @dataclass(frozen=True)
@@ -185,6 +212,12 @@ class LossFusionStats:
       - no_pairing_window_in_ring: per-report counter (not per-plane);
         increments once per LossReport that couldn't pair against any
         SentWindow within max_window_skew_ns.
+      - absent_evs_counted_as_lost: EVs we sprayed (>= MIN_SENT_FOR_
+        ABSENT_LOSS in the paired window) that the report omitted, fed
+        to the state machine as seen=0. Not included in planes_updated.
+      - absent_check_skipped_low_coverage: paired reports whose total
+        seen was below MIN_COVERAGE_FOR_ABSENT_LOSS of the window's
+        total sent, so absent EVs were not inferred lost.
     """
     reports_processed: int = 0
     planes_updated: int = 0
@@ -192,6 +225,8 @@ class LossFusionStats:
     paired_with_sent_window: int = 0
     fell_back_to_receiver_expected: int = 0
     no_pairing_window_in_ring: int = 0
+    absent_evs_counted_as_lost: int = 0
+    absent_check_skipped_low_coverage: int = 0
 
 
 def apply_loss_report(
@@ -203,6 +238,7 @@ def apply_loss_report(
     received_at_ns: int,
     max_window_skew_ns: int,
     stats: Optional[LossFusionStats] = None,
+    min_sent_for_absent: int = MIN_SENT_FOR_ABSENT_LOSS,
 ) -> None:
     """Translate a LossReport into EVStateTable.record_loss_window calls.
 
@@ -219,6 +255,10 @@ def apply_loss_report(
       - Else skip the plane: leave the EV's bad-window counter where
         it is. We deliberately do NOT use `rec.expected` as a fallback
         denominator — see module docstring for why.
+
+    Then, if paired, every EV absent from the report that we sent at
+    least `min_sent_for_absent` packets on is recorded as total loss
+    (see "Invariants" in the module docstring).
     """
     if stats is None:
         stats = LossFusionStats()  # local-only, discarded
@@ -235,7 +275,7 @@ def apply_loss_report(
         stats.no_pairing_window_in_ring += 1
 
     for rec in report.planes:
-        if rec.seen == 0 and rec.expected == 0:
+        if rec.seen == 0 and rec.expected == 0 and rec.trimmed == 0:
             stats.planes_skipped_no_data += 1
             continue
 
@@ -268,13 +308,12 @@ def apply_loss_report(
             stats.fell_back_to_receiver_expected += 1
             continue
 
-        # NB: once a plane is demoted to weight=0, the sender stops
-        # spraying it, so subsequent SentWindows have sent[plane]=0
-        # and we hit the `denominator == 0` skip above. The plane
-        # stays demoted via the consecutive-counter ratchet from when
-        # it was first demoted; recovery happens via the probe path
-        # (consecutive_probe_successes >= probe_recover_threshold),
-        # not via this loss-window path.
+        # NB: once an EV is demoted to weight=0, the sender stops
+        # spraying it, so subsequent SentWindows have sent=0 for it
+        # and we hit the `denominator == 0` skip above. The demote
+        # clears the EV's loss streak, so recovery happens via the
+        # probe path (probe_recover_ticks healthy windows), not via
+        # this loss-window path.
 
         # EVStateTable.record_loss_window takes (seen, expected) and
         # does the ratio internally; we keep compute_loss_ratio public
@@ -282,14 +321,37 @@ def apply_loss_report(
         # identified by (plane, path); the loss record carries both
         # since PROBE/LOSS_REPORT v2 wire formats added the path
         # dimension.
+        # A trimmed packet arrived (header only): congestion, not path
+        # loss, so it counts toward delivery for EV health.
         table.record_loss_window(
-            tenant, rec.plane_id, rec.path_id, rec.seen, denominator,
+            tenant, rec.plane_id, rec.path_id, rec.seen + rec.trimmed,
+            denominator,
         )
         stats.planes_updated += 1
         stats.paired_with_sent_window += 1
 
+    if paired is None:
+        return
+    total_sent = sum(sum(row) for row in paired.sent)
+    total_seen = sum(rec.seen + rec.trimmed for rec in report.planes)
+    if total_sent == 0 or total_seen < MIN_COVERAGE_FOR_ABSENT_LOSS * total_sent:
+        stats.absent_check_skipped_low_coverage += 1
+        return
+    reported = {(rec.plane_id, rec.path_id) for rec in report.planes}
+    for plane, row in enumerate(paired.sent):
+        for path, sender_sent in enumerate(row):
+            if sender_sent < min_sent_for_absent:
+                continue
+            if (plane, path) in reported:
+                continue
+            if table.state(tenant, plane, path) is EVState.ASSUMED_BAD:
+                continue
+            table.record_loss_window(tenant, plane, path, 0, sender_sent)
+            stats.absent_evs_counted_as_lost += 1
+
 
 __all__ = [
+    "MIN_SENT_FOR_ABSENT_LOSS", "MIN_COVERAGE_FOR_ABSENT_LOSS",
     "SentWindow", "SentWindowRing",
     "LossFusionStats",
     "compute_loss_ratio", "apply_loss_report",

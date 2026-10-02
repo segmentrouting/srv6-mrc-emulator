@@ -172,6 +172,14 @@ PLANE_NICS = tuple(PLANE_NIC(p) for p in range(NUM_PLANES))
 SPRAY_PORT = 9999
 SPRAY_PROBE_PORT = 9998   # MRC EV Probe / Probe Reply (see mrc/probe.py)
 SPRAY_REPORT_PORT = 9997  # MRC receiver loss-feedback report
+# Trimming (opt-in): NACKs for flow src -> dst go to the data sender's
+# own port, NACK_PORT_BASE + dst_id, so each flow's sender binds a
+# distinct port (no SO_REUSEPORT sharing).
+NACK_PORT_BASE = 9800
+
+
+def nack_port(dst_id: int) -> int:
+    return NACK_PORT_BASE + dst_id
 
 # --- transport (inner payload framing) --------------------------------------
 

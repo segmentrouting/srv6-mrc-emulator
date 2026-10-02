@@ -113,6 +113,7 @@ from ..topo import (
 from .agent import AgentConfig, SenderMrcAgent
 from .ev_state import EVStateConfig, EVStateTable
 from .probe import ProbeDecodeError, decode_probe
+from .sent_counters import SentCounterReader, sent_counters_path
 from .transport import (
     DEFAULT_RECV_BUFSIZE,
     MrcTransport,
@@ -287,6 +288,15 @@ class MrcDaemon:
         }
 
         for flow in self.flows:
+            # The data sender for this flow publishes its per-EV sent
+            # counts next to the snapshot it reads; loss fusion needs
+            # them as the denominator.
+            sent_reader = SentCounterReader(
+                sent_counters_path(
+                    self._snapshot_path(flow.tenant, flow.dst_id)
+                ),
+                num_planes=NUM_PLANES, num_paths=NUM_SPINES,
+            )
             agent = SenderMrcAgent(
                 tenant=flow.tenant,
                 src_id=src_id,
@@ -295,6 +305,7 @@ class MrcDaemon:
                 config=agent_cfg,
                 transport=self.transport,  # shared!
                 clock_ns=clock_ns,
+                sent_source=sent_reader.read_delta,
             )
             self.agents[(flow.tenant, flow.dst_id)] = agent
             self._demux[flow.dst_id] = agent

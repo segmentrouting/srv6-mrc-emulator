@@ -1,0 +1,42 @@
+# green-mrc-lasthop-drill.yaml — green last-hop link failure drill (2p-4x8).
+#
+# Long-running health_aware_mrc spray for a manual fault drill on the
+# one link green probes can't see. Green probes turn around at the
+# egress leaf (d000 uDT6) and never cross leaf -> host, so a dead
+# p<P>-leaf<NN>:Ethernet32 blackholes every plane-P EV to that host
+# while its probes keep succeeding. Only the loss path can catch it:
+# the receiver omits zero-arrival EVs from its report, and the sender
+# counts sprayed-but-absent EVs as total loss.
+#
+# Drill (from the docker host, while this runs):
+#   make TOPO=2p-4x8 SCEN=green-mrc-lasthop-drill scenario &
+#   sleep 10; srctl fault shutdown p1-leaf05 Ethernet32 --unidirectional
+#   sleep 25; srctl fault clear --all
+#
+# Expected for green-host02 -> green-host05 (watch
+# /dev/shm/srv6-mrc/green-host02/green_05.json in green-host02):
+#   - plane-1 EVs go ASSUMED_BAD within a few loss windows of the
+#     shutdown, and plane 0 carries the flow (loss stops);
+#   - while the link is down, plane-1 EVs recover via probes and are
+#     re-demoted by loss (probes can't see the fault);
+#   - after the clear they recover and stay GOOD.
+# Other flows (0->7, 1->6, 3->4) don't use leaf05 and stay clean.
+
+name: green-mrc-lasthop-drill
+description: |
+  60 s health_aware_mrc spray over 4 green pairs for a manual
+  p1-leaf05:Ethernet32 (leaf->host) shutdown drill. Exercises loss-path
+  detection of a blackhole that green's probes cannot observe.
+
+flows:
+  - pairs: green-pairs-4
+    policy: health_aware_mrc
+    rate: 100pps
+    duration: 60s
+
+faults: []
+
+mrc: {}
+
+report:
+  out: results/green-mrc-lasthop-drill.json

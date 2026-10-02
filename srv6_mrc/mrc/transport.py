@@ -118,6 +118,18 @@ class MrcTransport(ABC):
         and use the standard data-path uSID list (`usid_outer_dst`).
         """
 
+    def send_nack(
+        self, *, plane: int, path: int, dst_leaf: int, dport: int,
+        payload: bytes,
+    ) -> None:
+        """Send a NACK on EV `(plane, path)` to host_id=dst_leaf:dport.
+
+        Opt-in trimming only: goes to the data sender's own per-flow
+        port (`topo.nack_port`), not the daemon's listener. Same
+        one-way data-path uSIDs as a loss report.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot send NACKs")
+
     @abstractmethod
     def recv_socket(self) -> socket.socket:
         """Return the daemon's single UDP listener.
@@ -298,6 +310,21 @@ class Srv6RawTransport(MrcTransport):
         )
         self._raw_sockets[plane].sendto(pkt, (outer_dst, 0, 0, 0))
 
+    def send_nack(self, *, plane, path, dst_leaf, dport, payload):
+        outer_dst = usid_outer_dst(
+            self.tenant, plane=plane, spine=path, dst_leaf=dst_leaf,
+            sid_mode=self._sid_mode,
+        )
+        pkt = build_outer_packet(
+            src_underlay=self._loss_inner_src,
+            dst_outer=outer_dst,
+            src_inner=self._loss_inner_src,
+            dst_inner=inner_addr(self.tenant, dst_leaf),
+            sport=dport, dport=dport,
+            payload=payload,
+        )
+        self._raw_sockets[plane].sendto(pkt, (outer_dst, 0, 0, 0))
+
     # --- recv ---
 
     def recv_socket(self) -> socket.socket:
@@ -424,6 +451,9 @@ class LoopbackUdpTransport(MrcTransport):
 
     def send_loss_report(self, *, plane, path, dst_leaf, payload):
         self._send_sockets[plane].sendto(payload, ("::1", self._peer_rx_port))
+
+    def send_nack(self, *, plane, path, dst_leaf, dport, payload):
+        self._send_sockets[plane].sendto(payload, ("::1", dport))
 
     def recv_socket(self) -> socket.socket:
         return self._rx_socket

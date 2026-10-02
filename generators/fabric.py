@@ -983,7 +983,11 @@ def main() -> None:
         f"  {n_spines} spines, {n_leaves} leaves, {n_hosts} hosts, "
         f"{n_fabric_links} fabric links + {n_host_links} host links"
     )
-    print(f"Deploy lab: containerlab deploy -t {topo_clab.relative_to(REPO_ROOT)}")
+    try:
+        clab_display = topo_clab.relative_to(REPO_ROOT)
+    except ValueError:  # topo.yaml outside the repo (e.g. a temp dir)
+        clab_display = topo_clab
+    print(f"Deploy lab: containerlab deploy -t {clab_display}")
     print(f"Push configs: scripts/config.sh all")
 
 

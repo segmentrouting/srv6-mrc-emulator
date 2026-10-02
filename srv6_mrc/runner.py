@@ -121,6 +121,8 @@ class SenderResult:
     # `srv6_mrc.rdma`). Orthogonal to sid_mode — either uSID
     # construction works with either transport.
     transport: str = "udp"
+    # Opt-in trimming counters (srv6_mrc.trim.TrimStats); None = off.
+    trim: Optional[object] = None
 
     def to_dict(self) -> dict:
         return {
@@ -144,6 +146,7 @@ class SenderResult:
                 for (p, s), n in sorted(self.per_ev_sent.items())
             },
             "errors": self.errors,
+            **({"trim": self.trim.to_dict()} if self.trim is not None else {}),
         }
 
 
@@ -223,7 +226,8 @@ def _open_send_socket(iface: str) -> socket.socket:
 def _build_packet_bytes(src_underlay: str, dst_outer: str,
                         src_inner: str, dst_inner: str,
                         seq: int, plane: int, path: int,
-                        transport: str = "udp") -> bytes:
+                        transport: str = "udp",
+                        trimmed: bool = False) -> bytes:
     """Build full outer/inner/UDP bytes for one spray DATA packet.
 
     Thin wrapper around `srv6_mrc.encap.build_outer_packet` that
@@ -237,7 +241,11 @@ def _build_packet_bytes(src_underlay: str, dst_outer: str,
     RDMA_PORT instead of SPRAY_PORT for the inner UDP dport.
     """
     from .encap import build_outer_packet
-    mrc_payload = encode_payload(seq, plane, path)
+    # Trimmed form (opt-in trimming): the MRC header only, no pad. In
+    # rdma mode it is still wrapped in BTH, like a switch-trimmed RoCE
+    # packet that keeps its transport header.
+    mrc_payload = (struct.pack(_PAYLOAD_HDR, seq, plane, path) if trimmed
+                   else encode_payload(seq, plane, path))
     if transport == "rdma":
         from .rdma import wrap_rdma
         payload = wrap_rdma(mrc_payload, plane=plane, path=path, seq=seq)
@@ -264,7 +272,9 @@ def run_sender(flow: FlowEndpoint,
                stop_event: Optional[threading.Event] = None,
                progress_cb=None,
                sid_mode: str = "uA",
-               transport: str = "udp") -> SenderResult:
+               transport: str = "udp",
+               trim=None,
+               nack_listener=None) -> SenderResult:
     """Run a single-flow sender loop with the given policy.
 
     Args:
@@ -279,6 +289,11 @@ def run_sender(flow: FlowEndpoint,
             every packet; see `topo.usid_outer_dst`.
         transport: "udp" (default) or "rdma" — inner payload framing
             for every packet; see `srv6_mrc.rdma`.
+        trim: optional srv6_mrc.trim.TrimSpec. Opt-in trimming: the
+            oracle trims or drops matching packets, and NACKed seqs are
+            retransmitted full size on a different EV. None = off.
+        nack_listener: test hook; defaults to a NackListener on
+            `topo.nack_port(flow.dst_id)` when `trim` is set.
 
     Returns: SenderResult
     """
@@ -319,6 +334,70 @@ def run_sender(flow: FlowEndpoint,
             sid_mode=sid_mode, transport=transport,
         )
 
+        oracle = None
+        if trim is not None:
+            from .trim import NackListener, TrimOracle, TrimStats
+            oracle = TrimOracle(trim)
+            result.trim = TrimStats()
+            if nack_listener is None:
+                nack_listener = NackListener(
+                    dst_id=flow.dst_id, max_retransmits=trim.max_retransmits,
+                    stats=result.trim,
+                )
+            nack_listener.start()
+
+        def resolve(plane: int, ev_spine: int):
+            """(src_underlay, outer DA, sockaddr) for an EV."""
+            if not ev_aware:
+                return plane_meta[plane]
+            outer = usid_outer_dst(flow.tenant, plane, ev_spine,
+                                   flow.dst_id, sid_mode=sid_mode)
+            return plane_src_underlay[plane], outer, (outer, 0, 0, 0)
+
+        def pick_other_ev(seq: int, avoid: tuple):
+            """An EV for a retransmit, from the normal policy, != avoid."""
+            for k in range(1, 9):
+                if ev_aware:
+                    ev = policy.pick_ev(seq + k, flow_key)
+                else:
+                    ev = (policy.pick(seq + k, flow_key), spine)
+                if tuple(ev) != avoid:
+                    return ev
+            return ev
+
+        def emit(seq: int, plane: int, ev_spine: int, src_u, outer_d, sa
+                 ) -> None:
+            """Send one data packet, through the trim oracle when on."""
+            trimmed = dropped = False
+            if oracle is not None and oracle.hits(plane, ev_spine):
+                if oracle.spec.mode == "trim":
+                    trimmed = True
+                    result.trim.trimmed += 1
+                else:
+                    dropped = True
+                    result.trim.dropped += 1
+            try:
+                if not dropped:
+                    pkt = _build_packet_bytes(
+                        src_u, outer_d, src_inner, dst_inner,
+                        seq, plane, ev_spine, transport=transport,
+                        trimmed=trimmed,
+                    )
+                    sockets[plane].sendto(pkt, sa)
+                result.per_plane_sent[plane] = \
+                    result.per_plane_sent.get(plane, 0) + 1
+                if ev_aware:
+                    ev_key = (plane, ev_spine)
+                    result.per_ev_sent[ev_key] = \
+                        result.per_ev_sent.get(ev_key, 0) + 1
+                if nack_listener is not None:
+                    nack_listener.note_sent(seq)
+                if progress_cb is not None:
+                    progress_cb(seq, plane, ev_spine)
+            except OSError:
+                result.errors += 1
+                raise
+
         interval = 1.0 / rate_pps if rate_pps > 0 else 0.0
         t_start = time.monotonic()
         deadline = t_start + duration_s if duration_s > 0 else float("inf")
@@ -329,6 +408,17 @@ def run_sender(flow: FlowEndpoint,
             while time.monotonic() < deadline:
                 if stop_event is not None and stop_event.is_set():
                     break
+                if nack_listener is not None:
+                    # Fast retransmit: NACKed seqs go ahead of new data,
+                    # full size, on a different EV from the trimmed one.
+                    for rseq, tplane, tpath in nack_listener.take():
+                        rplane, rspine = pick_other_ev(rseq, (tplane, tpath))
+                        r_src, r_outer, r_sa = resolve(rplane, rspine)
+                        try:
+                            emit(rseq, rplane, rspine, r_src, r_outer, r_sa)
+                            result.trim.retransmits += 1
+                        except OSError:
+                            pass
                 if ev_aware:
                     plane, ev_spine = policy.pick_ev(seq, flow_key)
                     if not 0 <= plane < NUM_PLANES:
@@ -351,24 +441,32 @@ def run_sender(flow: FlowEndpoint,
                         )
                     ev_spine = spine
                     src_u, outer_d, sa = plane_meta[plane]
-                pkt = _build_packet_bytes(
-                    src_u, outer_d, src_inner, dst_inner,
-                    seq, plane, ev_spine, transport=transport,
-                )
-                try:
-                    sockets[plane].sendto(pkt, sa)
-                    result.per_plane_sent[plane] = \
-                        result.per_plane_sent.get(plane, 0) + 1
-                    if ev_aware:
-                        ev_key = (plane, ev_spine)
-                        result.per_ev_sent[ev_key] = \
-                            result.per_ev_sent.get(ev_key, 0) + 1
-                    result.sent += 1
-                    if progress_cb is not None:
-                        progress_cb(seq, plane, ev_spine)
-                except OSError:
-                    result.errors += 1
-                seq += 1
+                if oracle is not None:
+                    try:
+                        emit(seq, plane, ev_spine, src_u, outer_d, sa)
+                        result.sent += 1
+                    except OSError:
+                        pass
+                    seq += 1
+                else:
+                    pkt = _build_packet_bytes(
+                        src_u, outer_d, src_inner, dst_inner,
+                        seq, plane, ev_spine, transport=transport,
+                    )
+                    try:
+                        sockets[plane].sendto(pkt, sa)
+                        result.per_plane_sent[plane] = \
+                            result.per_plane_sent.get(plane, 0) + 1
+                        if ev_aware:
+                            ev_key = (plane, ev_spine)
+                            result.per_ev_sent[ev_key] = \
+                                result.per_ev_sent.get(ev_key, 0) + 1
+                        result.sent += 1
+                        if progress_cb is not None:
+                            progress_cb(seq, plane, ev_spine)
+                    except OSError:
+                        result.errors += 1
+                    seq += 1
 
                 if interval > 0:
                     next_tx += interval
@@ -385,6 +483,8 @@ def run_sender(flow: FlowEndpoint,
         return result
 
     finally:
+        if trim is not None and nack_listener is not None:
+            nack_listener.stop()
         for s in sockets.values():
             try:
                 s.close()
@@ -402,7 +502,8 @@ def run_receiver(self_host: str,
                  stop_event: Optional[threading.Event] = None,
                  nics: tuple[str, ...] = PLANE_NICS,
                  install_signal_handlers: bool = True,
-                 on_packet=None) -> dict:
+                 on_packet=None,
+                 on_trimmed=None) -> dict:
     """Multi-flow receiver. Sniffs all plane NICs in parallel, demultiplexes
     by FlowKey, computes per-flow loss + reorder histograms.
 
@@ -425,6 +526,13 @@ def run_receiver(self_host: str,
     path: int, seq: int)`. Used by the MRC receiver agent to feed its
     per-EV loss-window accountant. Callback exceptions are caught + logged
     but never crash the sniffer (the receiver's job is to keep counting).
+
+    Opt-in trimming: a data packet whose UDP payload is only the MRC
+    header (`_PAYLOAD_HDR_LEN` bytes, no padding) was trimmed in
+    flight. It is not delivered; `on_trimmed(flow_key, plane, path,
+    seq)` fires (the MRC agent NACKs it), and a later full copy of the
+    seq counts as recovered. Flows with trims gain a `trim` block in
+    their dict; flows without keep today's shape.
     """
     # Lazy scapy import — keeps orchestrator (no scapy) able to import this.
     logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
@@ -434,6 +542,9 @@ def run_receiver(self_host: str,
     per_nic: Counter[str] = Counter()
     per_plane: Counter[int] = Counter()
     last_rx = [0.0]                # monotonic time of most recent packet
+    # Opt-in trimming: per-flow counters + trimmed seqs awaiting a full copy.
+    trim_stats: dict[FlowKey, dict[str, int]] = {}
+    trim_pending: dict[FlowKey, set[int]] = {}
 
     # Precomputed canonical form of this host's inner anycast. Sniffers
     # see traffic in BOTH directions on each NIC, so an all-to-all run
@@ -490,7 +601,8 @@ def run_receiver(self_host: str,
         if not _should_count_inner(inner_dst, self_inner_canon):
             return
 
-        parsed = parse_payload(raw_payload)
+        raw = raw_payload
+        parsed = parse_payload(raw)
         if parsed is None:
             return
         seq, plane, path = parsed
@@ -501,6 +613,24 @@ def run_receiver(self_host: str,
             src_port=int(udp.sport),
             dst_port=int(udp.dport),
         )
+        if len(raw) == _PAYLOAD_HDR_LEN:
+            # Trimmed in flight: header only, nothing to deliver.
+            ts = trim_stats.setdefault(flow, {"trimmed": 0, "recovered": 0})
+            ts["trimmed"] += 1
+            trim_pending.setdefault(flow, set()).add(seq)
+            last_rx[0] = time.monotonic()
+            if on_trimmed is not None:
+                try:
+                    on_trimmed(flow, plane, path, seq)
+                except Exception as e:  # noqa: BLE001
+                    logging.getLogger(__name__).debug(
+                        "run_receiver on_trimmed hook raised %s; ignoring", e,
+                    )
+            return
+        pending = trim_pending.get(flow)
+        if pending is not None and seq in pending:
+            pending.discard(seq)
+            trim_stats[flow]["recovered"] += 1
         tracker.observe(flow, seq, plane=plane)
         per_nic[nic] += 1
         per_plane[plane] += 1
@@ -549,8 +679,22 @@ def run_receiver(self_host: str,
         "tenant": tenant,
         "per_nic":   {n: per_nic[n] for n in nics},
         "per_plane": {p: per_plane[p] for p in range(NUM_PLANES)},
-        "flows":     [f.to_dict() for f in tracker.flows()],
+        "flows":     [_flow_dict(f, trim_stats, trim_pending)
+                      for f in tracker.flows()],
     }
+
+
+def _flow_dict(f, trim_stats: dict, trim_pending: dict) -> dict:
+    """FlowStats.to_dict(), plus a `trim` block for flows that saw trims."""
+    d = f.to_dict()
+    ts = trim_stats.get(f.flow)
+    if ts:
+        d["trim"] = {
+            "trimmed": ts["trimmed"],
+            "recovered": ts["recovered"],
+            "unrecovered": len(trim_pending.get(f.flow, ())),
+        }
+    return d
 
 
 # --- host identity helper (for the `spray` CLI shim) ------------------------
