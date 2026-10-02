@@ -66,7 +66,7 @@ from ..topo import (
     NUM_SPINES,
     tenant_id as topo_tenant_id,
 )
-from .ev_state import EVStateTable
+from .ev_state import EVStateConfig, EVStateTable
 from .loss_compute import (
     LossFusionStats,
     SentWindow,
@@ -121,16 +121,15 @@ class AgentConfig:
 # tunables into per-container spray.py invocations.
 MRC_CONFIG_ENV = "SRV6_MRC_CONFIG_JSON"
 
-_AGENT_CONFIG_FIELDS = frozenset({
-    "probe_interval_ms", "probe_timeout_ms",
-    "loss_window_ms", "max_window_skew_ms",
-})
-_EV_STATE_CONFIG_FIELDS = frozenset({
-    "probe_window_ticks", "probe_min_samples",
-    "probe_fail_ratio", "probe_recover_ratio", "probe_recover_ticks",
-    "loss_threshold", "loss_demote_consecutive",
-    "min_active_evs", "rtt_ring_size",
-})
+# Keys SRV6_MRC_CONFIG_JSON may carry, derived from the config
+# dataclasses so a renamed or added tunable can't drift out of sync.
+def _config_fields(cls) -> frozenset:
+    import dataclasses
+    return frozenset(f.name for f in dataclasses.fields(cls))
+
+
+_AGENT_CONFIG_FIELDS = _config_fields(AgentConfig) - {"use_loopback"}
+_EV_STATE_CONFIG_FIELDS = _config_fields(EVStateConfig)
 
 
 def load_configs_from_env(
@@ -417,10 +416,9 @@ class SenderMrcAgent:
           - every loss_window_ms: rotate the sent-window for the
             loss-fusion path.
 
-        We loop at the GCD of the two cadences. In practice both
-        defaults are 200ms so a single timer fires both events; if a
-        scenario YAML overrides one but not the other, we just tick
-        independently with two separate deadlines.
+        The defaults differ (probe_interval_ms 500, loss_window_ms
+        300), so the loop keeps two separate deadlines and fires each
+        event on its own cadence.
         """
         probe_interval_s = self.cfg.probe_interval_ms / 1000.0
         loss_window_s = self.cfg.loss_window_ms / 1000.0

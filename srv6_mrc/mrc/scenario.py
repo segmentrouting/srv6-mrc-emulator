@@ -14,12 +14,14 @@ Validates the full scenario shape laid out in mrc/README.md:
       probe_timeout_ms: <int>
       loss_window_ms: <int>
       max_window_skew_ms: <int>
-      probe_fail_threshold: <int>
-      probe_recover_threshold: <int>
+      probe_window_ticks: <int>
+      probe_min_samples: <int>
+      probe_fail_ratio: <float 0..1>
+      probe_recover_ratio: <float 0..1>
+      probe_recover_ticks: <int>
       loss_threshold: <float 0..1>
       loss_demote_consecutive: <int>
       min_active_evs: <int>
-      rtt_ring_size: <int>
     faults:                          # optional
       - kind: netem
         target: <target-string>
@@ -116,31 +118,30 @@ class MrcSpec:
     probe_timeout_ms: int | None = None
     loss_window_ms: int | None = None
     max_window_skew_ms: int | None = None
-    # EVStateConfig tunables (EV state machine).
-    probe_fail_threshold: int | None = None
-    probe_recover_threshold: int | None = None
+    # EVStateConfig tunables (EV state machine). Names must match
+    # EVStateConfig fields; tests/mrc/test_scenario.py checks every
+    # field survives into the runtime configs.
+    probe_window_ticks: int | None = None
+    probe_min_samples: int | None = None
+    probe_fail_ratio: float | None = None
+    probe_recover_ratio: float | None = None
+    probe_recover_ticks: int | None = None
     loss_threshold: float | None = None
     loss_demote_consecutive: int | None = None
     min_active_evs: int | None = None
-    rtt_ring_size: int | None = None
 
     def to_env_json(self) -> str:
         """Encode for the SRV6_MRC_CONFIG_JSON env var consumed by
         spray.py. Only set fields are emitted so spray.py can layer
         them onto its dataclass defaults via field-by-field overrides.
         """
+        import dataclasses
         import json
-        payload: dict[str, Any] = {}
-        for fname in (
-            "probe_interval_ms", "probe_timeout_ms", "loss_window_ms",
-            "max_window_skew_ms", "probe_fail_threshold",
-            "probe_recover_threshold", "loss_threshold",
-            "loss_demote_consecutive", "min_active_evs",
-            "rtt_ring_size",
-        ):
-            v = getattr(self, fname)
-            if v is not None:
-                payload[fname] = v
+        payload: dict[str, Any] = {
+            f.name: getattr(self, f.name)
+            for f in dataclasses.fields(self)
+            if getattr(self, f.name) is not None
+        }
         return json.dumps(payload, sort_keys=True)
 
 
@@ -504,12 +505,18 @@ def _validate_transport(value: Any, path: str) -> str | None:
 # error messages list them deterministically.
 _MRC_POSITIVE_INT_FIELDS = (
     "probe_interval_ms", "probe_timeout_ms", "loss_window_ms",
-    "max_window_skew_ms", "probe_fail_threshold",
-    "probe_recover_threshold", "loss_demote_consecutive",
-    "min_active_evs", "rtt_ring_size",
+    "max_window_skew_ms", "probe_window_ticks", "probe_min_samples",
+    "probe_recover_ticks", "loss_demote_consecutive",
+    "min_active_evs",
 )
-_MRC_RATIO_FIELDS = ("loss_threshold",)
-_MRC_OPTIONAL = set(_MRC_POSITIVE_INT_FIELDS) | set(_MRC_RATIO_FIELDS)
+_MRC_NON_NEGATIVE_INT_FIELDS: tuple = ()
+_MRC_RATIO_FIELDS = (
+    "probe_fail_ratio", "probe_recover_ratio", "loss_threshold",
+)
+_MRC_OPTIONAL = (
+    set(_MRC_POSITIVE_INT_FIELDS) | set(_MRC_NON_NEGATIVE_INT_FIELDS)
+    | set(_MRC_RATIO_FIELDS)
+)
 
 
 def _validate_mrc(value: Any, path: str) -> MrcSpec:
@@ -538,6 +545,15 @@ def _validate_mrc(value: Any, path: str) -> MrcSpec:
                 raise ScenarioError(
                     f"{path}.{fname}",
                     f"must be a positive int, got {v!r}",
+                )
+            kwargs[fname] = v
+    for fname in _MRC_NON_NEGATIVE_INT_FIELDS:
+        if fname in value:
+            v = value[fname]
+            if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                raise ScenarioError(
+                    f"{path}.{fname}",
+                    f"must be a non-negative int, got {v!r}",
                 )
             kwargs[fname] = v
     for fname in _MRC_RATIO_FIELDS:

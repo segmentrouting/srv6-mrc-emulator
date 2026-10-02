@@ -40,7 +40,7 @@ The `MrcDaemon` class:
 - Runs a `_dispatch_loop` thread on the shared recv socket that demuxes inbound packets by magic byte:
   - `0xA5` = returning stateless PROBE → `agent.record_probe_recv(plane, path)`
   - `0xA7` = LOSS_REPORT from peer receiver → `agent._handle_loss_report(payload)`
-- Runs a `_snapshot_loop` thread that writes per-flow snapshots to `/dev/shm/srv6-mrc/<host>/<tenant>_<dst_id>.json` every `probe_interval_ms` (default 200ms)
+- Runs a `_snapshot_loop` thread that writes per-flow snapshots to `/dev/shm/srv6-mrc/<host>/<tenant>_<dst_id>.json` every `probe_interval_ms` (default 500 ms)
 
 Each `SenderMrcAgent` (owned by the daemon, one per flow):
 - Runs TWO daemon threads:
@@ -50,11 +50,11 @@ Each `SenderMrcAgent` (owned by the daemon, one per flow):
 - Shares the daemon's transport (no per-agent socket binds)
 
 Data sender processes consume EV health via the `mrc_snapshot` policy, which:
-- Reads `/dev/shm/srv6-mrc/<host>/<tenant>_<dst>.json` at startup and every `loss_window_ms`
+- Reads `/dev/shm/srv6-mrc/<host>/<tenant>_<dst>.json` at startup and every 200 ms (`MrcSnapshot.refresh_interval_ms`)
 - Builds a weighted CDF from the snapshot's per-EV weights (cached; invalidated on weight changes)
 - Picks EVs identically to the live `health_aware_mrc` but from frozen snapshot data
 
-Staleness ≤ 200ms is well under any demote threshold (probe or loss path), so steering decisions remain timely.
+Staleness is at most one snapshot interval plus one refresh (500 ms + 200 ms by default), well under any demote latency (probe or loss path), so steering decisions remain timely.
 
 ## Why a separate daemon (not one all-in-one process)
 
@@ -107,7 +107,7 @@ per-probe timeout sweep.
 **EV health derivation:**
 
 Per-EV sliding window tracks `(sent, recv)` counts over the last
-`probe_window_ticks` ticks (default 5 × 200ms = 1 second). The agent's
+`probe_window_ticks` ticks (default 5 × 500 ms = 2.5 s). The agent's
 `_window_loop` calls `EVStateTable.tick(tenant)` once per
 `probe_interval_ms` to rotate buckets. Health decision:
 
@@ -194,7 +194,7 @@ The `mrc_snapshot` policy and `report.py` both accept this wrapped shape.
 
 Data senders use `--policy mrc_snapshot:/dev/shm/srv6-mrc/<host>`, which:
 - Loads the wrapped snapshot from the daemon's published path at startup
-- Re-loads it every `loss_window_ms` (default 200ms)
+- Re-loads it every `refresh_interval_ms` (default 200 ms)
 - Unwraps `.ev_state` and builds a per-EV weighted grid
 - Drives EV picks identically to `health_aware_mrc.choose_ev()` but
   using the snapshot's frozen view instead of a live `EVStateTable`
