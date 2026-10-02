@@ -200,9 +200,9 @@ Data senders use `--policy mrc_snapshot:/dev/shm/srv6-mrc/<host>`, which:
   using the snapshot's frozen view instead of a live `EVStateTable`
 - Caches the CDF keyed by `(id(wgrid), spines)` to avoid per-packet
   allocations (invalidated on wgrid swap)
-- Does NOT report per-EV sent counters into a ring (v3 design artifact;
-  removed in v4 — the loss-feedback path uses the daemon's own
-  `SenderMrcAgent.sent_ring`)
+- Is paired with a `SentCounterWriter` in the data sender that
+  publishes cumulative per-EV sent counts to the `.sent` sidecar (see
+  "Loss-feedback path" below)
 
 Backward compatibility: the `health_aware_mrc` policy (live in-process
 EVStateTable) continues to work for single-flow / non-daemon scenarios.
@@ -220,11 +220,22 @@ When a receiver's LOSS_REPORT arrives (magic `0xA7`), the daemon's
 dispatcher calls `agent._handle_loss_report(payload)` → `apply_loss_report`
 → `EVStateTable.record_loss_window(tenant, plane, path, seen, expected)`.
 
-Data senders do NOT write per-EV sent counters to `/dev/shm`. The v3
-design's "sender writes `.sent.json`, daemon reads it" flow was removed
-in v4 because the daemon already owns the sent-window ring through its
-per-flow agents. The only cross-process snapshot is the EV health
-(`.ev_state`), not the sent counts.
+The ring's denominators come from the data sender, which is a separate
+process and never calls `agent.record_sent()`. Without them every
+LOSS_REPORT is skipped (`loss_fusion.fell_back_to_receiver_expected`
+climbs, `planes_updated` stays 0) and only probes can demote an EV.
+So the data sender (`spray --role send` on an `mrc_snapshot` policy)
+runs a `SentCounterWriter` (`srv6_mrc/mrc/sent_counters.py`) that
+publishes cumulative per-EV counts every 50 ms to
+`/dev/shm/srv6-mrc/<host>/<tenant>_<dd>.sent`, next to the snapshot it
+reads. Each daemon agent holds a `SentCounterReader` on that file and
+folds the delta since its last read into the current window at every
+`_rotate_window()`. The `.sent` suffix keeps the file out of scrapers
+that glob `*.json` snapshots.
+
+Once an EV is demoted it carries no data, so no further loss windows
+arrive for it; the demote clears its loss streak and recovery is left
+to the probe path (`EVStateTable._transition_locked`).
 
 ## Lifecycle (v4)
 

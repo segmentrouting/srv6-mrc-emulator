@@ -202,7 +202,14 @@ class TestProbePath(unittest.TestCase):
         _drive_healthy(t, "green", [(3, 0)], ticks=1)
         self.assertIs(t.state("green", 3, 0), EVState.GOOD)
 
-    def test_recovery_blocked_by_recent_loss_demote(self):
+    def test_loss_demoted_ev_recovers_via_probes(self):
+        """A loss-demoted EV must be resurrectable by probes alone.
+
+        Once demoted, the EV has weight 0 so the sender stops spraying
+        data on it and no further loss windows arrive for it. Recovery
+        therefore cannot wait for a clean loss window — it has to come
+        from the probe path.
+        """
         cfg = EVStateConfig(
             probe_window_ticks=2, probe_min_samples=3,
             probe_fail_ratio=0.5, probe_recover_ratio=0.9,
@@ -215,16 +222,50 @@ class TestProbePath(unittest.TestCase):
         t.record_loss_window("green", 3, 0, seen=900, expected=1000)
         t.record_loss_window("green", 3, 0, seen=900, expected=1000)
         self.assertIs(t.state("green", 3, 0), EVState.ASSUMED_BAD)
-        # Probes go clean for many ticks — but the loss-demote-counter
-        # is still non-zero, so recovery must NOT fire.
+        # Probes go clean; no loss windows arrive (weight 0 => no data).
+        _drive_healthy(t, "green", [(3, 0)])
+        self.assertIs(t.state("green", 3, 0), EVState.GOOD)
+
+    def test_recovery_blocked_by_loss_after_demote(self):
+        """Loss evidence that arrives *after* the demote still gates
+        recovery until a clean loss window clears it."""
+        cfg = EVStateConfig(
+            probe_window_ticks=2, probe_min_samples=3,
+            probe_fail_ratio=0.5, probe_recover_ratio=0.9,
+            probe_recover_ticks=2,
+            loss_threshold=0.05, loss_demote_consecutive=2,
+        )
+        t = _table(cfg=cfg)
+        _drive_healthy(t, "green", [(0, 0), (1, 0), (2, 0)])
+        t.record_loss_window("green", 3, 0, seen=900, expected=1000)
+        t.record_loss_window("green", 3, 0, seen=900, expected=1000)
+        self.assertIs(t.state("green", 3, 0), EVState.ASSUMED_BAD)
+        # Straggler data on the demoted EV shows loss again.
+        t.record_loss_window("green", 3, 0, seen=900, expected=1000)
         _drive_healthy(t, "green", [(3, 0)], ticks=10)
         self.assertIs(t.state("green", 3, 0), EVState.ASSUMED_BAD)
-        # A clean loss window resets the loss counter.
+        # A clean loss window opens the gate; the healthy-window latch
+        # has been climbing, so the next healthy tick promotes.
         t.record_loss_window("green", 3, 0, seen=1000, expected=1000)
-        # Probe path is already clean and consecutive_healthy_windows
-        # has been climbing; one more healthy tick crosses the latch
-        # now that the loss gate is open.
         _drive_healthy(t, "green", [(3, 0)], ticks=1)
+        self.assertIs(t.state("green", 3, 0), EVState.GOOD)
+
+    def test_probe_demoted_ev_with_stale_loss_counter_recovers(self):
+        """A partial loss streak from before a probe-driven demote must
+        not pin the EV in ASSUMED_BAD once probes recover."""
+        cfg = EVStateConfig(
+            probe_window_ticks=2, probe_min_samples=3,
+            probe_fail_ratio=0.5, probe_recover_ratio=0.9,
+            probe_recover_ticks=2,
+            loss_threshold=0.05, loss_demote_consecutive=3,
+        )
+        t = _table(cfg=cfg)
+        _drive_healthy(t, "green", [(0, 0), (1, 0), (2, 0)])
+        # One lossy window (below the demote streak), then probes fail.
+        t.record_loss_window("green", 3, 0, seen=900, expected=1000)
+        _drive_failing(t, "green", 3, 0)
+        self.assertIs(t.state("green", 3, 0), EVState.ASSUMED_BAD)
+        _drive_healthy(t, "green", [(3, 0)])
         self.assertIs(t.state("green", 3, 0), EVState.GOOD)
 
     def test_partial_recv_holds_state(self):
@@ -644,6 +685,84 @@ class TestThreadSafety(unittest.TestCase):
         # still UNKNOWN-usable, so the floor is met and (0,0) demotes.
         t.tick("green")
         self.assertIs(t.state("green", 0, 0), EVState.ASSUMED_BAD)
+
+
+class TestLossDemoteBackoff(unittest.TestCase):
+    """Probes can't vouch for an EV the loss path demoted (e.g. green's
+    last hop, which probes never cross), so each loss demote that
+    follows a recent loss-driven recovery doubles the next recovery
+    hold, up to loss_backoff_max_level."""
+
+    CFG = EVStateConfig(
+        probe_window_ticks=2, probe_min_samples=3,
+        probe_fail_ratio=0.5, probe_recover_ratio=0.9,
+        probe_recover_ticks=2,
+        loss_threshold=0.05, loss_demote_consecutive=1,
+        min_active_evs=1,
+        loss_backoff_max_level=2, loss_backoff_reset_ticks=20,
+    )
+    EVS = [(0, 0), (1, 0), (2, 0), (3, 0)]
+
+    def _fresh(self):
+        t = _table(cfg=self.CFG)
+        _drive_healthy(t, "green", self.EVS)
+        self.assertIs(t.state("green", 3, 0), EVState.GOOD)
+        return t
+
+    @staticmethod
+    def _loss_demote(t):
+        t.record_loss_window("green", 3, 0, seen=0, expected=10)
+        assert t.state("green", 3, 0) is EVState.ASSUMED_BAD
+
+    def _ticks_to_good(self, t, limit=100):
+        for n in range(1, limit + 1):
+            _drive_healthy(t, "green", self.EVS, ticks=1)
+            if t.state("green", 3, 0) is EVState.GOOD:
+                return n
+        self.fail("EV never recovered")
+
+    def test_repeated_loss_demotes_double_the_hold(self):
+        t = self._fresh()
+        holds = []
+        for _ in range(4):
+            self._loss_demote(t)
+            holds.append(self._ticks_to_good(t))
+        # base 2 ticks, then x2 per repeat, capped at level 2 (x4)
+        self.assertEqual(holds, [2, 4, 8, 8])
+        self.assertEqual(
+            t.inspect("green", 3, 0)["loss_backoff_level"], 2)
+
+    def test_quiet_period_resets_backoff(self):
+        t = self._fresh()
+        self._loss_demote(t)
+        self._ticks_to_good(t)
+        self._loss_demote(t)
+        self.assertEqual(self._ticks_to_good(t), 4)
+        _drive_healthy(t, "green", self.EVS, ticks=20)  # reset window
+        self._loss_demote(t)
+        self.assertEqual(self._ticks_to_good(t), 2)
+
+    def test_first_loss_demote_after_cold_start_uses_base_hold(self):
+        # The UNKNOWN -> GOOD promotion is not a loss recovery.
+        t = self._fresh()
+        self._loss_demote(t)
+        self.assertEqual(self._ticks_to_good(t), 2)
+
+    def test_probe_demote_recovers_at_base_despite_backoff(self):
+        # Probes saw this failure, so their recovery is trustworthy.
+        t = self._fresh()
+        for _ in range(3):
+            self._loss_demote(t)
+            self._ticks_to_good(t)
+        _drive_failing(t, "green", 3, 0)
+        self.assertIs(t.state("green", 3, 0), EVState.ASSUMED_BAD)
+        # window flush (window_ticks - 1) + recover_ticks
+        self.assertEqual(self._ticks_to_good(t), 3)
+
+    def test_defaults(self):
+        cfg = EVStateConfig()
+        self.assertEqual(cfg.loss_backoff_max_level, 3)
+        self.assertEqual(cfg.loss_backoff_reset_ticks, 60)
 
 
 if __name__ == "__main__":
