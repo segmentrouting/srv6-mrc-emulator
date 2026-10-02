@@ -240,7 +240,9 @@ def _build_packet_bytes(src_underlay: str, dst_outer: str,
     mrc_payload = encode_payload(seq, plane, path)
     if transport == "rdma":
         from .rdma import wrap_rdma
-        payload = wrap_rdma(mrc_payload, plane=plane, path=path, seq=seq)
+        payload = wrap_rdma(mrc_payload, plane=plane, path=path, seq=seq,
+                            src=src_inner, dst=dst_inner,
+                            sport=SPRAY_PORT, dport=RDMA_PORT)
         dport = RDMA_PORT
     else:
         payload = mrc_payload

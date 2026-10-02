@@ -30,8 +30,15 @@ class TestDqpnForEv(unittest.TestCase):
                 self.assertEqual(topo.ev_from_dqpn(dqpn), (plane, path))
 
     def test_known_shape(self):
-        # plane=2, path=5 -> (2 << 8) | 5 = 0x205
-        self.assertEqual(topo.dqpn_for_ev(2, 5), 0x205)
+        # plane=2, path=5 -> DQPN_BASE | (2 << 8) | 5 = 0x010205
+        self.assertEqual(topo.dqpn_for_ev(2, 5), 0x010205)
+
+    def test_never_a_reserved_qp(self):
+        # QP0 (SMI) and QP1 (GSI) carry InfiniBand management datagrams.
+        for plane in range(topo.NUM_PLANES):
+            for path in range(topo.NUM_SPINES):
+                self.assertNotIn(topo.dqpn_for_ev(plane, path), (0, 1))
+                self.assertLess(topo.dqpn_for_ev(plane, path), 1 << 24)
 
     def test_bad_plane_rejected(self):
         with self.assertRaises(ValueError):
@@ -108,6 +115,40 @@ class TestWrapUnwrapRdma(unittest.TestCase):
         from srv6_mrc.rdma import unwrap_rdma
 
         self.assertIsNone(unwrap_rdma(b""))
+
+
+
+@unittest.skipUnless(_HAVE_SCAPY, "scapy not installed")
+class TestIcrcOnTheWire(unittest.TestCase):
+    """The ICRC a full SRv6 packet carries must be the real RoCEv2 one,
+    computed over the inner IPv6/UDP pseudo-header + BTH + payload."""
+
+    def _wire(self):
+        from srv6_mrc.runner import _build_packet_bytes
+        return _build_packet_bytes(
+            "2001:db8:bbbb:2::2", "fc00:0:f001:e005:d000::",
+            "2001:db8:bbbb:2::2", "2001:db8:bbbb:5::2",
+            seq=41, plane=1, path=2, transport="rdma",
+        )
+
+    def test_icrc_is_nonzero_and_matches_a_recompute(self):
+        import scapy.contrib.roce  # noqa: F401  (binds UDP 4791 -> BTH)
+        from scapy.all import IPv6, raw
+        from scapy.contrib.roce import BTH
+        outer = IPv6(self._wire())
+        inner = outer.payload
+        carried = raw(inner)[-4:]
+        self.assertNotEqual(carried, b"\x00\x00\x00\x00")
+        again = IPv6(raw(inner))
+        again[BTH].icrc = None
+        self.assertEqual(raw(again)[-4:], carried)
+
+    def test_unwrap_still_returns_the_mrc_payload(self):
+        from scapy.all import IPv6, UDP
+        from srv6_mrc.rdma import unwrap_rdma
+        udp = IPv6(self._wire()).payload[UDP]
+        self.assertEqual(parse_payload(unwrap_rdma(bytes(udp.payload))),
+                         (41, 1, 2))
 
 
 if __name__ == "__main__":

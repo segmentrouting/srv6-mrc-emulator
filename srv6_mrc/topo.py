@@ -196,6 +196,13 @@ def _check_transport(v: str) -> None:
 RDMA_PORT = 4791
 
 
+# InfiniBand reserves QP0 (SMI) and QP1 (GSI) for management datagrams,
+# and Wireshark decodes packets to them as MADs. Every per-EV dqpn
+# carries this base so EV (0, 0) / (0, 1) never land on them; it also
+# keeps the hex readable: EV (2, 5) -> 0x010205.
+DQPN_BASE = 0x010000
+
+
 def dqpn_for_ev(plane: int, path: int) -> int:
     """Encode (plane, path) into a 24-bit RoCEv2 destination QP number.
 
@@ -203,10 +210,11 @@ def dqpn_for_ev(plane: int, path: int) -> int:
     deliberately makes dqpn double as EV identity, so a BTH-aware
     reader can recover which EV a packet belongs to without decoding
     SRv6 outer state. `path` is the spine index (== MRC path_id).
+    The `DQPN_BASE` prefix keeps clear of the reserved QP0/QP1.
     """
     _check_plane(plane)
     _check_spine(path)
-    return (plane << 8) | path
+    return DQPN_BASE | (plane << 8) | path
 
 
 def ev_from_dqpn(dqpn: int) -> tuple[int, int]:

@@ -23,15 +23,14 @@ fit for MRC-sprayed traffic — no ACK/NAK is expected per packet
 opcode family is SEND, so no RETH (remote addr/rkey/length, needed for
 RC/UC WRITE/READ) is required.
 
-Known simplification: the BTH `icrc` trailer is computed by scapy over
-just the BTH+payload bytes built here, with no UDP/IPv6 underlayer
-visible yet (that gets added later by `encap.build_outer_packet`). Real
-RoCEv2 ICRC also covers a pseudo-header derived from the UDP/IPv6
-wrapper, so ours will not match what a real RDMA NIC would compute.
-Nothing in this emulator validates ICRC (no real RDMA hardware is
-present), so this is cosmetic — flagged here rather than engineered
-away, since fixing it would mean threading addresses/ports through
-this module for zero functional benefit.
+ICRC: real RoCEv2 ICRC covers a pseudo-header of the packet's own
+IPv6 + UDP headers (variable fields masked) plus BTH and payload. When
+the caller passes the inner IPv6/UDP fields (`src`, `dst`, `sport`,
+`dport`), the BTH is built inside that IPv6/UDP packet so scapy computes
+the real ICRC, and the bytes after the UDP header are returned. Those
+are the same inner IPv6/UDP headers `encap.build_outer_packet` puts in
+front of them, so the ICRC on the wire is valid. Without those
+arguments scapy cannot see the IP layer and writes an ICRC of 0.
 
 Known simplification (confirmed via Wireshark, 2026-09-30): we don't
 build a DETH (Datagram Extended Transport Header), which the real
@@ -61,7 +60,10 @@ from .topo import dqpn_for_ev
 RDMA_OPCODE = 0x64  # UD_SEND_ONLY
 
 
-def wrap_rdma(payload: bytes, *, plane: int, path: int, seq: int) -> bytes:
+def wrap_rdma(payload: bytes, *, plane: int, path: int, seq: int,
+              src: Optional[str] = None, dst: Optional[str] = None,
+              sport: Optional[int] = None,
+              dport: Optional[int] = None) -> bytes:
     """Wrap `payload` (runner.encode_payload's bytes) in a RoCEv2 BTH frame.
 
     `seq` becomes the BTH PSN, truncated to its 24-bit field (real PSNs
@@ -69,6 +71,9 @@ def wrap_rdma(payload: bytes, *, plane: int, path: int, seq: int) -> bytes:
     `dqpn` via `topo.dqpn_for_ev`. Returned bytes are ready to pass as
     the `payload=` argument to `encap.build_outer_packet(..., dport=
     topo.RDMA_PORT, ...)`.
+
+    Pass the inner IPv6 `src`/`dst` and UDP `sport`/`dport` that
+    `build_outer_packet` will use to get a valid ICRC (see module doc).
     """
     import logging as _logging
     _logging.getLogger("scapy.runtime").setLevel(_logging.ERROR)
@@ -80,7 +85,16 @@ def wrap_rdma(payload: bytes, *, plane: int, path: int, seq: int) -> bytes:
         dqpn=dqpn_for_ev(plane, path),
         psn=seq & 0xFFFFFF,
     )
-    return bytes(bth / Raw(payload))
+    if None in (src, dst, sport, dport):
+        return bytes(bth / Raw(payload))
+    from scapy.layers.inet import UDP  # type: ignore
+    from scapy.layers.inet6 import IPv6  # type: ignore
+    framed = bytes(IPv6(src=src, dst=dst) / UDP(sport=sport, dport=dport)
+                   / bth / Raw(payload))
+    return framed[_IPV6_UDP_LEN:]
+
+
+_IPV6_UDP_LEN = 40 + 8
 
 
 def unwrap_rdma(raw: bytes) -> Optional[bytes]:
