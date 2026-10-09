@@ -88,6 +88,12 @@ class FlowRow:
     # srv6_mrc.cli.spray._loss_fusion_stats_to_dict for the producer.
     mrc: dict[str, Any] | None = None
 
+    # Opt-in trimming — None unless the run had a `trim:` block. Sender
+    # side: trimmed/dropped by the oracle, NACKs, retransmits. Receiver
+    # side: trimmed arrivals, recovered and unrecovered seqs.
+    trim_sender: dict[str, Any] | None = None
+    trim_receiver: dict[str, Any] | None = None
+
     def loss_pct(self) -> float | None:
         if self.sent <= 0 or self.received is None:
             return None
@@ -309,6 +315,7 @@ class ScenarioReport:
                 per_ev_sent=dict(s.get("per_ev_sent", {})),
                 send_errors=s.get("errors", 0),
                 mrc=s.get("mrc"),
+                trim_sender=s.get("trim"),
             )
 
             recv = recv_by_host.get(row.dst_host)
@@ -371,6 +378,7 @@ class ScenarioReport:
             row.per_plane_recv = {int(k): v
                                   for k, v in matched.get(
                                       "per_plane_recv", {}).items()}
+            row.trim_receiver = matched.get("trim")
             # per-NIC rx is aggregate-across-flows on the receiver side, so
             # only attach it once per (host) to the first matched flow.
             if recv.get("_per_nic_attached") is not True:
@@ -514,6 +522,26 @@ class ScenarioReport:
                 lines.append(
                     f"    plane {p}:  {plane_sent.get(p, 0):>6}"
                     f" / {plane_rx.get(p, 0):>6}"
+                )
+
+        trim_rows = [f for f in self.flows
+                     if f.trim_sender is not None or f.trim_receiver is not None]
+        if trim_rows:
+            lines.append("")
+            lines.append("  trimming (sender: oracle / NACKs / retransmits;"
+                         " receiver: trimmed / recovered / unrecovered):")
+            for f in trim_rows:
+                ts = f.trim_sender or {}
+                tr = f.trim_receiver or {}
+                lines.append(
+                    f"    {f.src_host} -> {f.dst_host}:"
+                    f"  trimmed {ts.get('trimmed', 0)}"
+                    f"  dropped {ts.get('dropped', 0)}"
+                    f"  nacks {ts.get('nacks_received', 0)}"
+                    f"  retx {ts.get('retransmits', 0)}"
+                    f"  |  rx trimmed {tr.get('trimmed', 0)}"
+                    f"  recovered {tr.get('recovered', 0)}"
+                    f"  unrecovered {tr.get('unrecovered', 0)}"
                 )
 
         if self.warnings:

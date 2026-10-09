@@ -64,6 +64,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from ..topo import (
     NUM_PLANES,
     NUM_SPINES,
+    nack_port,
     tenant_id as topo_tenant_id,
 )
 from .ev_state import EVStateConfig, EVStateTable
@@ -75,9 +76,11 @@ from .loss_compute import (
 )
 from .loss_window import LossWindowTable
 from .probe import (
+    Nack,
     ProbeDecodeError,
     decode_loss_report,
     encode_loss_report,
+    encode_nack,
     encode_probe,
 )
 from .transport import (
@@ -556,6 +559,10 @@ class ReceiverMrcAgent:
         # is alive between me and that sender" is the data-arrival EV.
         self._senders: Dict[Tuple[int, int], _SenderAddr] = {}
         self._senders_lock = threading.Lock()
+        # Opt-in trimming counters (stay 0 unless trims arrive).
+        self.trimmed_seen = 0
+        self.nacks_sent = 0
+        self.nack_send_errors = 0
 
         if transport is None:
             transport = Srv6RawTransport(
@@ -604,6 +611,40 @@ class ReceiverMrcAgent:
                         last_path=path,
                     )
 
+    def record_trimmed(self, flow_key, plane: int, path: int,
+                       seq: int) -> None:
+        """Hook for a trimmed (header-only) data arrival: count it for
+        the loss report and NACK it at once so the sender retransmits.
+
+        The NACK rides the same reverse EV as loss reports (the last EV
+        that delivered full data from that sender), falling back to the
+        trimmed packet's own EV before any full packet has arrived.
+        """
+        self.loss_table.record_trimmed(flow_key, plane=plane, path=path)
+        self.trimmed_seen += 1
+        if not (isinstance(flow_key, tuple) and len(flow_key) >= 2):
+            return
+        tid, src_id = flow_key[0], flow_key[1]
+        with self._senders_lock:
+            sender = self._senders.get((tid, src_id))
+        rev_plane, rev_path = (
+            (sender.last_plane, sender.last_path) if sender is not None
+            else (plane, path)
+        )
+        payload = encode_nack(Nack(
+            plane_id=plane, path_id=path, tenant_id=tid,
+            src_id=src_id, dst_id=self.my_id, seq=seq,
+        ))
+        try:
+            self.transport.send_nack(
+                plane=rev_plane, path=rev_path, dst_leaf=src_id,
+                dport=nack_port(self.my_id), payload=payload,
+            )
+            self.nacks_sent += 1
+        except OSError as e:
+            self.nack_send_errors += 1
+            log.debug("mrc.recv: nack send failed: %s", e)
+
     def known_senders(self) -> Tuple[Tuple[int, int], ...]:
         """Test/diagnostic accessor for the sender cache."""
         with self._senders_lock:
@@ -615,8 +656,15 @@ class ReceiverMrcAgent:
         The receiver-side probe-RX instrumentation is gone with the
         stateless-probe design; this method is retained so callers
         relying on its presence (the CLI's JSON output) keep working.
+        Carries trimming counters only once a trim has arrived.
         """
-        return {}
+        if not self.trimmed_seen:
+            return {}
+        return {"trim": {
+            "trimmed_seen": self.trimmed_seen,
+            "nacks_sent": self.nacks_sent,
+            "nack_send_errors": self.nack_send_errors,
+        }}
 
     # --- thread bodies -------------------------------------------------
 

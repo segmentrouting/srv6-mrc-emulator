@@ -22,12 +22,21 @@ Validates the full scenario shape laid out in mrc/README.md:
       loss_threshold: <float 0..1>
       loss_demote_consecutive: <int>
       min_active_evs: <int>
+      loss_backoff_max_level: <int >= 0>   # 0 disables the backoff
+      loss_backoff_reset_ticks: <int>
     faults:                          # optional
       - kind: netem
         target: <target-string>
         spec: <netem-spec-string>
     report:                          # optional
       out: <path>
+    trim:                            # optional; opt-in trimming oracle
+      rate: <float 0..1>             # share of matching packets hit
+      mode: trim|drop                # trim (default) or plain drop
+      planes: [<int>, ...]           # optional; match whole planes
+      evs: [[<plane>, <path>], ...]  # optional; match single EVs
+      seed: <int>                    # optional; default 0
+      max_retransmits: <int>         # optional; default 3
     sid: uA|uN                       # optional; default uA (see below)
     transport: udp|rdma              # optional; default udp (see below)
 
@@ -129,6 +138,8 @@ class MrcSpec:
     loss_threshold: float | None = None
     loss_demote_consecutive: int | None = None
     min_active_evs: int | None = None
+    loss_backoff_max_level: int | None = None
+    loss_backoff_reset_ticks: int | None = None
 
     def to_env_json(self) -> str:
         """Encode for the SRV6_MRC_CONFIG_JSON env var consumed by
@@ -177,6 +188,9 @@ class Scenario:
     # --sid does). Orthogonal to sid — receivers auto-detect either
     # framing, so this only affects sender-side flows.
     transport: str | None = None
+    # Opt-in trimming oracle (srv6_mrc.trim.TrimSpec); None = off. Needs
+    # `mrc:` so receivers run the agent that NACKs trimmed packets.
+    trim: Any = None
 
 
 # --- named pair sets --------------------------------------------------------
@@ -287,7 +301,8 @@ def validate(doc: Any) -> Scenario:
 
     _require_keys(doc, "$", required={"name", "flows"},
                   optional={"description", "faults", "report", "mrc",
-                            "paths_per_plane", "sid", "transport"})
+                            "paths_per_plane", "sid", "transport",
+                            "trim"})
 
     name = _require_str(doc, "$.name")
     description = _opt_str(doc, "$.description", default="")
@@ -314,6 +329,12 @@ def validate(doc: Any) -> Scenario:
     sid = _validate_sid_mode(doc.get("sid"), "$.sid")
     transport = _validate_transport(doc.get("transport"), "$.transport")
 
+    trim = _validate_trim(doc["trim"], "$.trim") if "trim" in doc else None
+    if trim is not None and mrc is None:
+        raise ScenarioError(
+            "$.trim", "needs an `mrc:` block (receivers NACK via the MRC agent)"
+        )
+
     return Scenario(
         name=name,
         description=description,
@@ -324,6 +345,51 @@ def validate(doc: Any) -> Scenario:
         paths_per_plane=paths_per_plane,
         sid=sid,
         transport=transport,
+        trim=trim,
+    )
+
+
+def _validate_trim(value: Any, path: str):
+    """Validate the optional `trim:` block into a TrimSpec."""
+    from ..trim import TRIM_MODES, TrimSpec
+    if not isinstance(value, dict):
+        raise ScenarioError(path, "must be a mapping")
+    _require_keys(value, path, required={"rate"},
+                  optional={"mode", "planes", "evs", "seed",
+                            "max_retransmits"})
+    rate = value["rate"]
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)) \
+            or not 0.0 <= float(rate) <= 1.0:
+        raise ScenarioError(f"{path}.rate", f"must be in [0.0, 1.0], got {rate!r}")
+    mode = value.get("mode", "trim")
+    if mode not in TRIM_MODES:
+        raise ScenarioError(f"{path}.mode", f"must be one of {TRIM_MODES}")
+
+    def ints(v, where):
+        if not isinstance(v, list) or not all(
+                isinstance(x, int) and not isinstance(x, bool) and x >= 0
+                for x in v):
+            raise ScenarioError(where, "must be a list of non-negative ints")
+        return tuple(v)
+
+    planes = ints(value.get("planes", []), f"{path}.planes")
+    evs_raw = value.get("evs", [])
+    if not isinstance(evs_raw, list):
+        raise ScenarioError(f"{path}.evs", "must be a list of [plane, path]")
+    evs = []
+    for i, ev in enumerate(evs_raw):
+        pair = ints(ev, f"{path}.evs[{i}]")
+        if len(pair) != 2:
+            raise ScenarioError(f"{path}.evs[{i}]", "must be [plane, path]")
+        evs.append(pair)
+    for key in ("seed", "max_retransmits"):
+        v = value.get(key, 0 if key == "seed" else 3)
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            raise ScenarioError(f"{path}.{key}", "must be a non-negative int")
+    return TrimSpec(
+        rate=float(rate), mode=mode, planes=planes, evs=tuple(evs),
+        seed=value.get("seed", 0),
+        max_retransmits=value.get("max_retransmits", 3),
     )
 
 
@@ -507,9 +573,9 @@ _MRC_POSITIVE_INT_FIELDS = (
     "probe_interval_ms", "probe_timeout_ms", "loss_window_ms",
     "max_window_skew_ms", "probe_window_ticks", "probe_min_samples",
     "probe_recover_ticks", "loss_demote_consecutive",
-    "min_active_evs",
+    "min_active_evs", "loss_backoff_reset_ticks",
 )
-_MRC_NON_NEGATIVE_INT_FIELDS: tuple = ()
+_MRC_NON_NEGATIVE_INT_FIELDS = ("loss_backoff_max_level",)
 _MRC_RATIO_FIELDS = (
     "probe_fail_ratio", "probe_recover_ratio", "loss_threshold",
 )

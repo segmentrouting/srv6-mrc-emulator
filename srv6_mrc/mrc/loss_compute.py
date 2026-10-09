@@ -46,6 +46,9 @@ attributed using receiver's seq-span estimate".
 
 Invariants
 ----------
+- Trimmed arrivals (opt-in trimming, LOSS_REPORT v3) count as delivered
+  for EV health: loss = 1 - (seen + trimmed) / sent. A trim is congestion,
+  recovered by NACK + retransmit; only untrimmed loss demotes an EV.
 - A `seen > expected` report for a plane is treated as 0% loss (clamped),
   not negative loss. This can legitimately happen when packets sent in
   the prior window arrive in this one (i.e., the receiver is using a
@@ -272,7 +275,7 @@ def apply_loss_report(
         stats.no_pairing_window_in_ring += 1
 
     for rec in report.planes:
-        if rec.seen == 0 and rec.expected == 0:
+        if rec.seen == 0 and rec.expected == 0 and rec.trimmed == 0:
             stats.planes_skipped_no_data += 1
             continue
 
@@ -318,8 +321,11 @@ def apply_loss_report(
         # identified by (plane, path); the loss record carries both
         # since PROBE/LOSS_REPORT v2 wire formats added the path
         # dimension.
+        # A trimmed packet arrived (header only): congestion, not path
+        # loss, so it counts toward delivery for EV health.
         table.record_loss_window(
-            tenant, rec.plane_id, rec.path_id, rec.seen, denominator,
+            tenant, rec.plane_id, rec.path_id, rec.seen + rec.trimmed,
+            denominator,
         )
         stats.planes_updated += 1
         stats.paired_with_sent_window += 1
@@ -327,7 +333,7 @@ def apply_loss_report(
     if paired is None:
         return
     total_sent = sum(sum(row) for row in paired.sent)
-    total_seen = sum(rec.seen for rec in report.planes)
+    total_seen = sum(rec.seen + rec.trimmed for rec in report.planes)
     if total_sent == 0 or total_seen < MIN_COVERAGE_FOR_ABSENT_LOSS * total_sent:
         stats.absent_check_skipped_low_coverage += 1
         return

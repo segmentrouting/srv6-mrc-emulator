@@ -1,0 +1,36 @@
+# green-mrc-congestion-drop.yaml — opt-in trimming A/B (2p-4x8).
+#
+# Every flow's sender plays a congested switch on plane 1: 30% of the
+# packets it sprays onto plane-1 EVs are hit. This file delivers the hit
+# as plain drops, i.e. congestion on a network without trimming.
+# Expected: the loss path reads ~30% loss on plane 1 and demotes it as
+# if it had failed, the gap trimming closes.
+#
+# Companion: green-mrc-congestion-trim.yaml, identical except for mode.
+#
+# Run:
+#   make TOPO=2p-4x8 SCEN=green-mrc-congestion-drop scenario
+
+name: green-mrc-congestion-drop
+description: |
+  30% of plane-1 packets hit by a sender-side congestion oracle, delivered
+  as plain drops (no trimming). 4 green pairs, health_aware_mrc.
+
+flows:
+  - pairs: green-pairs-4
+    policy: health_aware_mrc
+    rate: 100pps
+    duration: 30s
+
+faults: []
+
+mrc: {}
+
+trim:
+  rate: 0.3
+  planes: [1]
+  mode: drop
+  seed: 7
+
+report:
+  out: results/green-mrc-congestion-drop.json

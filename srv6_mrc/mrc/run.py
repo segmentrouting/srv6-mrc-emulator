@@ -276,7 +276,8 @@ def _recv_argv(idle_timeout_s: float, *, mrc: bool) -> list[str]:
 def _scenario_env(mrc: MrcSpec | None,
                   paths_per_plane: int | None,
                   sid_mode: str | None = None,
-                  transport: str | None = None) -> dict[str, str] | None:
+                  transport: str | None = None,
+                  trim=None) -> dict[str, str] | None:
     """Build the env dict passed to docker exec for a scenario run.
 
     Bundles MRC tunables (SRV6_MRC_CONFIG_JSON), the EV-spray fan-out
@@ -303,6 +304,9 @@ def _scenario_env(mrc: MrcSpec | None,
         env["SRV6_SID_MODE"] = sid_mode
     if transport is not None:
         env["SRV6_TRANSPORT"] = transport
+    if trim is not None:
+        # Opt-in trimming oracle; only data senders act on it.
+        env["SRV6_TRIM_JSON"] = trim.to_env_json()
     # Passthrough diagnostic flags from the orchestrator's env into the
     # sender/receiver containers. Used today only for transition
     # logging; opt-in (only forwarded when set on the host).
@@ -418,7 +422,8 @@ def run_flows(flows: list[FlowRun], *,
               paths_per_plane: int | None = None,
               sid_mode: str | None = None,
               transport: str | None = None,
-              verbose: bool = False) -> tuple[list[dict], list[dict], list[dict]]:
+              verbose: bool = False,
+              trim=None) -> tuple[list[dict], list[dict], list[dict]]:
     """Run all flows concurrently. Returns (sender_records, receiver_records,
     daemon_records).
 
@@ -459,7 +464,8 @@ def run_flows(flows: list[FlowRun], *,
     max_dur = max((f.duration_s for f in flows), default=0.0)
     recv_max_wait = max_dur + idle_timeout_s + 30.0
 
-    env = _scenario_env(mrc, paths_per_plane, sid_mode, transport)
+    env = _scenario_env(mrc, paths_per_plane, sid_mode, transport,
+                        trim=trim)
     mrc_enabled = mrc is not None
 
     if verbose:
@@ -868,6 +874,8 @@ def run_scenario(scenario: Scenario, *,
     if verbose:
         if scenario.mrc is not None:
             print(f"  mrc: enabled (env={scenario.mrc.to_env_json()})")
+        if scenario.trim is not None:
+            print(f"  trim: {scenario.trim.to_env_json()}")
         print(f"  sid: {scenario.sid or 'uA'}")
         print(f"  transport: {scenario.transport or 'udp'}")
         _print_ev_preview(flows, scenario.paths_per_plane, scenario.sid)
@@ -883,6 +891,7 @@ def run_scenario(scenario: Scenario, *,
             paths_per_plane=scenario.paths_per_plane,
             sid_mode=scenario.sid,
             transport=scenario.transport,
+            trim=scenario.trim,
             verbose=verbose,
         )
     finally:

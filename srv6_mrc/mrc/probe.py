@@ -66,9 +66,15 @@ from dataclasses import dataclass
 
 PROBE_VERSION = 4
 LOSS_REPORT_VERSION = 2
+# v3 = v2 layout with the per-record reserved u16 carrying `trimmed`.
+# Emitted only for a window that saw trimmed packets, so runs without
+# trimming stay byte-for-byte v2.
+LOSS_REPORT_VERSION_TRIMMED = 3
+NACK_VERSION = 1
 
 _MAGIC_PROBE = 0xA5
 _MAGIC_LOSS_REPORT = 0xA7
+_MAGIC_NACK = 0xA9
 
 
 # struct format strings (network byte order)
@@ -88,6 +94,12 @@ _LOSS_HDR_SIZE = struct.calcsize(_LOSS_HDR_FMT)  # 8 bytes
 # per-EV record (v2): plane_id, path_id, _rsv16, seen, expected, max_gap
 _LOSS_REC_FMT = "!BBHIII"
 _LOSS_REC_SIZE = struct.calcsize(_LOSS_REC_FMT)  # 16 bytes
+
+# NACK v1 (receiver -> data sender, one per trimmed packet): magic,
+# version, plane_id, path_id (the EV the trimmed packet arrived on),
+# tenant_id, src_id (the data sender), dst_id (the NACKing receiver), seq
+_NACK_FMT = "!BBBBHHHQ"
+_NACK_SIZE = struct.calcsize(_NACK_FMT)  # 18 bytes
 
 
 # --- exceptions ------------------------------------------------------------
@@ -136,6 +148,8 @@ class PlaneLossRecord:
     seen: int
     expected: int
     max_gap: int
+    # Header-only (trimmed) arrivals this window. Not counted in `seen`.
+    trimmed: int = 0
 
     def __post_init__(self) -> None:
         _check_u8(self.plane_id, "plane_id")
@@ -143,6 +157,28 @@ class PlaneLossRecord:
         _check_u32(self.seen, "seen")
         _check_u32(self.expected, "expected")
         _check_u32(self.max_gap, "max_gap")
+        _check_u32(self.trimmed, "trimmed")
+
+
+@dataclass(frozen=True)
+class Nack:
+    """A decoded NACK: the receiver saw `seq` arrive trimmed on EV
+    (plane_id, path_id) and asks the data sender to retransmit it."""
+    plane_id: int
+    path_id: int
+    tenant_id: int
+    src_id: int
+    dst_id: int
+    seq: int
+
+    def __post_init__(self) -> None:
+        _check_u8(self.plane_id, "plane_id")
+        _check_u8(self.path_id, "path_id")
+        _check_u16(self.tenant_id, "tenant_id")
+        _check_u16(self.src_id, "src_id")
+        _check_u16(self.dst_id, "dst_id")
+        if not isinstance(self.seq, int) or not 0 <= self.seq <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(f"seq must be uint64, got {self.seq!r}")
 
 
 @dataclass(frozen=True)
@@ -204,10 +240,12 @@ def encode_loss_report(
     _check_u16(window_id, "window_id")
     if len(planes) > 0xFFFF:
         raise ValueError(f"too many records: {len(planes)} > 65535")
+    trims = any(getattr(rec, "trimmed", 0) for rec in planes)
+    version = LOSS_REPORT_VERSION_TRIMMED if trims else LOSS_REPORT_VERSION
     out = bytearray(
         struct.pack(
             _LOSS_HDR_FMT,
-            _MAGIC_LOSS_REPORT, LOSS_REPORT_VERSION,
+            _MAGIC_LOSS_REPORT, version,
             window_id, len(planes), 0,
         )
     )
@@ -218,10 +256,20 @@ def encode_loss_report(
             )
         out += struct.pack(
             _LOSS_REC_FMT,
-            rec.plane_id, rec.path_id, 0,
+            rec.plane_id, rec.path_id,
+            min(rec.trimmed, 0xFFFF) if trims else 0,
             rec.seen, rec.expected, rec.max_gap,
         )
     return bytes(out)
+
+
+def encode_nack(nack: Nack) -> bytes:
+    """Build the UDP-payload bytes for a NACK packet."""
+    return struct.pack(
+        _NACK_FMT, _MAGIC_NACK, NACK_VERSION,
+        nack.plane_id, nack.path_id,
+        nack.tenant_id, nack.src_id, nack.dst_id, nack.seq,
+    )
 
 
 # --- decoders --------------------------------------------------------------
@@ -262,7 +310,7 @@ def decode_loss_report(payload: bytes) -> LossReport:
             f"expected LOSS_REPORT magic 0x{_MAGIC_LOSS_REPORT:02x}, "
             f"got 0x{magic:02x}"
         )
-    if version != LOSS_REPORT_VERSION:
+    if version not in (LOSS_REPORT_VERSION, LOSS_REPORT_VERSION_TRIMMED):
         raise ProbeDecodeError(
             f"unsupported loss-report protocol version {version}"
         )
@@ -275,15 +323,37 @@ def decode_loss_report(payload: bytes) -> LossReport:
     planes: list[PlaneLossRecord] = []
     off = _LOSS_HDR_SIZE
     for _ in range(num_records):
-        plane_id, path_id, _r16, seen, expected, max_gap = struct.unpack(
+        plane_id, path_id, r16, seen, expected, max_gap = struct.unpack(
             _LOSS_REC_FMT, payload[off:off + _LOSS_REC_SIZE],
         )
         planes.append(PlaneLossRecord(
             plane_id=plane_id, path_id=path_id,
             seen=seen, expected=expected, max_gap=max_gap,
+            trimmed=r16 if version == LOSS_REPORT_VERSION_TRIMMED else 0,
         ))
         off += _LOSS_REC_SIZE
     return LossReport(window_id=window_id, planes=tuple(planes))
+
+
+def decode_nack(payload: bytes) -> Nack:
+    if len(payload) < _NACK_SIZE:
+        raise ProbeDecodeError(
+            f"nack payload too short: {len(payload)} < {_NACK_SIZE}"
+        )
+    (magic, version, plane_id, path_id,
+     tenant_id, src_id, dst_id, seq) = struct.unpack(
+         _NACK_FMT, payload[:_NACK_SIZE],
+     )
+    if magic != _MAGIC_NACK:
+        raise ProbeDecodeError(
+            f"expected NACK magic 0x{_MAGIC_NACK:02x}, got 0x{magic:02x}"
+        )
+    if version != NACK_VERSION:
+        raise ProbeDecodeError(f"unsupported NACK protocol version {version}")
+    return Nack(
+        plane_id=plane_id, path_id=path_id, tenant_id=tenant_id,
+        src_id=src_id, dst_id=dst_id, seq=seq,
+    )
 
 
 # --- range checks ----------------------------------------------------------
@@ -306,10 +376,11 @@ def _check_u32(v: int, name: str) -> None:
 # --- module-level constants for consumers ----------------------------------
 
 __all__ = [
-    "PROBE_VERSION", "LOSS_REPORT_VERSION",
+    "PROBE_VERSION", "LOSS_REPORT_VERSION", "LOSS_REPORT_VERSION_TRIMMED",
+    "NACK_VERSION",
     "PROBE_PAYLOAD_LEN",
-    "Probe", "PlaneLossRecord", "LossReport",
-    "encode_probe", "encode_loss_report",
-    "decode_probe", "decode_loss_report",
+    "Probe", "PlaneLossRecord", "LossReport", "Nack",
+    "encode_probe", "encode_loss_report", "encode_nack",
+    "decode_probe", "decode_loss_report", "decode_nack",
     "ProbeDecodeError",
 ]

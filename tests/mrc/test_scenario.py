@@ -296,6 +296,8 @@ class TestMrc(unittest.TestCase):
             "loss_threshold": 0.02,
             "loss_demote_consecutive": 3,
             "min_active_evs": 1,
+            "loss_backoff_max_level": 0,
+            "loss_backoff_reset_ticks": 30,
         }}
         s = scenario.validate(doc)
         self.assertEqual(s.mrc.probe_interval_ms, 50)
@@ -315,7 +317,7 @@ class TestMrc(unittest.TestCase):
         # every host process at startup.
         from srv6_mrc.mrc.agent import load_configs_from_env
         values = {"probe_fail_ratio": 0.4, "probe_recover_ratio": 0.8,
-                  "loss_threshold": 0.02}
+                  "loss_threshold": 0.02, "loss_backoff_max_level": 0}
         kwargs = {f.name: values.get(f.name, 7)
                   for f in dataclasses.fields(scenario.MrcSpec)}
         agent_cfg, ev_cfg = load_configs_from_env(

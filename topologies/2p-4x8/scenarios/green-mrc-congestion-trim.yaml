@@ -1,0 +1,36 @@
+# green-mrc-congestion-trim.yaml — opt-in trimming A/B (2p-4x8).
+#
+# Every flow's sender plays a congested switch on plane 1: 30% of the
+# packets it sprays onto plane-1 EVs are hit. This file delivers the hit
+# as trims: header-only packets that the receiver NACKs and
+# the sender retransmits on a different EV. Expected: plane-1 EVs stay
+# GOOD (trims never count as path loss) and every trim is recovered.
+#
+# Companion: green-mrc-congestion-drop.yaml, identical except for mode.
+#
+# Run:
+#   make TOPO=2p-4x8 SCEN=green-mrc-congestion-trim scenario
+
+name: green-mrc-congestion-trim
+description: |
+  30% of plane-1 packets hit by a sender-side congestion oracle, delivered
+  as trims (NACK + fast retransmit). 4 green pairs, health_aware_mrc.
+
+flows:
+  - pairs: green-pairs-4
+    policy: health_aware_mrc
+    rate: 100pps
+    duration: 30s
+
+faults: []
+
+mrc: {}
+
+trim:
+  rate: 0.3
+  planes: [1]
+  mode: trim
+  seed: 7
+
+report:
+  out: results/green-mrc-congestion-trim.json
