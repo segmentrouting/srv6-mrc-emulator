@@ -496,6 +496,69 @@ def run_sender(flow: FlowEndpoint,
 
 # --- recv -------------------------------------------------------------------
 
+
+_ETH_VLAN_TAGS = (0x8100, 0x88A8)
+_ETH_IPV6 = 0x86DD
+_BTH_LEN = 12
+_ICRC_LEN = 4
+
+
+def _parse_frame(frame: bytes):
+    """Fixed-offset parse of a captured Ethernet frame.
+
+    Returns (inner_src, inner_dst, sport, dport, udp_payload) for an
+    IPv6/UDP packet, peeling one IPv6-in-IPv6 (SRv6 encap.red) layer if
+    present, else None. Mirrors what run_receiver used to read from a
+    scapy dissection (tests/test_runner_rxpath.py pins the equivalence)
+    at ~0.3 us instead of ~70 us per packet: the IPv6 payload length
+    bounds the packet, so Ethernet padding is ignored, and addresses come
+    out RFC 5952-compressed as scapy prints them. No IPv6 extension
+    headers are expected (the SID list lives in the DA, no SRH).
+    """
+    if len(frame) < 14:
+        return None
+    off = 12
+    etype = int.from_bytes(frame[off:off + 2], "big")
+    while etype in _ETH_VLAN_TAGS and len(frame) >= off + 6:
+        off += 4
+        etype = int.from_bytes(frame[off:off + 2], "big")
+    ip = off + 2
+    if etype != _ETH_IPV6 or len(frame) < ip + 40 or frame[ip] >> 4 != 6:
+        return None
+    end = min(len(frame), ip + 40 + int.from_bytes(frame[ip + 4:ip + 6], "big"))
+    nh = frame[ip + 6]
+    if nh == 41:  # SRv6 encap: the inner IPv6 carries the UDP
+        ip += 40
+        if end < ip + 40 or frame[ip] >> 4 != 6:
+            return None
+        end = min(end, ip + 40 + int.from_bytes(frame[ip + 4:ip + 6], "big"))
+        nh = frame[ip + 6]
+    if nh != 17:
+        return None
+    udp = ip + 40
+    if end < udp + 8:
+        return None
+    sport, dport = struct.unpack_from("!HH", frame, udp)
+    return (socket.inet_ntop(socket.AF_INET6, frame[ip + 8:ip + 24]),
+            socket.inet_ntop(socket.AF_INET6, frame[ip + 24:ip + 40]),
+            sport, dport, frame[udp + 8:end])
+
+
+def _unwrap_bth(udp_payload: bytes) -> Optional[bytes]:
+    """RoCEv2 framing: the MRC payload sits between the 12-byte BTH and
+    the 4-byte ICRC trailer (same bytes rdma.unwrap_rdma returns)."""
+    if len(udp_payload) <= _BTH_LEN + _ICRC_LEN:
+        return None
+    return udp_payload[_BTH_LEN:-_ICRC_LEN]
+
+
+def _open_capture(nic: str, bpf: str):
+    """A PF_PACKET listen socket on `nic` with the BPF filter applied;
+    `recv_raw()` hands back undissected frames. Tests patch this."""
+    from scapy.all import conf  # type: ignore
+    return conf.L2listen(iface=nic, filter=bpf)
+
+
 def run_receiver(self_host: str,
                  self_id: int,
                  tenant: str,
@@ -538,7 +601,7 @@ def run_receiver(self_host: str,
     """
     # Lazy scapy import — keeps orchestrator (no scapy) able to import this.
     logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
-    from scapy.all import IPv6, UDP, AsyncSniffer  # type: ignore
+    import select
 
     tracker = ReorderTracker()
     per_nic: Counter[str] = Counter()
@@ -556,26 +619,13 @@ def run_receiver(self_host: str,
     # IPv6 strings while inner_addr() returns the zero-padded form.
     self_inner_canon = _canon_inner(inner_addr(tenant, self_id))
 
-    def handle(pkt) -> None:
-        if IPv6 not in pkt:
+    def handle(nic: str, frame: bytes) -> None:
+        # Peels SRv6 encap if present (yellow case; green is already
+        # decapped); see _parse_frame.
+        parsed_frame = _parse_frame(frame)
+        if parsed_frame is None:
             return
-        nic = getattr(pkt, "sniffed_on", None) or "?"
-        outer = pkt[IPv6]
-
-        # Peel SRv6 encap if present (yellow case; green is already decapped).
-        if outer.nh == 41:
-            inner = outer.payload
-            if not isinstance(inner, IPv6) or UDP not in inner:
-                return
-            udp = inner[UDP]
-            inner_src = inner.src
-            inner_dst = inner.dst
-        else:
-            if UDP not in pkt:
-                return
-            udp = pkt[UDP]
-            inner_src = outer.src
-            inner_dst = outer.dst
+        inner_src, inner_dst, sport, dport, udp_payload = parsed_frame
 
         # Auto-detect framing by dport: plain UDP data spray (SPRAY_PORT)
         # carries the accounting struct bare; RDMA-transport spray
@@ -583,11 +633,10 @@ def run_receiver(self_host: str,
         # `srv6_mrc.rdma`). No transport flag needed on the receiver —
         # it demuxes whichever framing arrives, so a single receiver
         # process handles both without configuration.
-        if udp.dport == SPRAY_PORT:
-            raw_payload = bytes(udp.payload)
-        elif udp.dport == RDMA_PORT:
-            from .rdma import unwrap_rdma
-            unwrapped = unwrap_rdma(bytes(udp.payload))
+        if dport == SPRAY_PORT:
+            raw_payload = udp_payload
+        elif dport == RDMA_PORT:
+            unwrapped = _unwrap_bth(udp_payload)
             if unwrapped is None:
                 return
             raw_payload = unwrapped
@@ -612,8 +661,8 @@ def run_receiver(self_host: str,
         flow = FlowKey(
             src_addr=inner_src,
             dst_addr=inner_dst,
-            src_port=int(udp.sport),
-            dst_port=int(udp.dport),
+            src_port=sport,
+            dst_port=dport,
         )
         if len(raw) == _PAYLOAD_HDR_LEN:
             # Trimmed in flight: header only, nothing to deliver.
@@ -646,12 +695,34 @@ def run_receiver(self_host: str,
                 )
 
     bpf = f"ip6 proto 41 or udp port {SPRAY_PORT} or udp port {RDMA_PORT}"
-    sniffers = []
+    stop_capture = threading.Event()
+
+    def capture(nic: str, sock) -> None:
+        log = logging.getLogger(__name__)
+        while not stop_capture.is_set():
+            try:
+                ready, _, _ = select.select([sock], [], [], 0.25)
+                if not ready:
+                    continue
+                _cls, frame, _ts = sock.recv_raw(65535)
+            except (OSError, ValueError):
+                return  # socket closed under us at shutdown
+            if frame:
+                try:
+                    handle(nic, frame)
+                except Exception as e:  # noqa: BLE001 — keep counting
+                    log.debug("run_receiver: frame handler raised %s", e)
+
+    sockets_open = []
+    threads = []
     try:
         for nic in nics:
-            sn = AsyncSniffer(iface=nic, filter=bpf, prn=handle, store=False)
-            sn.start()
-            sniffers.append(sn)
+            sock = _open_capture(nic, bpf)
+            sockets_open.append(sock)
+            th = threading.Thread(target=capture, args=(nic, sock),
+                                  name=f"rx-{nic}", daemon=True)
+            th.start()
+            threads.append(th)
 
         stop_flag = {"flag": False}
         if install_signal_handlers:
@@ -669,9 +740,12 @@ def run_receiver(self_host: str,
                     and (time.monotonic() - last_rx[0]) >= idle_timeout_s):
                 break
     finally:
-        for sn in sniffers:
+        stop_capture.set()
+        for th in threads:
+            th.join(timeout=1.0)
+        for sock in sockets_open:
             try:
-                sn.stop()
+                sock.close()
             except Exception:
                 pass
 

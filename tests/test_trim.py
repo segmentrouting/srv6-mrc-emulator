@@ -304,22 +304,25 @@ class SenderTests(unittest.TestCase):
         self.assertNotEqual((pl, path), (1, 2))
 
 
-class _FakeSniffer:
-    """Feeds canned frames to run_receiver's handler on start()."""
-    frames: list = []
+class _FakeCapture:
+    """Stands in for runner._open_capture: a datagram socketpair carries
+    canned Ethernet frames that run_receiver's capture thread reads."""
 
-    def __init__(self, iface, filter, prn, store):
-        self.prn = prn
+    def __init__(self, frames):
+        self._rx, tx = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        eth = bytes.fromhex("0242ac120001aac1ab000001") + b"\x86\xdd"
+        for f in frames:
+            tx.send(eth + f)
+        tx.close()
 
-    def start(self):
-        from scapy.all import IPv6
-        for raw in _FakeSniffer.frames:
-            pkt = IPv6(raw)
-            pkt.sniffed_on = "eth2"
-            self.prn(pkt)
+    def fileno(self):
+        return self._rx.fileno()
 
-    def stop(self):
-        pass
+    def recv_raw(self, n):
+        return None, self._rx.recv(n), None
+
+    def close(self):
+        self._rx.close()
 
 
 def _frame(seq, plane, path, *, trimmed, transport="udp"):
@@ -342,14 +345,13 @@ def _frame(seq, plane, path, *, trimmed, transport="udp"):
 
 class ReceiverTests(unittest.TestCase):
     def _run(self, frames):
-        _FakeSniffer.frames = frames
         trimmed_hook = []
-        stop = threading.Event()
-        stop.set()
-        with mock.patch("scapy.all.AsyncSniffer", _FakeSniffer):
+        with mock.patch.object(runner, "_open_capture",
+                               lambda nic, bpf: _FakeCapture(frames)):
+            # Returns once the frames are read and the link goes idle.
             rep = runner.run_receiver(
                 "yellow-host05", 5, "yellow", nics=("eth2",),
-                stop_event=stop, install_signal_handlers=False,
+                idle_timeout_s=0.3, install_signal_handlers=False,
                 on_trimmed=lambda *a: trimmed_hook.append(a),
             )
         return rep, trimmed_hook
