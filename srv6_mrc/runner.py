@@ -266,6 +266,12 @@ def _build_packet_bytes(src_underlay: str, dst_outer: str,
     )
 
 
+# How long a trimming sender keeps answering NACKs after its last new
+# packet. A NACK takes milliseconds to come back; the margin covers a
+# loaded lab VM.
+NACK_DRAIN_S = 0.5
+
+
 def run_sender(flow: FlowEndpoint,
                policy: SprayPolicy,
                rate_pps: int,
@@ -276,7 +282,8 @@ def run_sender(flow: FlowEndpoint,
                sid_mode: str = "uA",
                transport: str = "udp",
                trim=None,
-               nack_listener=None) -> SenderResult:
+               nack_listener=None,
+               nack_drain_s: float = NACK_DRAIN_S) -> SenderResult:
     """Run a single-flow sender loop with the given policy.
 
     Args:
@@ -296,6 +303,8 @@ def run_sender(flow: FlowEndpoint,
             retransmitted full size on a different EV. None = off.
         nack_listener: test hook; defaults to a NackListener on
             `topo.nack_port(flow.dst_id)` when `trim` is set.
+        nack_drain_s: with trimming on, how long to keep answering
+            NACKs after the last new packet (late trims near the end).
 
     Returns: SenderResult
     """
@@ -400,6 +409,18 @@ def run_sender(flow: FlowEndpoint,
                 result.errors += 1
                 raise
 
+        def retransmit_nacked() -> None:
+            """Fast retransmit: NACKed seqs go ahead of new data, full
+            size, on a different EV from the trimmed one."""
+            for rseq, tplane, tpath in nack_listener.take():
+                rplane, rspine = pick_other_ev(rseq, (tplane, tpath))
+                r_src, r_outer, r_sa = resolve(rplane, rspine)
+                try:
+                    emit(rseq, rplane, rspine, r_src, r_outer, r_sa)
+                    result.trim.retransmits += 1
+                except OSError:
+                    pass
+
         interval = 1.0 / rate_pps if rate_pps > 0 else 0.0
         t_start = time.monotonic()
         deadline = t_start + duration_s if duration_s > 0 else float("inf")
@@ -411,16 +432,7 @@ def run_sender(flow: FlowEndpoint,
                 if stop_event is not None and stop_event.is_set():
                     break
                 if nack_listener is not None:
-                    # Fast retransmit: NACKed seqs go ahead of new data,
-                    # full size, on a different EV from the trimmed one.
-                    for rseq, tplane, tpath in nack_listener.take():
-                        rplane, rspine = pick_other_ev(rseq, (tplane, tpath))
-                        r_src, r_outer, r_sa = resolve(rplane, rspine)
-                        try:
-                            emit(rseq, rplane, rspine, r_src, r_outer, r_sa)
-                            result.trim.retransmits += 1
-                        except OSError:
-                            pass
+                    retransmit_nacked()
                 if ev_aware:
                     plane, ev_spine = policy.pick_ev(seq, flow_key)
                     if not 0 <= plane < NUM_PLANES:
@@ -482,6 +494,16 @@ def run_sender(flow: FlowEndpoint,
             pass
 
         result.elapsed_s = time.monotonic() - t_start
+        if nack_listener is not None and not (
+                stop_event is not None and stop_event.is_set()):
+            # NACKs for packets trimmed near the end of the run arrive
+            # after the last new send; keep answering them briefly so
+            # those packets are recovered too. elapsed_s and the pps it
+            # implies cover only the send phase.
+            drain_until = time.monotonic() + nack_drain_s
+            while time.monotonic() < drain_until:
+                retransmit_nacked()
+                time.sleep(0.005)
         return result
 
     finally:
