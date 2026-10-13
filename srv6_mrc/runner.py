@@ -266,6 +266,99 @@ def _build_packet_bytes(src_underlay: str, dst_outer: str,
     )
 
 
+
+class _PacketTemplates:
+    """Per-EV byte templates for the data hot path.
+
+    `_build_packet_bytes` runs scapy for every packet (~350 us for UDP,
+    ~650 us for RoCE on an M-series core), which caps one sender at a
+    few thousand pps. Every data packet of an EV is identical except
+    for the MRC header (seq/plane/path), the inner UDP checksum, and in
+    rdma mode the BTH PSN and ICRC. So each (plane, path, trimmed)
+    combination gets its template built once by scapy, and per packet
+    only those fields are patched (~3 us). The RoCEv2 ICRC is a CRC32
+    over a masked pseudo-header that is constant up to the PSN, so its
+    prefix CRC is cached too and only the tail is folded in per packet.
+
+    Output is byte-identical to `_build_packet_bytes`
+    (tests/test_runner_fastpath.py pins this).
+    """
+
+    # BTH layout: opcode, flags, pkey(2), fecn/becn/resv6, dqpn(3),
+    # ackreq/resv7, psn(3). ICRC masking sets byte 4 (fecn/becn/resv6).
+    _BTH_PSN = slice(9, 12)
+
+    def __init__(self, *, src_inner: str, dst_inner: str,
+                 transport: str = "udp") -> None:
+        self._src_inner = src_inner
+        self._dst_inner = dst_inner
+        self._transport = transport
+        self._cache: dict = {}
+
+    def build(self, seq: int, plane: int, path: int, *, src_underlay: str,
+              dst_outer: str, trimmed: bool = False) -> bytes:
+        key = (plane, path, trimmed, dst_outer)
+        entry = self._cache.get(key)
+        if entry is None:
+            entry = self._cache[key] = self._make(
+                plane, path, src_underlay, dst_outer, trimmed)
+        template, plen, bth_at, icrc_prefix = entry
+        from .encap import PAYLOAD_OFFSET, udp6_checksum_inplace
+        mrc = (struct.pack(_PAYLOAD_HDR, seq, plane, path) if trimmed
+               else encode_payload(seq, plane, path))
+        buf = bytearray(template)
+        if bth_at is None:
+            buf[PAYLOAD_OFFSET:PAYLOAD_OFFSET + plen] = mrc
+        else:
+            psn = (seq & 0xFFFFFF).to_bytes(3, "big")
+            start = PAYLOAD_OFFSET + bth_at
+            buf[start + 9:start + 12] = psn
+            buf[start + 12:start + 12 + len(mrc)] = mrc
+            import zlib
+            icrc = zlib.crc32(psn + mrc, icrc_prefix) & 0xFFFFFFFF
+            buf[start + 12 + len(mrc):start + 16 + len(mrc)] = \
+                icrc.to_bytes(4, "little")
+        udp6_checksum_inplace(buf, payload_len=plen)
+        return bytes(buf)
+
+    def _make(self, plane, path, src_underlay, dst_outer, trimmed):
+        """Template for one EV: (bytes, udp payload len, BTH offset in
+        the UDP payload or None, ICRC CRC32 over the constant prefix)."""
+        from .encap import build_outer_template
+        mrc_len = _PAYLOAD_HDR_LEN if trimmed else len(encode_payload(0, 0, 0))
+        if self._transport != "rdma":
+            tpl = build_outer_template(
+                src_underlay=src_underlay, dst_outer=dst_outer,
+                src_inner=self._src_inner, dst_inner=self._dst_inner,
+                sport=SPRAY_PORT, dport=SPRAY_PORT, payload_len=mrc_len)
+            return bytes(tpl), mrc_len, None, None
+        import zlib
+        from .encap import INNER_HEADER_LEN, OUTER_HEADER_LEN, PAYLOAD_OFFSET
+        from .rdma import wrap_rdma
+        # A real RoCE frame for seq 0 gives the constant BTH bytes.
+        frame = wrap_rdma(b"\x00" * mrc_len, plane=plane, path=path, seq=0,
+                          src=self._src_inner, dst=self._dst_inner,
+                          sport=SPRAY_PORT, dport=RDMA_PORT)
+        plen = len(frame)
+        tpl = build_outer_template(
+            src_underlay=src_underlay, dst_outer=dst_outer,
+            src_inner=self._src_inner, dst_inner=self._dst_inner,
+            sport=SPRAY_PORT, dport=RDMA_PORT, payload_len=plen)
+        tpl[PAYLOAD_OFFSET:PAYLOAD_OFFSET + 12] = frame[:12]
+        # ICRC pseudo-header: 8 x 0xff, inner IPv6 with tc/fl/hlim set to
+        # all-ones, UDP with checksum 0xffff, BTH with fecn/becn/resv6
+        # set to all-ones; constant up to (not including) the PSN.
+        ip6 = bytearray(tpl[OUTER_HEADER_LEN:OUTER_HEADER_LEN + INNER_HEADER_LEN])
+        ip6[0:4] = b"\x6f\xff\xff\xff"
+        ip6[7] = 0xFF
+        udp = bytearray(tpl[OUTER_HEADER_LEN + INNER_HEADER_LEN:PAYLOAD_OFFSET])
+        udp[6:8] = b"\xff\xff"
+        bth = bytearray(frame[:9])
+        bth[4] = 0xFF
+        prefix = b"\xff" * 8 + bytes(ip6) + bytes(udp) + bytes(bth)
+        return bytes(tpl), plen, 0, zlib.crc32(prefix) & 0xFFFFFFFF
+
+
 def run_sender(flow: FlowEndpoint,
                policy: SprayPolicy,
                rate_pps: int,
@@ -335,6 +428,10 @@ def run_sender(flow: FlowEndpoint,
             rate_pps=rate_pps, duration_s=duration_s, spine=spine,
             sid_mode=sid_mode, transport=transport,
         )
+        # Per-EV byte templates: scapy once per EV, not per packet.
+        templates = _PacketTemplates(src_inner=src_inner,
+                                     dst_inner=dst_inner,
+                                     transport=transport)
 
         oracle = None
         if trim is not None:
@@ -380,10 +477,9 @@ def run_sender(flow: FlowEndpoint,
                     result.trim.dropped += 1
             try:
                 if not dropped:
-                    pkt = _build_packet_bytes(
-                        src_u, outer_d, src_inner, dst_inner,
-                        seq, plane, ev_spine, transport=transport,
-                        trimmed=trimmed,
+                    pkt = templates.build(
+                        seq, plane, ev_spine, src_underlay=src_u,
+                        dst_outer=outer_d, trimmed=trimmed,
                     )
                     sockets[plane].sendto(pkt, sa)
                 result.per_plane_sent[plane] = \
@@ -451,9 +547,9 @@ def run_sender(flow: FlowEndpoint,
                         pass
                     seq += 1
                 else:
-                    pkt = _build_packet_bytes(
-                        src_u, outer_d, src_inner, dst_inner,
-                        seq, plane, ev_spine, transport=transport,
+                    pkt = templates.build(
+                        seq, plane, ev_spine, src_underlay=src_u,
+                        dst_outer=outer_d,
                     )
                     try:
                         sockets[plane].sendto(pkt, sa)
