@@ -66,6 +66,19 @@ ALL_NODES="$LEAF_NODES $SPINE_NODES"
 # Strip any common defaults so vtysh -f loads the file cleanly.
 BGP_ASNS_TO_CLEAR="65000 65001 65100"
 
+# SONiC daemons this lab never uses, stopped after each node's FRR config
+# loads. There is no BGP (above) and no LLDP consumer, and the kernel does
+# neighbor discovery itself, so arp_update's periodic shell loop is idle
+# work. Together they cost ~2.7 GB RAM and 1-4 CPU cores across a 2p-4x8
+# fabric (much more under emulation, e.g. Rosetta on Apple silicon).
+# Set KEEP_UNUSED_DAEMONS=1 to leave them running.
+UNUSED_DAEMONS="bgpd bgpcfgd bgpmon staticroutebfd lldp-syncd lldpd lldpmgrd arp_update"
+
+stop_unused_daemons() {
+    [ "${KEEP_UNUSED_DAEMONS:-0}" = "1" ] && return 0
+    docker exec "$1" supervisorctl stop $UNUSED_DAEMONS >/dev/null 2>&1 || true
+}
+
 resolve_container() {
     local NODE_ID="$1"
     local LONG_NAME="clab-${TOPOLOGY_NAME}-${NODE_ID}"
@@ -206,6 +219,7 @@ deploy_node() {
         wait_for_vrfs "$CONTAINER" "$CONFIGS_DIR/$NODE_ID/frr.conf" || true
         docker exec "$CONTAINER" vtysh -f "$FRR_DIR/frr.conf" 2>/dev/null || true
         echo "    frr.conf loaded"
+        stop_unused_daemons "$CONTAINER"
     else
         echo "    WARN: no frr.conf found for $NODE_ID"
     fi
@@ -285,6 +299,7 @@ repush_frr() {
     # the repush, since the first pass likely raced vrfmgrd.
     wait_for_vrfs "$CONTAINER" "$CONFIGS_DIR/$NODE_ID/frr.conf" || true
     docker exec "$CONTAINER" vtysh -f "$FRR_DIR/frr.conf" 2>/dev/null || true
+    stop_unused_daemons "$CONTAINER"
 }
 
 # Verify every node in NODES has its expected SID count programmed. For
