@@ -250,6 +250,10 @@ class Srv6RawTransport(MrcTransport):
         # Falls back to scapy on cache miss (one-shot warn, then silent).
         key = (plane, path, dst_leaf)
         cached = self._probe_templates.get(key)
+        if cached is not None and len(payload) != PROBE_PAYLOAD_LEN:
+            # Templates are sized for PROBE_PAYLOAD_LEN; splicing a
+            # different size would leave stale length fields.
+            cached = None
         if cached is None:
             self._probe_fast_path_misses += 1
             if self._probe_fast_path_misses == 1:

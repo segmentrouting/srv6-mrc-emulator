@@ -154,6 +154,45 @@ except ImportError:  # pragma: no cover
     _HAVE_SCAPY = False
 
 
+class ProbeFastPathSizeGuardTests(unittest.TestCase):
+    """A payload whose size doesn't match the cached template must take
+    the scapy path, not be spliced into the wrong-sized template."""
+
+    def test_wrong_size_payload_falls_back_to_slow_path(self) -> None:
+        with mock.patch(
+            "srv6_mrc.mrc.transport.open_raw_send_socket",
+            side_effect=_fake_raw_send_socket,
+        ), mock.patch(
+            "srv6_mrc.mrc.transport._open_udp_listener",
+            side_effect=_fake_udp_listener,
+        ):
+            t = transport.Srv6RawTransport(
+                tenant="yellow", my_id=0, is_sender=True,
+            )
+            self.addCleanup(_close_transport, t)
+            sent: list[bytes] = []
+            t._raw_sockets[1] = _CaptureSock(sent, [])
+            t.send_probe(plane=1, path=2, dst_leaf=3, payload=bytes(28))
+        self.assertEqual(len(sent), 1)
+        plen = int.from_bytes(sent[0][4:6], "big")
+        self.assertEqual(plen, len(sent[0]) - 40)  # header matches size
+        self.assertEqual(t._probe_fast_path_misses, 1)
+
+
+class _CaptureSock:
+    """Stand-in raw socket that records what would have been sent."""
+
+    def __init__(self, sent: list, dsts: list) -> None:
+        self._sent, self._dsts = sent, dsts
+
+    def sendto(self, buf, dst) -> None:
+        self._sent.append(bytes(buf))
+        self._dsts.append(dst)
+
+    def close(self) -> None:
+        pass
+
+
 def _fake_raw_send_socket(_iface: str) -> socket.socket:
     """Stand-in for `open_raw_send_socket` that needs no CAP_NET_RAW.
 
@@ -435,7 +474,8 @@ class ProbeFastPathByteIdentityTests(unittest.TestCase):
         plane = 1
         path = 2
         dst_leaf = 3
-        payload = bytes(range(28))
+        from srv6_mrc.mrc.probe import PROBE_PAYLOAD_LEN
+        payload = bytes(range(PROBE_PAYLOAD_LEN))  # real v4 probe size
 
         with mock.patch(
             "srv6_mrc.mrc.transport.open_raw_send_socket",
@@ -458,12 +498,10 @@ class ProbeFastPathByteIdentityTests(unittest.TestCase):
 
             slow_bytes: list[bytes] = []
             slow_dst: list = []
-
-            def slow_sendto(buf, dst):
-                slow_bytes.append(bytes(buf))
-                slow_dst.append(dst)
-
-            t._raw_sockets[plane].sendto = slow_sendto  # type: ignore[assignment]
+            # socket.socket attributes are read-only, so swap the whole
+            # socket for a capturing stand-in rather than patching sendto.
+            real_sock = t._raw_sockets[plane]
+            t._raw_sockets[plane] = _CaptureSock(slow_bytes, slow_dst)
             t.send_probe(
                 plane=plane, path=path, dst_leaf=dst_leaf, payload=payload,
             )
@@ -472,16 +510,12 @@ class ProbeFastPathByteIdentityTests(unittest.TestCase):
             t._probe_templates[cache_key] = saved
             fast_bytes: list[bytes] = []
             fast_dst: list = []
-
-            def fast_sendto(buf, dst):
-                fast_bytes.append(bytes(buf))
-                fast_dst.append(dst)
-
-            t._raw_sockets[plane].sendto = fast_sendto  # type: ignore[assignment]
+            t._raw_sockets[plane] = _CaptureSock(fast_bytes, fast_dst)
             t.send_probe(
                 plane=plane, path=path, dst_leaf=dst_leaf, payload=payload,
             )
             self.assertEqual(len(fast_bytes), 1)
+            t._raw_sockets[plane] = real_sock
 
         self.assertEqual(
             fast_bytes[0], slow_bytes[0],

@@ -117,6 +117,23 @@ def _start_loss_report_dispatcher(sender, sender_xport):
     return t, stop_evt
 
 
+def _report_round(sender: SenderMrcAgent, receiver: ReceiverMrcAgent) -> None:
+    """One deterministic loss-window round: close the sender's sent
+    window, have the receiver emit its LOSS_REPORT now, and wait until
+    the sender has fused it.
+
+    Driving this by hand (instead of receiver.start()'s 40 ms timer)
+    keeps a report from firing mid-burst: a report covering half a burst
+    reads as heavy loss on healthy EVs, and with
+    loss_demote_consecutive=1 that demoted them under CPU load.
+    """
+    sender._rotate_window()
+    before = sender.stats.reports_processed
+    receiver._emit_one_round()
+    _wait_for(lambda: sender.stats.reports_processed > before,
+              timeout_s=2.0)
+
+
 def _drive_spray(policy: HealthAwareMrc, sender: SenderMrcAgent,
                  receiver: ReceiverMrcAgent, flow_key,
                  *, n: int, bad_ev=None, bad_loss: float = 1.0,
@@ -186,7 +203,8 @@ class HealthyFabricTests(unittest.TestCase):
         disp_t, disp_stop = _start_loss_report_dispatcher(sender, sender_xport)
 
         try:
-            receiver.start()
+            # Report rounds are driven by _report_round, not the
+            # receiver's timer thread (see its docstring).
             # NOTE: we intentionally do NOT call sender.start(). In v4
             # the sender's mrc-emit thread fires probes whose kernel
             # turnaround doesn't exist on loopback, so the sliding-
@@ -206,7 +224,7 @@ class HealthyFabricTests(unittest.TestCase):
                         in receiver.known_senders(),
                 timeout_s=1.0,
             ), "receiver never learned sender via record_data")
-            time.sleep(FAST_CONFIG.loss_window_ms * 3.0 / 1000.0)
+            _report_round(sender, receiver)
 
             # No EV should be ASSUMED_BAD. Check every (plane, path)
             # cell in the EVStateTable.
@@ -257,8 +275,8 @@ class PlaneLossShiftsDistributionTests(unittest.TestCase):
         BAD_PATH = 1
 
         try:
-            receiver.start()
-            # As in HealthyFabricTests, skip sender.start() to avoid
+            # Report rounds are driven by _report_round (no receiver
+            # timer thread). As in HealthyFabricTests, skip sender.start() to avoid
             # probe-emit thread demoting EVs (no kernel turnaround on
             # loopback). The mini-dispatcher feeds LOSS_REPORTs into
             # `sender._handle_loss_report` directly.
@@ -283,8 +301,7 @@ class PlaneLossShiftsDistributionTests(unittest.TestCase):
                 # Order matters: rotate the sent-window first so the
                 # LOSS_REPORT the receiver is about to emit can be
                 # paired against a populated SentWindow on the sender.
-                sender._rotate_window()
-                time.sleep(FAST_CONFIG.loss_window_ms / 1000.0)
+                _report_round(sender, receiver)
                 table.tick("green")
             self.assertIn(
                 (topo_tenant_id("green"), 0), receiver.known_senders(),
