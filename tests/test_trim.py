@@ -193,6 +193,32 @@ class NackListenerTests(unittest.TestCase):
         self.assertEqual(got, [(7, 1, 0)])
 
 
+class _LateNackListener:
+    """Releases its NACK only after `delay_s`, i.e. once the sender's
+    send loop has already ended: the end-of-run race."""
+
+    def __init__(self, nack, delay_s):
+        import time
+        self._nack, self._at = nack, time.monotonic() + delay_s
+        self.sent = []
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def note_sent(self, seq):
+        self.sent.append(seq)
+
+    def take(self):
+        import time
+        if self._nack is None or time.monotonic() < self._at:
+            return []
+        out, self._nack = [self._nack], None
+        return out
+
+
 class _FakeSock:
     def __init__(self, plane, log):
         self.plane, self.log = plane, log
@@ -263,6 +289,24 @@ class SenderTests(unittest.TestCase):
             self.assertEqual(_udp_payload_len(pkt), 10 if plane == 1 else 42)
         self.assertEqual(res.trim.trimmed, sum(1 for pl, _ in log if pl == 1))
         self.assertEqual(res.sent, len(log))
+
+    def test_late_nack_after_last_send_is_still_retransmitted(self):
+        log = []
+        socks = iter(range(8))
+        def run(drain):
+            with mock.patch.object(runner, "_open_send_socket",
+                                   side_effect=lambda nic: _FakeSock(next(socks),
+                                                                     log)):
+                return runner.run_sender(
+                    runner.FlowEndpoint(tenant="green", src_id=2, dst_id=5),
+                    EvSpray(), 400, 0.05, trim=TrimSpec(rate=0.0),
+                    nack_listener=_LateNackListener((3, 1, 2), 0.1),
+                    nack_drain_s=drain,
+                )
+        self.assertEqual(run(0.0).trim.retransmits, 0)   # old behaviour
+        res = run(0.4)
+        self.assertEqual(res.trim.retransmits, 1)
+        self.assertLess(res.elapsed_s, 0.1)  # pps covers the send phase only
 
     def test_rdma_trimmed_form_keeps_the_bth(self):
         from srv6_mrc.rdma import unwrap_rdma
