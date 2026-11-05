@@ -15,12 +15,13 @@ run-scenario topologies/4p-4x8/scenarios/green-mrc-baseline.yaml \
 make scenario SCEN=green-mrc-baseline
 ```
 
-Scenarios that inject faults need `sudo` because `tc netem` is applied
-via `nsenter` into container network namespaces:
+Faults are injected separately with `srctl fault` (the scenario
+`faults:` block is deprecated), before or during a run:
 
 ```bash
-sudo run-scenario topologies/4p-4x8/scenarios/green-mrc-plane-loss.yaml \
-    --report results/plane-loss.json
+srctl fault netem "plane 2" "loss 5%"
+srctl run green-mrc-baseline
+srctl fault clear --all
 ```
 
 The orchestrator always reverts netem in a `finally` block. Verify
@@ -66,8 +67,8 @@ Quick-pick guide:
   `green-mrc-ev-spray` / `yellow-mrc-ev-spray`. Demote a single
   (plane, path) cell, not a whole plane.
 - **Failure injection with netem (programmatic, no manual `ip link`):**
-  the `*-mrc-plane-loss` / `*-mrc-plane-latency` scenarios use
-  `tc qdisc add` on a chosen plane's veth.
+  `srctl fault netem "plane N" "<netem spec>"` applies `tc qdisc add`
+  on a chosen plane's veths; combine it with any scenario above.
 
 | Scenario | Family | Tenant | Spray policy | `paths_per_plane` | MRC | Faults | Expect |
 |---|---|---|---|---|---|---|---|
@@ -76,10 +77,6 @@ Quick-pick guide:
 | `yellow-ev-spray.yaml` | EV-spray | yellow | `ev_spray` | 8 | off | none | balanced 32 EVs; validates yellow's 2-uSID outer rotates correctly |
 | `green-mrc-baseline.yaml` | MRC plane-coarse | green | `health_aware_mrc` | 1 (default) | on | none | EV table = 4 cells all GOOD; no-op on clean fabric |
 | `yellow-mrc-baseline.yaml` | MRC plane-coarse | yellow | `health_aware_mrc` | 1 (default) | on | none | as above; also exercises Phase 1a collapsed rx socket |
-| `green-mrc-plane-loss.yaml` | MRC plane-coarse | green | `health_aware_mrc` | 1 | on | netem loss on one plane | EV table demotes the affected plane → ASSUMED_BAD; loss% drops post-demote |
-| `yellow-mrc-plane-loss.yaml` | MRC plane-coarse | yellow | `health_aware_mrc` | 1 | on | netem loss on one plane | as above on host-decap path |
-| `green-mrc-plane-latency.yaml` | MRC plane-coarse | green | `health_aware_mrc` | 1 | on | netem delay on one plane | RTT p99 climbs on affected plane; latency-based signal only (no demote unless config tuned) |
-| `yellow-mrc-plane-latency.yaml` | MRC plane-coarse | yellow | `health_aware_mrc` | 1 | on | netem delay on one plane | as above |
 | `green-mrc-ev-spray.yaml` | MRC per-EV | green | `health_aware_mrc` | 8 | on | none (manual link-shut recommended) | exercises Phase 1b step 2: per-EV `seen/sent` accounting; demote a single (plane, path) cell |
 | `yellow-mrc-ev-spray.yaml` | MRC per-EV | yellow | `health_aware_mrc` | 8 | on | none (manual link-shut recommended) | as above on host-decap path |
 
@@ -229,26 +226,27 @@ MRC is opt-in: a scenario YAML enables it by including a top-level
 | Scenario | Fault | Expect |
 |---|---|---|
 | `green-mrc-baseline.yaml` | none | MRC running but never demoting; per-plane sent counts balanced |
-| `green-mrc-plane-loss.yaml` | 5% loss on plane 2 | plane 2 demotes within ~1–2 loss windows; total loss drops well below the round-robin reference |
-| `green-mrc-plane-latency.yaml` | +10ms on plane 3 | reorder tail extends by ~10ms-worth of in-flight packets; **no demotion** (latency isn't a demote signal in the current build) |
 | `green-mrc-ev-spray.yaml` | none (manual link-shut recommended) | per-`(plane, path)` EV table; shutting one `p<P>-spine<S>` link demotes 1/32 of the EV grid |
 | `yellow-mrc-baseline.yaml` | none | as green; exercises Phase 1a collapsed rx socket on host-decap path |
-| `yellow-mrc-plane-loss.yaml` | 5% loss on plane 2 | as green on host-decap path |
-| `yellow-mrc-plane-latency.yaml` | +10ms on plane 3 | as green on host-decap path |
 | `yellow-mrc-ev-spray.yaml` | none (manual link-shut recommended) | as green on host-decap path |
 
-Run them like any other scenario:
+The plane-loss and plane-latency cases are now run by injecting the
+fault with `srctl fault` around a baseline scenario:
+
+| Fault | Command | Expect |
+|---|---|---|
+| 5% loss on plane 2 | `srctl fault netem "plane 2" "loss 5%"` | plane 2 demotes within ~1–2 loss windows; total loss drops well below the round-robin reference |
+| +10ms on plane 3 | `srctl fault netem "plane 3" "delay 10ms"` | reorder tail extends by ~10ms-worth of in-flight packets; **no demotion** (latency isn't a demote signal in the current build) |
 
 ```bash
-sudo run-scenario topologies/4p-4x8/scenarios/green-mrc-plane-loss.yaml \
-    --report results/green-mrc-plane-loss.json
-# or:
-make scenario SCEN=green-mrc-plane-loss
+srctl fault netem "plane 2" "loss 5%"
+srctl run green-mrc-baseline        # or yellow-mrc-baseline for host decap
+srctl fault clear --all
 ```
 
 ### What "MRC is working" looks like in the output
 
-For `green-mrc-plane-loss.yaml`, the per-flow JSON should show plane
+For `green-mrc-baseline` with 5% loss on plane 2, the per-flow JSON should show plane
 2 starting at ~25% of `per_plane_sent` then dropping to near-zero as
 MRC demotes it; total `loss` should be substantially below the
 ~1.25% you'd see under a non-MRC policy with the same 5% plane
@@ -256,12 +254,11 @@ fault. Inspect with:
 
 ```bash
 jq '.flows[0].per_plane_sent, .flows[0].per_plane_loss, .flows[0].loss' \
-    results/green-mrc-plane-loss.json
+    results/green-mrc-baseline.json
 ```
 
-To get a non-MRC reference number for comparison, copy a `*-mrc-plane-loss`
-scenario, set its flow `policy:` to `hash5tuple` (or any non-MRC
-policy), drop the `mrc:` block, and run it side-by-side.
+To get a non-MRC reference number for comparison, keep the same fault
+and run a non-MRC scenario (e.g. `green-ev-spray`) side-by-side.
 
 If the per-plane counts stay uniform with MRC enabled, MRC isn't
 actually engaging. Common causes:
@@ -284,16 +281,17 @@ actually engaging. Common causes:
      loss_demote_consecutive: 1
    ```
 
-### Known limitation: blackhole + MRC
+### Blackhole + MRC
 
-The receiver-side loss estimator computes per-plane
-`expected = max_seq − min_seq + 1`. A 100%-blackholed plane has zero
-arrivals, so the loss window reports 0/0 and the plane stays UNKNOWN
-on that signal. The probe channel still catches it (no replies →
-`probe_fail_threshold` timeouts → demote), but the demote latency is
-longer than for a partial-loss scenario. No `green-mrc-plane-blackhole.yaml`
-ships today for this reason — once probe-driven demotion is exercised
-in the lab we'll add it.
+A 100%-blackholed EV has zero arrivals, so the receiver omits it from
+its LOSS_REPORT. The sender fills the gap from its own sent counters
+(`srv6_mrc/mrc/loss_compute.py`): an EV it sent at least
+`MIN_SENT_FOR_ABSENT_LOSS` (2) packets on but that is absent from the
+report counts as 100% loss, as long as the report covers at least
+`MIN_COVERAGE_FOR_ABSENT_LOSS` (50%) of the window's traffic. So a
+blackhole demotes on the loss path like partial loss does. This
+matters for green last-hop faults, which probes cannot see; the
+`2p-4x8` `green-mrc-lasthop-drill` scenario exercises one.
 
 ### Inspecting MRC state mid-run
 
@@ -330,10 +328,12 @@ through these in order — each step gates the next:
 7. `run-scenario topologies/4p-4x8/scenarios/green-mrc-baseline.yaml --dry-run`
    — scenario parses
 8. `make scenario SCEN=green-mrc-baseline` — orchestrator + merge + render pipeline works
-9. Three fault scenarios in order — netem inject + revert works
+9. `srctl fault netem "plane 2" "loss 5%"`, `srctl fault list`,
+   `srctl fault clear --all` — netem inject + revert works
 10. `make scenario SCEN=green-mrc-baseline` — MRC enabled, clean fabric,
     should look like step 8's output
-11. `make scenario SCEN=green-mrc-plane-loss` — MRC visibly drives
+11. `srctl fault netem "plane 2" "loss 5%"` then
+    `make scenario SCEN=green-mrc-baseline` — MRC visibly drives
     `per_plane_sent[2]` toward zero as plane 2 demotes (compare with
     `jq` per "What MRC is working looks like" above)
 12. Final `tc qdisc show` sweep — clean state

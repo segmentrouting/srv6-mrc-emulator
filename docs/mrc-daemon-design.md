@@ -300,11 +300,11 @@ resolved issue).
   per peer dst). Deferred because the current per-flow model is easier
   to reason about and test, and probe pacing + fast-path templates already
   reduced emit cost to negligible.
-- **RTT-aware EV weighting.** The `rtt_ring` is collected per EV but not
-  yet consulted by the weight builder. `green-mrc-plane-latency` scenario
-  observes latency deltas in diagnostics but correctly does NOT demote
-  (by design — latency-only faults shouldn't cause traffic shift until
-  RTT-aware weighting lands).
+- **RTT-aware EV weighting.** Probe RTT is not measured since the v4
+  stateless probes (the old `rtt_ring` went with the probe clock), so
+  this would first need probes to carry a send timestamp. A latency-only
+  fault (`srctl fault netem "plane 3" "delay 10ms"`) correctly does NOT
+  demote today.
 - **Adaptive probe interval** (back off when all EVs are stable, increase
   frequency under churn). Current design uses fixed 200ms. OCP MRC spec
   mentions adaptive intervals; not implemented here.
@@ -373,7 +373,7 @@ against scapy reference.
 
 - All 564 unit tests pass (0 skips, 0 expected failures)
 - Baseline scenarios (`*-baseline.yaml`) show 0% loss, 16/16 EVs
-- Fault-injection scenarios (`*-plane-loss.yaml`) demote affected EVs
+- Fault injection (`srctl fault netem "plane N" "loss 5%"`) demotes affected EVs
   within `probe_window_ticks * probe_interval_ms` (1 second) and recover
   after `probe_recover_ticks` consecutive healthy windows (also 1 second)
 - Snapshots are valid JSON and contain the wrapped envelope with
