@@ -110,7 +110,8 @@ host-image/
 scripts/
   config.sh            push config_db.json + frr.conf into containers
 
-tests/                 unittest mirror of srv6_mrc/ layout
+tests/                 unittest mirror of srv6_mrc/ layout (`make test`;
+                       CI runs it on every PR, .github/workflows/tests.yml)
 docs/                  consolidated design + runbook documentation
 results/               scenario JSON output (gitignored)
 ```
