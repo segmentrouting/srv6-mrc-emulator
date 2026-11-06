@@ -29,14 +29,25 @@ dockerized SONiC-VS instances and SRv6 capable Alpine linux containers simulatin
 - **Containerlab topology**: 4-plane × 4-spine × 8-leaf *docker-sonic-vs* Clos carrying
   two tenants (`green`, `yellow`) with 8 Alpine container *hosts* each. 
 - **config.sh shell script**: containerlab deploys the topology,  
-  `scripts/config.sh` pushes the sonic nodes' config_db.json and FRR configs.
+  `scripts/config.sh` pushes the sonic nodes' config_db.json and FRR configs,
+  then stops SONiC daemons the lab never uses (BGP, LLDP, arp_update) to
+  save memory and CPU (`KEEP_UNUSED_DAEMONS=1` keeps them).
 - **Userspace MRC traffic simulator** builds uSID-encapsulated (uA or uN flavored)
-  UDP frames in scapy and sprays them into the fabric so each packet traces a
-  distinct `(plane, path)` Entropy Value or EV. Accompanying MRC receiver computes per-flow
+  UDP frames (scapy builds a template per EV; per packet only the
+  sequence fields and checksums are patched) and sprays them into the
+  fabric so each packet traces a distinct `(plane, path)` Entropy Value
+  or EV. `--transport rdma` wraps the payload as RoCEv2 (UD SEND_ONLY
+  BTH with a valid ICRC) instead of plain UDP. Accompanying MRC receiver computes per-flow
   reorder-distance histograms (the MRC / SRv6 paper's reorder metric)
   plus loss, latency, and PPS. The MRC control plane (probes + loss
   feedback) rides the same SRv6-encapped raw-socket path as the data
   packets, with per-`(plane, path)` EV granularity.
+- **Opt-in packet trimming**: a scenario `trim:` block makes each sender
+  play a congested switch on chosen planes, trimming packets to headers
+  (or dropping them in `drop` mode). The receiver NACKs trims and the
+  sender fast-retransmits on a different EV, so trims are not counted as
+  path loss. See the `*-mrc-congestion-{trim,drop}` scenarios in
+  `topologies/2p-4x8/scenarios/`.
 - **srctl command-line tool**: Kubectl-style CLI for running traffic simulations. Key commands:
   - `srctl get {topology, hosts, evs}` — show fabric dimensions, tenants EVs, etc.
   - `srctl run <scenario>` — execute traffic simulations (baseline, all-to-all, all-reduce, etc.)
@@ -45,7 +56,7 @@ dockerized SONiC-VS instances and SRv6 capable Alpine linux containers simulatin
   *host-encap*. The Green tenant is *leaf-decapped* (uDT6 into `Vrf-green` on
   every leaf. The Yellow tenant receives SRv6 encapsulated traffic and 
   performs its own *host-decap* via linux `seg6local End.DT6` policies. 
-  For more information see [Multi-Tenant Design Doc](./docs/design-multi-tenant.md)
+  For more information see [Multi-Tenant Design Doc](./docs/srv6-multi-tenant-design.md)
 - **Optional live visibility** - Grafana dashboard for real-time per-plane balance,
   MRC EV health, and fault injection effects. Enable by uncommenting `visibility.enabled`
   in `topo.yaml`. See [visibility/README.md](./visibility/README.md)
@@ -62,7 +73,11 @@ srv6_mrc/           Python package: topology constants, runtime libs
   topo.py              fabric dimensions + addressing helpers (reads topo.yaml)
   topology.py          typed Topology accessor (Refactor 1 in progress;
                        parallel to topo.py during migration)
-  runner.py            spray sender/receiver core
+  runner.py            spray sender/receiver core (per-EV packet
+                       templates on send, direct frame parsing on receive)
+  rdma.py              RoCEv2 BTH + ICRC framing for `--transport rdma`
+  trim.py              opt-in trimming: oracle, NACK listener, stats
+  fault.py             `srctl fault` state + topology-aware peer lookup
   encap.py             shared raw-socket SRv6 outer-packet builder
                        (used by runner.py and mrc/transport.py)
   policy.py            per-plane / per-EV scheduling policies
@@ -85,9 +100,11 @@ srv6_mrc/           Python package: topology constants, runtime libs
                        LoopbackUdpTransport
     ev_state.py        per-(tenant, plane, path) EV state machine
     probe.py           PROBE / PROBE_REPLY / LOSS_REPORT wire format
-    probe_clock.py     per-EV in-flight probe bookkeeping
     loss_window.py     per-EV receiver-side loss accounting
-    loss_compute.py    per-EV SentWindowRing on the sender
+    loss_compute.py    per-EV SentWindowRing on the sender; fuses
+                       LOSS_REPORTs into EV state
+    sent_counters.py   data sender's per-EV sent counts, shared with
+                       the MRC daemon via a `.sent` sidecar
 
 generators/
   fabric.py            parameterized generator: reads topo.yaml,
@@ -108,9 +125,10 @@ host-image/
   Dockerfile           alpine + scapy + pip-installed srv6_mrc
 
 scripts/
-  config.sh            push config_db.json + frr.conf into containers
+  config.sh            push config_db.json + frr.conf into containers,
+                       stop unused SONiC daemons
 
-tests/                 unittest mirror of srv6_mrc/ layout
+tests/                 unittest mirror of srv6_mrc/ layout (`make test`)
 docs/                  consolidated design + runbook documentation
 results/               scenario JSON output (gitignored)
 ```
