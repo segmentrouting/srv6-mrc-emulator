@@ -128,7 +128,7 @@ scripts/
   config.sh            push config_db.json + frr.conf into containers,
                        stop unused SONiC daemons
 
-tests/                 unittest mirror of srv6_mrc/ layout (`make test`)
+tests/                 unittest mirror of srv6_mrc/ layout
 docs/                  consolidated design + runbook documentation
 results/               scenario JSON output (gitignored)
 ```
