@@ -1,0 +1,40 @@
+# yellow-mrc-congestion-trim.yaml — opt-in trimming A/B (2p-4x8).
+#
+# Every flow's sender plays a congested switch on plane 1: 30% of the
+# packets it sprays onto plane-1 EVs are hit. This file delivers the hit
+# as trims: header-only packets that the receiver NACKs and
+# the sender retransmits on a different EV. Expected: plane-1 EVs stay
+# GOOD (trims never count as path loss) and every trim is recovered.
+#
+# Companion: yellow-mrc-congestion-drop.yaml, identical except for mode.
+#
+# Yellow counterpart of green-mrc-congestion-trim.yaml: same oracle,
+# but data, NACKs and loss reports decap on the host (End.DT6).
+# Needs `make TOPO=2p-4x8 host-routes`.
+#
+# Run:
+#   make TOPO=2p-4x8 SCEN=yellow-mrc-congestion-trim scenario
+
+name: yellow-mrc-congestion-trim
+description: |
+  30% of plane-1 packets hit by a sender-side congestion oracle, delivered
+  as trims (NACK + fast retransmit). 4 yellow pairs, health_aware_mrc.
+
+flows:
+  - pairs: yellow-pairs-4
+    policy: health_aware_mrc
+    rate: 100pps
+    duration: 30s
+
+faults: []
+
+mrc: {}
+
+trim:
+  rate: 0.3
+  planes: [1]
+  mode: trim
+  seed: 7
+
+report:
+  out: results/yellow-mrc-congestion-trim.json
