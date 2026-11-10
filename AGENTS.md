@@ -315,8 +315,7 @@ it's a parallel vertical with no code-path overlap.
   via per-packet outer-DA rotation. Reports include `per_ev_sent` keyed
   `"P<p>:S<s>"`. No health awareness on its own — every EV is always
   active. Scenarios shipped: `green-ev-spray.yaml`,
-  `green-ev-spray-n2.yaml`, `yellow-ev-spray.yaml`,
-  `yellow-ev-spray-n2.yaml`. The data wire format carries `path` (the
+  `yellow-ev-spray.yaml` (the `-n2` variants were later pruned). The data wire format carries `path` (the
   MRC-layer name for `spine`) in the payload so the receiver can
   attribute per-EV stats.
 - **Phase 1b step 2 (per-EV scapy raw-socket probes):** done. Probe TX
@@ -384,11 +383,6 @@ Concretely:
 - New probe / health code path → test with both tenants in the
   lab; yellow's host-side decap (invariant 7) is the failure mode
   green never exposes.
-- Phase 1b step 1's yellow-ev-spray YAMLs are the immediate
-  outstanding piece. Pick those up at the same time as step 2's
-  scapy probes — they're cheap (~20 lines of YAML each) and rerun
-  the same `green-ev-spray-n2` validation against yellow as a
-  yellow-decap regression check.
 
 ## Naming conventions
 
@@ -478,12 +472,11 @@ veths, runs `spray` send/recv inside the relevant containers via
 
 ```
 run-scenario topologies/4p-4x8/scenarios/green-mrc-baseline.yaml --verbose
-run-scenario topologies/4p-4x8/scenarios/green-mrc-plane-loss.yaml --dry-run
+run-scenario topologies/4p-4x8/scenarios/green-mrc-baseline.yaml --dry-run
 ```
 
-`--dry-run` prints the plan plus the exact `nsenter ... tc qdisc add ...`
-argvs that would be invoked — useful for verifying fault targeting
-without touching the lab.
+`--dry-run` prints the plan without touching the lab. Faults are
+injected separately with `srctl fault` (see below).
 
 ### `srctl fault` — Manual Fault Injection
 
@@ -681,19 +674,17 @@ Demotions are subject to an `min_active_evs` floor (OCP's
 
 ### Known limitations
 
-- **Receiver loss estimator needs partial loss.** The receiver estimates
-  per-plane `expected = max_seq − min_seq + 1`. A 100% blackholed plane
-  has zero arrivals, so the loss window reports 0/0 and the plane stays
-  UNKNOWN. The probe channel still catches a hard blackhole (no replies
-  → `probe_fail_threshold` timeouts → demote), but a partial-loss netem
-  scenario will demote much faster than a blackhole one.
-- **Reorder isn't a demote signal yet.** Latency-only faults
-  (`green-mrc-plane-latency.yaml`) leave loss windows clean and probe
-  replies arrive (slow but successful), so plane state stays GOOD. The
-  per-plane RTT ring is collected for diagnostics but not consulted by
-  the weight builder. This is by design today; the plane-latency
-  scenario is the regression fixture for when RTT-aware weighting
-  lands.
+- **Blackholed EVs are inferred from the sender's counts.** The
+  receiver omits an EV with zero arrivals from its LOSS_REPORT; the
+  sender counts it as 100% loss if it sent at least 2 packets on it and
+  the report covers at least half the window's traffic
+  (`srv6_mrc/mrc/loss_compute.py`). So a blackhole, including a green
+  last-hop fault that probes cannot see, demotes on the loss path.
+- **Latency isn't a demote signal.** Latency-only faults
+  (`srctl fault netem "plane 3" "delay 10ms"`) leave loss windows clean
+  and probe replies arrive (slow but successful), so plane state stays
+  GOOD. Probe RTT is not measured since the v4 stateless probes, so
+  RTT-aware weighting would first need probes to carry a timestamp.
 - **Per-flow MRC agent, not per-host.** Today there's one
   `SenderMrcAgent` per spray invocation, so two simultaneous flows from
   the same host emit duplicate probe streams. A per-host agent with IPC
@@ -706,11 +697,13 @@ confirms the three headline green-tenant scenarios behave as designed
 (see `docs/design-mrc.md` for the detailed table):
 
 - `green-mrc-baseline` — uniform spray, all planes `GOOD`, 0% loss
-- `green-mrc-plane-loss` — 5% loss on plane 2 triggers loss-path
+- `green-mrc-plane-loss` (since removed; now `srctl fault netem
+  "plane 2" "loss 5%"` around `green-mrc-baseline`) — 5% loss on plane 2 triggers loss-path
   demotion (`consecutive_loss_demote_windows ≥ 2`); plane 2 weight
   drops to 0, planes 0/1/3 carry uniformly, total loss ≈ 0.07% vs
   ~1.25% under round-robin (16× improvement)
-- `green-mrc-plane-latency` — 10ms delay on plane 3 leaves all planes
+- `green-mrc-plane-latency` (since removed; now `srctl fault netem
+  "plane 3" "delay 10ms"`) — 10ms delay on plane 3 leaves all planes
   `GOOD` at weight 0.25 each; plane 3 RTT p50 ≈ 21ms is observed in
   EV-state diagnostics but correctly not acted on
 
@@ -719,7 +712,7 @@ LossFusionStats) when `--policy=health_aware_mrc` is active; the
 ScenarioReport JSON passes it through as `flows[].mrc`. Inspect with:
 
 ```bash
-jq '.flows[].mrc' results/green-mrc-plane-loss.json
+jq '.flows[].mrc' results/green-mrc-baseline.json
 ```
 
 Yellow MRC scenarios (`yellow-mrc-ev-spray.yaml` etc.) ship in the
@@ -1642,15 +1635,12 @@ For MRC end-to-end:
 ```
 make scenario SCEN=green-mrc-baseline    # green tenant, MRC enabled, no faults
 make scenario SCEN=yellow-baseline       # yellow tenant, round_robin, no faults
-make scenario SCEN=green-mrc-plane-loss  # 1% loss on plane 2 + MRC demote
-make scenario SCEN=green-mrc-plane-latency  # plane 2 +5ms + MRC (RTT not yet a demote signal)
 
 # Health-aware MRC variants (turn the agents on):
 make scenario SCEN=green-mrc-baseline     # clean fabric + MRC; should match baseline
-make scenario SCEN=green-mrc-plane-loss   # 5% loss on plane 2 + MRC; loss should
-                                          # drop well below round_robin after demote
-make scenario SCEN=green-mrc-plane-latency # 10ms on plane 3 + MRC; currently no
-                                          # demote (RTT not a signal yet)
+srctl fault netem "plane 2" "loss 5%"    # then green-mrc-baseline: loss should
+make scenario SCEN=green-mrc-baseline     # drop well below round_robin after demote
+srctl fault clear --all
 make scenario SCEN=green-mrc-ev-spray     # per-EV sender control (green)
 make scenario SCEN=yellow-mrc-ev-spray    # per-EV sender control (yellow)
 ```

@@ -176,25 +176,29 @@ Differences worth flagging:
 | Topology                         | 2-tier multi-plane Clos                | 2-tier 4-plane Clos                   | Match                                           |
 | Switch fabric                    | Hardware, line rate                    | docker-sonic-vs                       | Lab constraint                                   |
 | Routing                          | Static SRv6 uN                         | Static SRv6 uA (default) or uN, both always provisioned, `--sid` selects per run | uA default is an operator preference for deterministic per-path pinning; uN available to match the paper |
-| PFC                              | Disabled                               | N/A (no RDMA)                         | Match in spirit                                  |
-| Transport                        | RoCEv2 + MRC extensions                | Plain UDP spray                       | Verbs unavailable in emulator                    |
+| PFC                              | Disabled                               | N/A (no lossless queues)              | Match in spirit                                  |
+| Transport                        | RoCEv2 + MRC extensions                | UDP spray, or RoCEv2-framed UD SEND_ONLY (`--transport rdma`: BTH + real ICRC, no DETH) | Verbs unavailable in emulator; packets are built in software |
 | EV granularity                   | 100–256 EVs per QP                     | Up to NUM_PLANES × paths_per_plane EVs per QP (default 32 on 4p-8x16) | Plane/Path fidelity is enough for simulation |
 | Spray policy                     | EV[k] rotated per packet               | round_robin / hash5tuple / weighted / ev_spray / health_aware_mrc | Match in spirit at plane/path granularity             |
-| Loss signal — congestion         | Packet trimming → NACK → fast retx     | **Not available**                     | docker-sonic-vs cannot trim                      |
-| Loss signal — failure            | Untrimmed loss → demote EV             | Receiver loss-fusion → demote path   | The only loss signal we have                     |
+| Loss signal — congestion         | Packet trimming → NACK → fast retx     | Opt-in `trim:` block: the sender trims synthetically, the receiver NACKs, the sender retransmits on another EV | docker-sonic-vs cannot trim, so the trim happens at the sender (see `srv6_mrc/trim.py`) |
+| Loss signal — failure            | Untrimmed loss → demote EV             | Receiver loss-fusion → demote path   | Trimmed packets count as delivered, not lost      |
 | Load-balance signal              | ECN → migrate EV within plane          | **Not implemented**                   | ECN not available in docker-sonic-vs |
 | Probes                           | Background EV resurrection probes      | Emulator probes all EVs every interval | CPU bound, low pps |
 | Fabric health mapping            | Clustermapper (1 ms/link)              | **Not implemented**                   | Out of scope for current phases                  |
 | Reverse-path EV management       | Small reverse EV set + EV probes       | Probes constructed with uSID combination that performs full EV round trip with probe sender's address as inner dest | Stateless EV probes, if packets arrive back at sender the EV is up |
 | EV state machine                 | active / backup / inactive             | UNKNOWN / GOOD / ASSUMED_BAD          | Equivalent at plane/path granularity                  |
-| EV demotion threshold            | Binary (first untrimmed loss)          | Configurable per scenario             | We need knobs because we have one signal         |
+| EV demotion threshold            | Binary (first untrimmed loss)          | Configurable per scenario             | We need knobs because, without trimming on, loss is the only signal |
 
-The single largest fidelity gap is the loss-signal collapse: the paper
+The single largest fidelity gap is the loss signals: the paper
 distinguishes three signals (trim, untrimmed-loss, ECN) that drive three
-different responses (retransmit, demote, rebalance). The emulator has
-only the middle one, so it conflates congestion with failure. This is
-acceptable for scenarios that inject *explicit* path failures (the
-existing `plane-loss`, `plane-blackhole`, `plane-latency` scenarios) but
-will produce false positives under genuine congestion. Scenarios are
-designed accordingly: we never run incast against MRC.
+different responses (retransmit, demote, rebalance). The emulator always
+has the middle one. Trimming is opt-in: with a `trim:` block, trimmed
+packets are NACKed and retransmitted and do not count as loss, but the
+trim is synthetic (done by the sender, not by a congested switch) and
+trims do not feed EV state. ECN is not modelled. Without trimming, the
+emulator conflates congestion with failure. This is acceptable when
+faults are injected *explicitly* (`srctl fault netem` / `srctl fault
+shutdown`), but it will produce false positives under genuine
+congestion. Scenarios are designed accordingly: we never run incast
+against MRC.
 
